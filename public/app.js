@@ -2,6 +2,7 @@ const view = document.getElementById('view');
 const connEl = document.getElementById('conn');
 const storageEl = document.getElementById('storage');
 const toastsEl = document.getElementById('toasts');
+const updateBadgeEl = document.getElementById('update-badge');
 
 let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
@@ -817,6 +818,7 @@ async function renderSettings() {
   });
 
   const showCheck = (result) => {
+    setUpdateBadge(Boolean(result.updatable), result.behind);
     if (result.updatable) {
       status.textContent = `Update available: ${result.behind} commit${result.behind === 1 ? '' : 's'} behind origin/main.`;
       status.className = 'hint warn';
@@ -879,6 +881,12 @@ async function renderSettings() {
       el('label', { class: 'check' }, [
         selfUpdate,
         'Check for updates once per interval and apply them automatically',
+      ]),
+      el('div', { class: 'hint warn' }, [
+        'During an update, automatic or manual, every cron is paused until the update finishes. ',
+        'A trigger due in that window is missed, not queued. ',
+        'Turn this off if you would rather handle updates by hand — the server keeps checking either way, ',
+        'and offers what it finds as an Update available badge in the header.',
       ]),
       el('div', { class: 'preset-row' }, [
         checkButton,
@@ -1094,6 +1102,10 @@ function connectEvents() {
   }
 
   // Pause and update progress: the badges and the sub line both come from it.
+  events.addEventListener('update:availability', (event) => {
+    const { updateAvailable, updateBehind } = JSON.parse(event.data);
+    setUpdateBadge(Boolean(updateAvailable), updateBehind);
+  });
   events.addEventListener('pause:changed', () => refreshCurrentView());
   events.addEventListener('update:waiting', () => refreshCurrentView());
   events.addEventListener('update:launched', () => refreshCurrentView());
@@ -1125,6 +1137,18 @@ function connectEvents() {
   };
 }
 
+/**
+ * The header offer. Shown whenever main is behind, whether or not the server is
+ * allowed to apply it itself, and clicking through goes to Settings.
+ */
+function setUpdateBadge(available, behind = 0) {
+  if (!updateBadgeEl) return;
+  updateBadgeEl.hidden = !available;
+  if (!available) return;
+  const commits = behind ? `${behind} commit${behind === 1 ? '' : 's'} behind origin/main. ` : '';
+  updateBadgeEl.title = `${commits}Open Settings to update.`;
+}
+
 /** Live, or live-but-out-of-date once the server has moved to another commit. */
 function setConnState() {
   if (staleBuild) {
@@ -1142,6 +1166,7 @@ function setConnState() {
 async function checkHealth() {
   try {
     const health = await api('/api/health');
+    setUpdateBadge(Boolean(health.updateAvailable), health.updateBehind);
     if (!health.commit) return; // not a git checkout, nothing to compare
     if (!loadedCommit) loadedCommit = health.commit;
     else if (health.commit !== loadedCommit) staleBuild = true;

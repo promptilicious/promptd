@@ -196,6 +196,8 @@ The **⚙ Settings** button at the right of the header opens a page for everythi
 
 The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
 
+The check runs on the interval either way. `selfUpdate` decides only whether what it finds gets applied: with it off, the server still fetches and compares, and an available update shows as an amber **Update available** badge in the header that links to this page. Nothing is pulled and no cron is paused until you press **Update now**.
+
 With `selfUpdate` true, the server checks once a day whether the project checkout is behind its remote, and if so updates itself:
 
 1. `git fetch origin main`, then compare `main` with `origin/main`.
@@ -212,6 +214,8 @@ Two ways out if the restart never comes, so a pause can't strand the crons:
 - A run never ends. After 4 hours the wait is abandoned, the schedules resume, and the update is left for the next check.
 
 Everything the updater does is appended to `logs/update.log`. The check itself is also available on demand at `GET /api/update/check`, which only reads — it never pulls.
+
+Because an update pauses every cron until it finishes, a trigger due during one is missed rather than queued. That is the trade in leaving `selfUpdate` on, and the reason to turn it off if your schedules are tight: the badge still tells you an update is waiting, and you pick the moment.
 
 ### Checking and updating by hand
 
@@ -446,7 +450,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream |
 | GET | `/api/events` | Activity stream |
 | GET | `/api/config` | Storage paths and retention limit |
-| GET | `/api/health` | Liveness, plus how many crons are scheduled |
+| GET | `/api/health` | Liveness, how many crons are scheduled, whether they are paused, and `updateAvailable` with the commits behind |
 | GET, PUT | `/api/settings` | Read settings; write `selfUpdate` and `updateCheckIntervalHours` |
 | GET | `/api/pause` | Pause state, the offered lengths, and how many runs are still in flight |
 | POST | `/api/pause` | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}` |
@@ -463,5 +467,6 @@ As the field changes, a green line below it shows when the expression next fires
 - The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
 - A pause lives in memory only. Restarting the server clears it, whichever length was chosen.
+- The **Update available** badge reflects the last check, so it can lag a push by up to `updateCheckIntervalHours`. **Check for updates** on the Settings page refreshes it at once.
 - Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone.
 - Renaming a cron moves its log folder, so history follows the new name.

@@ -181,7 +181,7 @@ app.delete('/api/pause', async (_req, res, next) => {
 /** Reports whether main is behind without touching the working tree. */
 app.get('/api/update/check', async (_req, res, next) => {
   try {
-    res.json(await checkForUpdates());
+    res.json(selfUpdater.recordCheck(await checkForUpdates()));
   } catch (err) {
     next(err);
   }
@@ -433,7 +433,13 @@ app.get('/api/events', (req, res) => {
 let runningCommit = null;
 
 app.get('/api/health', (_req, res) =>
-  res.json({ ok: true, scheduled: cronService.jobs.size, commit: runningCommit }),
+  res.json({
+    ok: true,
+    scheduled: cronService.jobs.size,
+    commit: runningCommit,
+    paused: cronService.isPaused(),
+    ...selfUpdater.availability(),
+  }),
 );
 
 app.use((err, _req, res, _next) => {
