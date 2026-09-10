@@ -6,7 +6,7 @@ import express from 'express';
 import { bus, sseInit, sseSend } from './events.js';
 import { CRONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
 import { SETTINGS_FILE as SETTINGS_PATH } from './settings.js';
-import { cronService, previewNextRun, validateCronExpression } from './cronService.js';
+import { PAUSE_OPTIONS, cronService, pauseOption, previewNextRun, validateCronExpression } from './cronService.js';
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
@@ -143,6 +143,41 @@ app.put('/api/settings', async (req, res, next) => {
   }
 });
 
+/**
+ * Whole-app pause. Holding every schedule is a temporary state that is never
+ * written to disk: a restart is one of the documented ways out of it.
+ */
+app.get('/api/pause', (_req, res) => {
+  res.json({ ...cronService.pauseInfo(), options: PAUSE_OPTIONS, update: selfUpdater.state() });
+});
+
+app.post('/api/pause', async (req, res, next) => {
+  try {
+    if (cronService.isPausedForUpdate()) {
+      return res.status(409).json({ error: 'an update is in progress; schedules are already held until it restarts' });
+    }
+    const option = pauseOption(String(req.body?.option ?? ''));
+    if (!option) {
+      return res.status(400).json({ error: `option must be one of ${PAUSE_OPTIONS.map((o) => o.id).join(', ')}` });
+    }
+    res.json(await cronService.pauseAll({ mode: 'manual', label: option.label, option: option.id, ms: option.ms }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/api/pause', async (_req, res, next) => {
+  try {
+    if (cronService.isPausedForUpdate()) {
+      return res.status(409).json({ error: 'this pause is holding schedules for an update and cannot be cancelled' });
+    }
+    if (!cronService.isPaused()) return res.status(409).json({ error: 'not paused' });
+    res.json(await cronService.resumeAll('cancelled by user'));
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** Reports whether main is behind without touching the working tree. */
 app.get('/api/update/check', async (_req, res, next) => {
   try {
@@ -175,7 +210,6 @@ app.get('/api/models', (_req, res) => {
 app.post('/api/models/refresh', async (_req, res, next) => {
   try {
     await modelCatalog.refresh();
-selfUpdater.start();
     res.json(modelCatalog.state());
   } catch (err) {
     next(err);
@@ -250,6 +284,15 @@ app.post('/api/crons/:id/run', async (req, res, next) => {
   try {
     const cron = await getCron(req.params.id);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
+    // Paused means nothing new starts, by hand or on a schedule — the same rule
+    // the disabled Run now buttons show.
+    if (cronService.isPaused()) {
+      return res.status(409).json({
+        error: cronService.isPausedForUpdate()
+          ? 'an update is waiting for runs to finish; nothing new can start'
+          : `all crons are paused ${cronService.pauseInfo().label}; cancel the pause to run one`,
+      });
+    }
     const run = await cronService.trigger(cron.id, 'manual');
     if (!run) return res.status(409).json({ error: 'this cron is already running' });
     res.status(202).json(run);

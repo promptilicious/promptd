@@ -116,6 +116,21 @@ a {
   flex-wrap: wrap;
 }
 
+/* Pause control and New cron sit together, and wrap as a pair on a phone. */
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Sized to its own content rather than filling the row like a form select. */
+.select.pause-select {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 8px 10px;
+}
+
 h1 {
   font-size: 20px;
   margin: 0 0 4px;
@@ -267,6 +282,12 @@ tbody tr:hover {
   animation: pulse 1.1s ease-in-out infinite;
 }
 
+/* Held by a pause: distinct from deactivated, which is the cron's own setting. */
+.pill.held {
+  color: var(--accent);
+  border-color: rgba(217, 119, 87, 0.4);
+}
+
 /* A finished-but-interrupted outcome: amber, and not pulsing like a live run. */
 .pill.warn {
   color: var(--amber);
@@ -412,6 +433,18 @@ input.narrow {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Holds a disabled button so the pause explanation can be hovered: pointer
+   events are suppressed on the button itself, so the wrapper gets the hover. */
+.btn-hold {
+  display: inline-flex;
+  cursor: not-allowed;
+}
+
+.btn-hold > .btn:disabled {
+  pointer-events: none;
+  cursor: not-allowed;
 }
 
 .select:disabled,

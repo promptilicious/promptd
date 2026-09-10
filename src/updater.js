@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { emit } from './events.js';
 import { LOGS_DIR } from './paths.js';
 import { loadSettings, patchSettings } from './settings.js';
+import { cronService } from './cronService.js';
 
 // Normally the checkout this file lives in; overridable so the update path can
 // be exercised against a scratch repository.
@@ -19,6 +20,18 @@ const UPDATE_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 // recorded timestamp, so sleeping through a whole day does not skip a check.
 const TICK_MS = 15 * 60 * 1000;
 const FIRST_TICK_MS = 60 * 1000;
+
+// Restarting on top of a live run kills it: the run's stdout is a pipe to this
+// process, so the child dies of EPIPE at its next write, mid-task and with
+// nothing recorded. So an update holds the schedules and waits for the last run
+// to end before the restart.
+const DRAIN_INTERVAL_MS = 10 * 1000;
+// A run that never ends must not hold the schedules paused forever. Generous,
+// because a legitimately long cron finishing is worth more than a prompt update.
+const DRAIN_LIMIT_MS = 4 * 60 * 60 * 1000;
+// How long the restart gets to arrive after the script exits, before the pause
+// is treated as stuck and lifted.
+const RESTART_GRACE_MS = 5000;
 
 const BRANCH = 'main';
 const REMOTE = 'origin';
@@ -87,9 +100,24 @@ class SelfUpdater {
   constructor() {
     this.timer = null;
     this.busy = false;
+    /** Set from the moment schedules are held until the restart takes us down. */
+    this.draining = false;
+    this.drainTimer = null;
+    this.drainStartedAt = null;
+  }
+
+  /** What the page polls while an update is queued behind a running cron. */
+  state() {
+    return {
+      draining: this.draining,
+      runningCount: cronService.runningCount(),
+      since: this.drainStartedAt ? new Date(this.drainStartedAt).toISOString() : null,
+    };
   }
 
   start() {
+    // Idempotent: calling it twice must not leave two intervals ticking.
+    if (this.timer) return;
     // A moment after boot, then on a slow tick. Not awaited by startup.
     setTimeout(() => this.tick(), FIRST_TICK_MS).unref?.();
     this.timer = setInterval(() => this.tick(), TICK_MS);
@@ -113,20 +141,67 @@ class SelfUpdater {
    * tick and the Update now button, so both behave identically.
    */
   async applyIfBehind() {
+    if (this.draining) {
+      // Already committed to updating; a second press just reports the wait.
+      return { updatable: true, launched: true, waiting: true, pid: null, ...this.state() };
+    }
     const result = await checkForUpdates();
     if (!result.updatable) {
       console.log(`[update] no update applied: ${result.reason}`);
       return { ...result, launched: false };
     }
-    console.log(`[update] ${result.behind} commit(s) behind ${REMOTE}/${BRANCH}; launching updater`);
+    console.log(`[update] ${result.behind} commit(s) behind ${REMOTE}/${BRANCH}; holding schedules for the restart`);
     await patchSettings({ lastUpdateLaunchedAt: new Date().toISOString(), lastUpdateFromCommit: result.head });
-    const pid = this.launch();
-    emit('update:launched', { behind: result.behind, from: result.head, pid });
-    return { ...result, launched: true, pid };
+
+    // Nothing new may start between here and the restart, and this pause cannot
+    // be cancelled from the page.
+    this.draining = true;
+    this.drainStartedAt = Date.now();
+    await cronService.pauseAll({ mode: 'update', label: 'for update' });
+    emit('update:launched', { behind: result.behind, from: result.head, pid: null, ...this.state() });
+
+    const pid = this.startDrain();
+    return { ...result, launched: true, waiting: pid === null, pid, ...this.state() };
+  }
+
+  /**
+   * Polls until no run is in flight, then hands over to the update script.
+   * Returns the script's pid when it could start immediately, else null.
+   */
+  startDrain() {
+    let pid = null;
+    const tick = () => {
+      const running = cronService.runningCount();
+      if (running === 0) {
+        this.stopDrain();
+        pid = this.launch();
+        return;
+      }
+      if (Date.now() - this.drainStartedAt >= DRAIN_LIMIT_MS) {
+        console.error(`[update] gave up after ${Math.round(DRAIN_LIMIT_MS / 60000)}m; ${running} run(s) still going. Resuming schedules, update not applied.`);
+        this.stopDrain();
+        emit('update:abandoned', { runningCount: running });
+        cronService.resumeAll('update gave up waiting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+        return;
+      }
+      console.log(`[update] waiting for ${running} run(s) to finish before restarting`);
+      emit('update:waiting', { ...this.state(), runningCount: running });
+    };
+
+    this.drainTimer = setInterval(tick, DRAIN_INTERVAL_MS);
+    this.drainTimer.unref?.();
+    tick(); // check straight away rather than waiting out the first interval
+    return pid;
+  }
+
+  stopDrain() {
+    if (this.drainTimer) clearInterval(this.drainTimer);
+    this.drainTimer = null;
+    this.draining = false;
   }
 
   async tick(force = false) {
-    if (this.busy) return null;
+    if (this.busy || this.draining) return null;
     const settings = await loadSettings();
     if (!settings.selfUpdate) return null;
     if (!force && !this.due(settings)) return null;
@@ -147,6 +222,7 @@ class SelfUpdater {
    * server being restarted, which is the last thing it does.
    */
   launch() {
+    console.log('[update] no runs in flight; starting the update script');
     const logFd = fs.openSync(UPDATE_LOG, 'a');
     const child = spawn('/bin/bash', [UPDATE_SCRIPT], {
       cwd: PROJECT_DIR,
@@ -157,6 +233,19 @@ class SelfUpdater {
         CONDUCTOR_PROJECT_DIR: PROJECT_DIR,
         CONDUCTOR_LAUNCHD_LABEL: process.env.CONDUCTOR_LAUNCHD_LABEL ?? 'local.claude-conductor',
       },
+    });
+    // A successful update restarts us, so the restart kills this process before
+    // the grace period below runs out. Still being here after it means no restart
+    // is coming — the script refused, found nothing to do, or had no launchd
+    // agent to kick — so lift the pause rather than hold the crons forever.
+    child.on('exit', (code) => {
+      console.log(`[update] update script exited ${code}; waiting ${RESTART_GRACE_MS / 1000}s for the restart`);
+      const grace = setTimeout(() => {
+        console.error(`[update] no restart arrived; see ${UPDATE_LOG}. Resuming schedules.`);
+        emit('update:failed', { code, updateLog: UPDATE_LOG });
+        cronService.resumeAll('update finished without restarting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+      }, RESTART_GRACE_MS);
+      grace.unref?.();
     });
     child.unref();
     fs.closeSync(logFd);

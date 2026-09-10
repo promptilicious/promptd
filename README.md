@@ -5,6 +5,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
 - Follow a run's output as it is produced, or read back any of the last 50 runs per cron.
 - Stop a run in progress. The schedule stays armed for its next trigger.
+- Pause every schedule for 15 minutes, an hour, 6 hours, or until the next restart.
 - Choose the model per cron, from whatever the installed CLI recognises.
 - Every finished run records the model, runtime, tokens and cost that the CLI reported.
 
@@ -154,6 +155,29 @@ Model discovery is slower on the first run after login, around 14 seconds agains
 - **`brew services`** manages Homebrew formulae, not arbitrary projects.
 - Running `npm start` in a terminal remains fine for occasional use; it stops when the terminal closes.
 
+## Pausing every cron
+
+**Pause for…** sits to the left of **+ New cron** on the home page. Pick a length and every schedule is held at once:
+
+| Option | Held until |
+| --- | --- |
+| 15 minutes | 15 minutes from now |
+| 1 hour | an hour from now |
+| 6 hours | six hours from now |
+| Until restart | the pause is cancelled, or the server restarts |
+
+While paused, the dropdown is replaced by **Cancel pause**, which resumes immediately. Every status reads `Paused 15 minutes` (or whichever length you chose), and hovering one says when it lifts.
+
+What a pause does and does not do:
+
+1. **Schedules are unregistered, not just ignored.** Nothing fires, and the Next run column reads `paused` because there is no armed job to ask.
+2. **A run already in flight is left alone.** It keeps its `running` badge and finishes normally; it picks up the paused badge once it is done.
+3. **Nothing new starts, by hand either.** **Run now** is disabled on the home page and the logs page, and says why on hover; `POST /api/crons/:id/run` answers 409. **Stop** is never disabled, so a run already going can always be ended.
+4. **Deactivated crons stay `deactivated`.** A pause is not the cron's own `isActive` setting, and lifting the pause will not arm something you turned off.
+5. **It is never written to disk.** A restart always comes back unpaused, with every active cron armed again — which is why `Until restart` means what it says.
+
+When the time is up, or you cancel, the crons are re-read from disk and re-armed, so any edit made during the pause takes effect.
+
 ## Settings and self update
 
 The **⚙ Settings** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
@@ -175,8 +199,17 @@ The first two are yours to set, from the Settings page, by editing the file, or 
 With `selfUpdate` true, the server checks once a day whether the project checkout is behind its remote, and if so updates itself:
 
 1. `git fetch origin main`, then compare `main` with `origin/main`.
-2. If `main` is behind, spawn `scripts/self-update.sh` **detached**, so it outlives the server it is about to restart.
-3. That script re-checks everything, runs `git pull --ff-only origin main`, runs `npm install` if `package-lock.json` moved, and restarts the service with `launchctl kickstart -k`.
+2. If `main` is behind, hold every schedule — the same pause as above, shown as `Paused for update` with no dropdown and no **Cancel pause**, because the restart is already committed to.
+3. Wait for any run still in flight, re-checking every 10 seconds.
+4. Once nothing is running, spawn `scripts/self-update.sh` **detached**, so it outlives the server it is about to restart.
+5. That script re-checks everything, runs `git pull --ff-only origin main`, runs `npm install` if `package-lock.json` moved, and restarts the service with `launchctl kickstart -k`.
+
+Steps 2 and 3 exist because a restart does not wait for a run. A run's output is a pipe to the server, so when the server goes down the `claude` process dies of `EPIPE` at its next write — mid-task, with no footer in its log and no last-run recorded. Draining first means an update never lands on top of live work.
+
+Two ways out if the restart never comes, so a pause can't strand the crons:
+
+- The update script exits without restarting — a dirty tree, a failed pull, no launchd agent to kick — and the schedules resume 5 seconds later.
+- A run never ends. After 4 hours the wait is abandoned, the schedules resume, and the update is left for the next check.
 
 Everything the updater does is appended to `logs/update.log`. The check itself is also available on demand at `GET /api/update/check`, which only reads — it never pulls.
 
@@ -191,6 +224,14 @@ The Settings page runs a check as soon as it opens and says what it found:
 | `No update: <reason>` | See the table below |
 
 **Check for updates** re-runs it. **Update now** applies a pending update immediately and works whether or not `selfUpdate` is on — that is the point of it: turn self update off and update on your own schedule, from the page. Both buttons use the same code path as the daily check, so there is no second behaviour to keep in step.
+
+Update now reports the wait rather than guessing at a reload time:
+
+1. `Waiting for 1 cron to finish executing before restarting…` while runs drain, then `All crons idle. Waiting for the server to restart…`.
+2. The header badge turns to `live - refresh window` when this page notices the server came back on a different commit.
+3. The page then counts down from 5 seconds and reloads itself.
+
+If the update does not proceed, the message says so and **Update now** becomes clickable again rather than counting down to nothing.
 
 ### When it declines to update
 
@@ -398,7 +439,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET | `/api/crons` | List, with next run time and live-run state |
 | POST | `/api/crons` | Create |
 | GET, PUT, DELETE | `/api/crons/:id` | Read, update, delete |
-| POST | `/api/crons/:id/run` | Trigger now (409 if already running) |
+| POST | `/api/crons/:id/run` | Trigger now (409 if already running, or if crons are paused) |
 | POST | `/api/crons/:id/stop` | Kill the in-flight run (409 if not running) |
 | GET | `/api/crons/:id/logs` | Run history, newest first |
 | GET | `/api/crons/:id/logs/:file` | One log as JSON |
@@ -407,8 +448,11 @@ As the field changes, a green line below it shows when the expression next fires
 | GET | `/api/config` | Storage paths and retention limit |
 | GET | `/api/health` | Liveness, plus how many crons are scheduled |
 | GET, PUT | `/api/settings` | Read settings; write `selfUpdate` and `updateCheckIntervalHours` |
+| GET | `/api/pause` | Pause state, the offered lengths, and how many runs are still in flight |
+| POST | `/api/pause` | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}` |
+| DELETE | `/api/pause` | Resume (409 if not paused, or if the pause belongs to an update) |
 | GET | `/api/update/check` | Whether `main` is behind. Read-only, never pulls |
-| POST | `/api/update/run` | Apply a pending update now. 202 with the updater's pid, or 409 and the reason. Ignores `selfUpdate` |
+| POST | `/api/update/run` | Apply a pending update now. 202 with the updater's pid, or `waiting: true` and a null pid while runs drain. 409 and the reason if there is nothing to do. Ignores `selfUpdate` |
 | GET | `/api/browse?path=` | Subdirectories matching a partial path, for the Working Directory field |
 | GET | `/api/next-run?cron=` | Whether an expression parses, and when it next fires |
 | GET | `/api/models` | Discovered models, plus whether discovery is running |
@@ -418,5 +462,6 @@ As the field changes, a green line below it shows when the expression next fires
 
 - The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
+- A pause lives in memory only. Restarting the server clears it, whichever length was chosen.
 - Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone.
 - Renaming a cron moves its log folder, so history follows the new name.

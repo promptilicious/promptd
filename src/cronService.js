@@ -18,6 +18,22 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
  */
 const CLAUDE_ARGS = ['--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
 
+/**
+ * The durations the Pause for control offers. `ms: null` means "no timer" — the
+ * pause is only lifted by cancelling it or by the process restarting, since the
+ * pause is never written to disk.
+ */
+export const PAUSE_OPTIONS = [
+  { id: '15m', label: '15 minutes', ms: 15 * 60 * 1000 },
+  { id: '1h', label: '1 hour', ms: 60 * 60 * 1000 },
+  { id: '6h', label: '6 hours', ms: 6 * 60 * 60 * 1000 },
+  { id: 'restart', label: 'until restart', ms: null },
+];
+
+export function pauseOption(id) {
+  return PAUSE_OPTIONS.find((option) => option.id === id) ?? null;
+}
+
 function formatRuntime(ms) {
   if (!Number.isFinite(ms)) return 'unknown';
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
@@ -80,6 +96,90 @@ class CronService {
     this.running = new Map();
     /** @type {Map<string, object>} cron id -> child process and log stream, kept out of responses */
     this.handles = new Map();
+    /**
+     * Set while every schedule is held. Deliberately memory-only: a restart is
+     * one of the two documented ways out of a pause, so it must not survive one.
+     * @type {{mode: 'manual'|'update', label: string, option: string|null, startedAt: string, until: string|null}|null}
+     */
+    this.pauseState = null;
+    this.pauseTimer = null;
+  }
+
+  isPaused() {
+    return this.pauseState !== null;
+  }
+
+  /** An update pause is the one kind the user cannot cancel. */
+  isPausedForUpdate() {
+    return this.pauseState?.mode === 'update';
+  }
+
+  /** How many runs are still in flight; what an update waits to reach zero. */
+  runningCount() {
+    return this.running.size;
+  }
+
+  /** JSON-safe pause state for the API and the status badges. */
+  pauseInfo() {
+    if (!this.pauseState) {
+      return { paused: false, mode: null, label: null, badge: null, until: null, startedAt: null, remainingMs: null, cancellable: false, runningCount: this.running.size };
+    }
+    const { mode, label, option, startedAt, until } = this.pauseState;
+    return {
+      paused: true,
+      mode,
+      option,
+      label,
+      // What every status badge shows, so the wording lives in one place.
+      badge: `Paused ${label}`,
+      startedAt,
+      until,
+      remainingMs: until ? Math.max(0, new Date(until).getTime() - Date.now()) : null,
+      cancellable: mode === 'manual',
+      runningCount: this.running.size,
+    };
+  }
+
+  /**
+   * Holds every schedule. Runs already in flight are left alone — they keep
+   * their running badge and finish on their own.
+   */
+  async pauseAll({ mode = 'manual', label, option = null, ms = null }) {
+    if (this.pauseTimer) clearTimeout(this.pauseTimer);
+    this.pauseTimer = null;
+
+    const startedAt = new Date();
+    this.pauseState = {
+      mode,
+      label,
+      option,
+      startedAt: startedAt.toISOString(),
+      until: ms ? new Date(startedAt.getTime() + ms).toISOString() : null,
+    };
+
+    await this.reload(); // stops every job; reload leaves them stopped while paused
+    if (ms) {
+      this.pauseTimer = setTimeout(() => {
+        this.resumeAll('timer expired').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+      }, ms);
+      this.pauseTimer.unref?.();
+    }
+    console.log(`[cron] paused ${label} (${mode}); ${this.running.size} run(s) still in flight`);
+    emit('pause:changed', this.pauseInfo());
+    return this.pauseInfo();
+  }
+
+  /** Lifts a pause and re-arms whatever is still active on disk. */
+  async resumeAll(reason = 'cancelled') {
+    if (!this.pauseState) return this.pauseInfo();
+    if (this.pauseTimer) clearTimeout(this.pauseTimer);
+    this.pauseTimer = null;
+    const previous = this.pauseState;
+    this.pauseState = null;
+    await this.reload();
+    console.log(`[cron] resumed after "${previous.label}" pause (${reason})`);
+    emit('pause:changed', { ...this.pauseInfo(), resumedFrom: previous.label, reason });
+    return this.pauseInfo();
   }
 
   /** Rebuilds every schedule from disk. Called on boot and after any cron write. */
@@ -88,6 +188,13 @@ class CronService {
     this.jobs.clear();
 
     const crons = await listCrons();
+    // Paused: the jobs above are stopped and none get rebuilt, so nothing fires.
+    // Cron files can still be edited meanwhile; resuming re-reads them.
+    if (this.pauseState) {
+      console.log(`[cron] paused ${this.pauseState.label}; ${crons.length} cron(s) left unscheduled`);
+      emit('crons:changed');
+      return 0;
+    }
     for (const cron of crons) {
       if (!cron.isActive) continue;
       const check = validateCronExpression(cron.cron);
@@ -130,6 +237,14 @@ class CronService {
   async trigger(cronId, source = 'manual') {
     const cron = await getCron(cronId);
     if (!cron) throw new Error('cron not found');
+    // Schedules are stopped while paused, so this only catches a job that fired
+    // in the moment before it was stopped. An update pause also blocks manual
+    // runs, because the update is waiting for the last run to finish.
+    if (this.pauseState && (source === 'schedule' || this.pauseState.mode === 'update')) {
+      console.warn(`[cron] "${cron.name}" ${source} trigger skipped: paused ${this.pauseState.label}`);
+      emit('run:skipped', { cronId, cronName: cron.name, source, reason: `paused ${this.pauseState.label}` });
+      return null;
+    }
     if (this.running.has(cronId)) {
       console.warn(`[cron] "${cron.name}" is still running; skipping ${source} trigger`);
       emit('run:skipped', { cronId, cronName: cron.name, source });

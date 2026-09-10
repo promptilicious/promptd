@@ -6,6 +6,7 @@ const toastsEl = document.getElementById('toasts');
 let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
 let reloadTimer = null; // counting down to a reload after an update was started
+let updateWatchTimer = null; // polling while an update waits for runs to finish
 // The commit the server reported when this page loaded. If it ever differs, the
 // server has been updated underneath us and this page is running old code.
 let loadedCommit = null;
@@ -91,10 +92,75 @@ function toast(message, bad = false) {
   while (toastsEl.children.length > 5) toastsEl.firstElementChild.remove();
 }
 
-function statusPill(cron) {
+/**
+ * A live run keeps its running badge through a pause and picks up the paused
+ * badge when it finishes. A deactivated cron stays deactivated: a pause does
+ * not change it, and lifting the pause will not arm it.
+ */
+function statusPill(cron, pause) {
   if (cron.isRunning) return el('span', { class: 'pill running' }, [el('span', { class: 'led' }), 'running']);
   if (!cron.isActive) return el('span', { class: 'pill paused' }, [el('span', { class: 'led' }), 'deactivated']);
+  if (pause?.paused) {
+    return el(
+      'span',
+      { class: 'pill held', title: pauseTitle(pause) },
+      [el('span', { class: 'led' }), pause.badge],
+    );
+  }
   return el('span', { class: 'pill active' }, [el('span', { class: 'led' }), 'armed']);
+}
+
+/** Hover text for a paused badge: when it lifts, or why it cannot be lifted. */
+function pauseTitle(pause) {
+  if (pause.mode === 'update') return 'An update is waiting for runs to finish, then the server restarts.';
+  if (pause.until) return `Schedules resume ${fmtRelative(pause.until)}, at ${fmtDateTime(pause.until)}.`;
+  return 'Schedules resume when the pause is cancelled or the server restarts.';
+}
+
+/**
+ * Pause for… while running normally, Cancel pause while the user paused, and
+ * neither during an update — that pause is not the user's to lift.
+ */
+function pauseControl(pause, options, onChanged) {
+  if (pause.paused && pause.mode === 'update') return null;
+
+  if (pause.paused) {
+    return el('button', {
+      class: 'btn',
+      text: 'Cancel pause',
+      onclick: async (event) => {
+        event.target.disabled = true;
+        try {
+          await api('/api/pause', { method: 'DELETE' });
+          toast('Schedules resumed');
+          onChanged?.();
+        } catch (err) {
+          toast(err.message, true);
+          event.target.disabled = false;
+        }
+      },
+    });
+  }
+
+  const select = el('select', { class: 'select pause-select', 'aria-label': 'Pause all crons' }, [
+    el('option', { value: '', selected: 'selected' }, 'Pause for…'),
+    ...options.map((option) => el('option', { value: option.id }, option.label)),
+  ]);
+  select.addEventListener('change', async () => {
+    const option = select.value;
+    if (!option) return;
+    select.disabled = true;
+    try {
+      const state = await api('/api/pause', { method: 'POST', body: JSON.stringify({ option }) });
+      toast(`Paused ${state.label}`);
+      onChanged?.();
+    } catch (err) {
+      toast(err.message, true);
+      select.value = '';
+      select.disabled = false;
+    }
+  });
+  return select;
 }
 
 function outcomePill(status) {
@@ -106,9 +172,11 @@ function outcomePill(status) {
 /**
  * One button that swaps role: Run now while idle, Stop while a run is in flight.
  * Stopping kills the child process; the schedule is untouched, so an armed cron
- * still fires at its next trigger.
+ * still fires at its next trigger. Run now is disabled while paused — a pause
+ * means nothing new starts — but Stop never is, so a live run can always be
+ * ended.
  */
-function runControl(cron, { small = false, onStarted } = {}) {
+function runControl(cron, { small = false, onStarted, pause } = {}) {
   const size = small ? 'btn small' : 'btn';
 
   if (cron.isRunning) {
@@ -128,6 +196,28 @@ function runControl(cron, { small = false, onStarted } = {}) {
         }
       },
     });
+  }
+
+  if (pause?.paused) {
+    // The title sits on a wrapper, not the button: a disabled control does not
+    // reliably receive hover, so the tooltip would never appear on some browsers.
+    return el(
+      'span',
+      {
+        class: 'btn-hold',
+        title:
+          pause.mode === 'update'
+            ? 'Paused for update — an update is waiting for runs to finish, so nothing new can start.'
+            : `All crons are paused ${pause.label}. Cancel the pause to run one.`,
+      },
+      [
+        el('button', {
+          class: small ? 'btn small' : 'btn primary',
+          text: 'Run now',
+          disabled: 'disabled',
+        }),
+      ],
+    );
   }
 
   return el('button', {
@@ -150,19 +240,27 @@ function runControl(cron, { small = false, onStarted } = {}) {
 // ---- home -------------------------------------------------------------
 
 async function renderHome() {
-  const crons = await api('/api/crons');
+  const [crons, pause] = await Promise.all([api('/api/crons'), api('/api/pause')]);
+
+  const armed = crons.filter((c) => c.isActive).length;
+  let sub;
+  if (!crons.length) sub = 'Nothing scheduled yet';
+  else if (pause.paused && pause.mode === 'update') {
+    sub = pause.runningCount
+      ? `Paused for update — waiting for ${pause.runningCount} run${pause.runningCount === 1 ? '' : 's'} to finish`
+      : 'Paused for update — restarting';
+  } else if (pause.paused) {
+    sub = pause.until
+      ? `${armed} armed of ${crons.length} — paused ${pause.label}, resumes ${fmtRelative(pause.until)}`
+      : `${armed} armed of ${crons.length} — paused ${pause.label}`;
+  } else sub = `${armed} armed of ${crons.length}`;
 
   const head = el('div', { class: 'page-head' }, [
-    el('div', {}, [
-      el('h1', { text: 'Crons' }),
-      el('p', {
-        class: 'sub',
-        text: crons.length
-          ? `${crons.filter((c) => c.isActive).length} armed of ${crons.length}`
-          : 'Nothing scheduled yet',
-      }),
+    el('div', {}, [el('h1', { text: 'Crons' }), el('p', { class: 'sub', text: sub })]),
+    el('div', { class: 'head-actions' }, [
+      pauseControl(pause, pause.options ?? [], () => renderHome().catch(() => {})),
+      el('a', { class: 'btn primary', href: '#/new', text: '+ New cron' }),
     ]),
-    el('a', { class: 'btn primary', href: '#/new', text: '+ New cron' }),
   ]);
 
   if (!crons.length) {
@@ -185,7 +283,7 @@ async function renderHome() {
         cron.description ? el('div', { class: 'cron-desc', text: cron.description }) : null,
         el('div', { class: 'cron-desc mono', text: cron.cron }),
       ]),
-      el('td', {}, [statusPill(cron)]),
+      el('td', {}, [statusPill(cron, pause)]),
       el('td', { class: 'hide-sm' }, [
         cron.lastRunAt
           ? el('div', {}, [
@@ -201,11 +299,16 @@ async function renderHome() {
               el('div', { text: fmtRelative(cron.nextRunAt) }),
               el('div', { class: 'cron-desc', text: fmtDateTime(cron.nextRunAt) }),
             ])
-          : el('span', { class: 'muted', text: cron.isActive ? 'not scheduled' : 'deactivated' }),
+          : // Paused means the schedule is not registered, so there is no next
+            // fire time to show for a cron that is otherwise armed.
+            el('span', {
+              class: 'muted',
+              text: !cron.isActive ? 'deactivated' : pause.paused ? 'paused' : 'not scheduled',
+            }),
       ]),
       el('td', {}, [
         el('div', { class: 'row-actions' }, [
-          runControl(cron, { small: true }),
+          runControl(cron, { small: true, pause }),
           el('a', { class: 'btn small', href: `#/edit/${cron.id}`, text: 'Edit' }),
           el('a', { class: 'btn small', href: `#/logs/${cron.id}`, text: 'View logs' }),
         ]),
@@ -619,6 +722,60 @@ async function renderForm(id) {
 
 // ---- settings ---------------------------------------------------------
 
+/**
+ * There is nothing to count down to when Update now is pressed: the server first
+ * holds the schedules and waits for any run to finish, and only then restarts.
+ * So report the wait, and start the 5 second countdown once this page notices the
+ * server is on a new commit — the same signal behind the "live - refresh window"
+ * badge in the header.
+ */
+function watchUpdate(status, updateButton, updateLog) {
+  clearTimeout(reloadTimer);
+  clearTimeout(updateWatchTimer);
+
+  const countdown = (secondsLeft) => {
+    if (secondsLeft <= 0) {
+      location.reload();
+      return;
+    }
+    status.textContent = `Update applied. Reloading in ${secondsLeft}s…`;
+    status.className = 'hint ok';
+    reloadTimer = setTimeout(() => countdown(secondsLeft - 1), 1000);
+  };
+
+  const poll = async () => {
+    await checkHealth();
+    if (staleBuild) {
+      countdown(5);
+      return;
+    }
+    try {
+      const pause = await api('/api/pause');
+      if (!pause.paused) {
+        // The pause was lifted without a restart: the script refused, or it gave
+        // up waiting. Either way the update log has the reason.
+        status.textContent = `Update did not proceed; schedules have resumed. See ${updateLog}`;
+        status.className = 'hint warn';
+        updateButton.textContent = 'Update now';
+        updateButton.disabled = false;
+        return;
+      }
+      const waiting = pause.runningCount;
+      status.textContent = waiting
+        ? `Waiting for ${waiting} cron${waiting === 1 ? '' : 's'} to finish executing before restarting…`
+        : 'All crons idle. Waiting for the server to restart…';
+      status.className = 'hint';
+    } catch {
+      // The restart drops connections; that is expected here.
+      status.textContent = 'Restarting…';
+      status.className = 'hint';
+    }
+    updateWatchTimer = setTimeout(poll, 2000);
+  };
+
+  poll();
+}
+
 async function renderSettings() {
   const settings = await api('/api/settings');
 
@@ -694,21 +851,10 @@ async function renderSettings() {
     updateButton.textContent = 'Updating…';
     try {
       const result = await api('/api/update/run', { method: 'POST' });
-      status.className = 'hint ok';
       toast(`Update started — progress in ${result.updateLog}`);
-
-      // The update restarts the server, so reload onto the new version.
-      let secondsLeft = 10;
-      const countdown = () => {
-        if (secondsLeft <= 0) {
-          location.reload();
-          return;
-        }
-        status.textContent = `Update started (pid ${result.pid}). Reloading in ${secondsLeft}s…`;
-        secondsLeft -= 1;
-        reloadTimer = setTimeout(countdown, 1000);
-      };
-      countdown();
+      status.textContent = 'Holding schedules…';
+      status.className = 'hint';
+      watchUpdate(status, updateButton, result.updateLog ?? settings.updateLog);
     } catch (err) {
       status.textContent = err.message;
       status.className = 'hint warn';
@@ -771,7 +917,7 @@ async function renderSettings() {
 const logsState = { cronId: null, selected: null, atBottom: true };
 
 async function renderLogs(id) {
-  const { cron, logs } = await api(`/api/crons/${id}/logs`);
+  const [{ cron, logs }, pause] = await Promise.all([api(`/api/crons/${id}/logs`), api('/api/pause')]);
   logsState.cronId = id;
 
   // Default to the live run if there is one, else the newest run.
@@ -846,6 +992,7 @@ async function renderLogs(id) {
       el('div', { class: 'row-actions' }, [
         el('a', { class: 'btn', href: `#/edit/${cron.id}`, text: 'Edit cron' }),
         runControl(cron, {
+          pause,
           onStarted: () => {
             logsState.selected = null; // jump to the new run's log
           },
@@ -899,6 +1046,7 @@ async function route() {
   closeLogStream();
   clearTimeout(modelPollTimer);
   clearTimeout(reloadTimer);
+  clearTimeout(updateWatchTimer);
   const [, section, id] = hash.split('/');
   try {
     if (section === 'settings') await renderSettings();
@@ -938,10 +1086,27 @@ function connectEvents() {
     events.addEventListener(type, (event) => {
       const payload = JSON.parse(event.data);
       if (type === 'run:finished') toast(`"${payload.cronName}" ${payload.status} in ${payload.seconds}s`);
-      if (type === 'run:skipped') toast(`"${payload.cronName}" was still running; trigger skipped`, true);
+      if (type === 'run:skipped') {
+        toast(payload.reason ? `"${payload.cronName}" skipped: ${payload.reason}` : `"${payload.cronName}" was still running; trigger skipped`, true);
+      }
       refreshCurrentView();
     });
   }
+
+  // Pause and update progress: the badges and the sub line both come from it.
+  events.addEventListener('pause:changed', () => refreshCurrentView());
+  events.addEventListener('update:waiting', () => refreshCurrentView());
+  events.addEventListener('update:launched', () => refreshCurrentView());
+  events.addEventListener('update:abandoned', (event) => {
+    const { runningCount } = JSON.parse(event.data);
+    toast(`Update gave up waiting on ${runningCount} run(s); schedules resumed`, true);
+    refreshCurrentView();
+  });
+  events.addEventListener('update:failed', (event) => {
+    const { code } = JSON.parse(event.data);
+    toast(`Update script failed (exit ${code}); schedules resumed`, true);
+    refreshCurrentView();
+  });
 
   // Cron files changed on disk outside the app: one toast per file, then redraw.
   events.addEventListener('crons:files-changed', (event) => {
