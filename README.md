@@ -31,12 +31,12 @@ It finds your `node` and `claude`, runs `npm install` if `node_modules` is missi
 
 Overrides, if you need them:
 
-| Variable | Default | |
-| --- | --- | --- |
-| `PORT` | `4321` | Port the server listens on |
-| `HOST` | `127.0.0.1` | Bind address. `0.0.0.0` accepts connections from your network — read [Network access](#network-access) first |
-| `LABEL` | `local.claude-conductor` | launchd service name |
-| `FORCE` | unset | Replace an already-registered agent |
+| Variable | Default                  |                                                                                                              |
+| -------- | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `PORT`   | `4321`                   | Port the server listens on                                                                                   |
+| `HOST`   | `127.0.0.1`              | Bind address. `0.0.0.0` accepts connections from your network — read [Network access](#network-access) first |
+| `LABEL`  | `local.claude-conductor` | launchd service name                                                                                         |
+| `FORCE`  | unset                    | Replace an already-registered agent                                                                          |
 
 ```bash
 PORT=5000 ./scripts/register-app-mac-os.sh     # a different port
@@ -125,14 +125,14 @@ Set `HOST` to `0.0.0.0` in that plist to accept connections from your network �
 
 ### Start and stop
 
-| Task | Command |
-| --- | --- |
-| Start (and enable at login) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-conductor.plist` |
-| Stop (and disable at login) | `launchctl bootout gui/$(id -u)/local.claude-conductor` |
-| Restart after changing code | `launchctl kickstart -k gui/$(id -u)/local.claude-conductor` |
-| Is it running? | `launchctl print gui/$(id -u)/local.claude-conductor \| grep -E "state =\|pid ="` |
-| Server log | `tail -f ~/Library/Logs/claude-conductor/server.log` |
-| Remove entirely | `launchctl bootout gui/$(id -u)/local.claude-conductor && rm ~/Library/LaunchAgents/local.claude-conductor.plist` |
+| Task                        | Command                                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Start (and enable at login) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-conductor.plist`                            |
+| Stop (and disable at login) | `launchctl bootout gui/$(id -u)/local.claude-conductor`                                                           |
+| Restart after changing code | `launchctl kickstart -k gui/$(id -u)/local.claude-conductor`                                                      |
+| Is it running?              | `launchctl print gui/$(id -u)/local.claude-conductor \| grep -E "state =\|pid ="`                                 |
+| Server log                  | `tail -f ~/Library/Logs/claude-conductor/server.log`                                                              |
+| Remove entirely             | `launchctl bootout gui/$(id -u)/local.claude-conductor && rm ~/Library/LaunchAgents/local.claude-conductor.plist` |
 
 `bootout` both stops the server and stops it coming back at login, so it is the pair to `bootstrap` rather than a temporary pause. Editing the plist requires a `bootout` then `bootstrap`; `kickstart -k` only restarts the process with the plist launchd already has.
 
@@ -159,11 +159,11 @@ Model discovery is slower on the first run after login, around 14 seconds agains
 
 **Pause for…** sits to the left of **+ New cron** on the home page. Pick a length and every schedule is held at once:
 
-| Option | Held until |
-| --- | --- |
-| 15 minutes | 15 minutes from now |
-| 1 hour | an hour from now |
-| 6 hours | six hours from now |
+| Option        | Held until                                     |
+| ------------- | ---------------------------------------------- |
+| 15 minutes    | 15 minutes from now                            |
+| 1 hour        | an hour from now                               |
+| 6 hours       | six hours from now                             |
 | Until restart | the pause is cancelled, or the server restarts |
 
 While paused, the dropdown is replaced by **Cancel pause**, which resumes immediately. Every status reads `Paused 15 minutes` (or whichever length you chose), and hovering one says when it lifts.
@@ -221,11 +221,11 @@ Because an update pauses every cron until it finishes, a trigger due during one 
 
 The Settings page runs a check as soon as it opens and says what it found:
 
-| Shown | Meaning |
-| --- | --- |
+| Shown                                             | Meaning                   |
+| ------------------------------------------------- | ------------------------- |
 | `Update available: 2 commits behind origin/main.` | **Update now** is enabled |
-| `Up to date with origin/main.` | Nothing to do |
-| `No update: <reason>` | See the table below |
+| `Up to date with origin/main.`                    | Nothing to do             |
+| `No update: <reason>`                             | See the table below       |
 
 **Check for updates** re-runs it. **Update now** applies a pending update immediately and works whether or not `selfUpdate` is on — that is the point of it: turn self update off and update on your own schedule, from the page. Both buttons use the same code path as the daily check, so there is no second behaviour to keep in step.
 
@@ -241,14 +241,14 @@ If the update does not proceed, the message says so and **Update now** becomes c
 
 The checker refuses rather than guesses, and says why in the server log and in `/api/update/check`:
 
-| Reason | Meaning |
-| --- | --- |
-| `not a git repository` | The project folder is not a checkout |
-| `on branch X, not main` | Only `main` is updated, and only when it is checked out |
-| `N uncommitted change(s) in the working tree` | Your work is never touched |
-| `diverged: N ahead, M behind` | Local commits that the remote does not have; resolve by hand |
-| `git fetch failed: …` | No network, or credentials that need a prompt |
-| `already up to date` | Nothing to do |
+| Reason                                        | Meaning                                                      |
+| --------------------------------------------- | ------------------------------------------------------------ |
+| `not a git repository`                        | The project folder is not a checkout                         |
+| `on branch X, not main`                       | Only `main` is updated, and only when it is checked out      |
+| `N uncommitted change(s) in the working tree` | Your work is never touched                                   |
+| `diverged: N ahead, M behind`                 | Local commits that the remote does not have; resolve by hand |
+| `git fetch failed: …`                         | No network, or credentials that need a prompt                |
+| `already up to date`                          | Nothing to do                                                |
 
 `git pull --ff-only` means a merge is never attempted. All of these are re-checked inside the detached script too, since the working tree could have changed between the decision and the pull.
 
@@ -305,13 +305,13 @@ Files are safe to edit or delete by hand — the server polls the folder and pic
 
 The `crons` folder is polled every 3 seconds. Changes made outside the app are applied to the scheduler and announced in the UI as a toast:
 
-| On disk | Effect | Toast |
-| --- | --- | --- |
-| New `.json` file | Scheduled | `Cron file added: "X" — now scheduled` |
-| File edited | Rescheduled | `Cron file updated: "X" — rescheduled` |
-| File deleted | Unscheduled | `Cron file deleted: "X" — unscheduled` |
+| On disk              | Effect                       | Toast                                                             |
+| -------------------- | ---------------------------- | ----------------------------------------------------------------- |
+| New `.json` file     | Scheduled                    | `Cron file added: "X" — now scheduled`                            |
+| File edited          | Rescheduled                  | `Cron file updated: "X" — rescheduled`                            |
+| File deleted         | Unscheduled                  | `Cron file deleted: "X" — unscheduled`                            |
 | File is invalid JSON | Keeps its last good schedule | `x.json is not valid JSON — still running its last saved version` |
-| Invalid file fixed | Rescheduled | `Cron file fixed: "X" — rescheduled` |
+| Invalid file fixed   | Rescheduled                  | `Cron file fixed: "X" — rescheduled`                              |
 
 Set `WATCH_INTERVAL_MS` to change the interval, or `0` to switch the watcher off.
 
@@ -369,15 +369,15 @@ Two Server-Sent Event streams, no polling loops in the UI:
 
 ## Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PORT` | `4321` | HTTP port |
-| `HOST` | `127.0.0.1` | Bind address. Localhost only by default; `0.0.0.0` accepts connections from your network, with the caveats in [Network access](#network-access). |
-| `CONDUCTOR_HOME` | `~/.claude/claude-conductor` | Storage root |
-| `CLAUDE_BIN` | `claude` | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`. |
-| `WATCH_INTERVAL_MS` | `3000` | How often the crons folder is polled for outside changes. `0` disables it. |
-| `CONDUCTOR_LAUNCHD_LABEL` | `local.claude-conductor` | The launchd service the updater restarts |
-| `CONDUCTOR_PROJECT_DIR` | the checkout this code lives in | Which repository the update check looks at |
+| Variable                  | Default                         | Purpose                                                                                                                                          |
+| ------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PORT`                    | `4321`                          | HTTP port                                                                                                                                        |
+| `HOST`                    | `127.0.0.1`                     | Bind address. Localhost only by default; `0.0.0.0` accepts connections from your network, with the caveats in [Network access](#network-access). |
+| `CONDUCTOR_HOME`          | `~/.claude/claude-conductor`    | Storage root                                                                                                                                     |
+| `CLAUDE_BIN`              | `claude`                        | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`.                                                                 |
+| `WATCH_INTERVAL_MS`       | `3000`                          | How often the crons folder is polled for outside changes. `0` disables it.                                                                       |
+| `CONDUCTOR_LAUNCHD_LABEL` | `local.claude-conductor`        | The launchd service the updater restarts                                                                                                         |
+| `CONDUCTOR_PROJECT_DIR`   | the checkout this code lives in | Which repository the update check looks at                                                                                                       |
 
 ## Model
 
@@ -399,12 +399,12 @@ The field defaults to `~/` on a new cron and autocompletes as you type: suggesti
 
 Paths are stored exactly as typed. They are resolved at spawn time:
 
-| Stored | Runs in |
-| --- | --- |
-| `~/code/project` | `/Users/you/code/project` |
-| `~` or blank | `/Users/you` |
-| `Documents` | `/Users/you/Documents` (relative means relative to home) |
-| `/tmp` | `/tmp` |
+| Stored           | Runs in                                                  |
+| ---------------- | -------------------------------------------------------- |
+| `~/code/project` | `/Users/you/code/project`                                |
+| `~` or blank     | `/Users/you`                                             |
+| `Documents`      | `/Users/you/Documents` (relative means relative to home) |
+| `/tmp`           | `/tmp`                                                   |
 
 Each log's header records the resolved absolute path, so there is never a question about where a run happened.
 
@@ -416,51 +416,51 @@ For sub-minute schedules add a sixth field **at the front** for seconds `(s m h 
 
 Each field name in the form's hint explains itself on hover:
 
-| Field | Range |
-| --- | --- |
-| `s` | 0 to 59 (only in the six-field form) |
-| `m` | 0 to 59 |
-| `h` | 0 to 23 |
-| `dom` | 1 to 31 |
-| `mon` | 1 to 12, or JAN to DEC |
+| Field | Range                                           |
+| ----- | ----------------------------------------------- |
+| `s`   | 0 to 59 (only in the six-field form)            |
+| `m`   | 0 to 59                                         |
+| `h`   | 0 to 23                                         |
+| `dom` | 1 to 31                                         |
+| `mon` | 1 to 12, or JAN to DEC                          |
 | `dow` | 0 to 7, or SUN to SAT. 0 and 7 are both Sunday. |
 
 Under the field are shortcuts that fill it in for you:
 
-| Control | Writes |
-| --- | --- |
-| **30s** | `*/30 * * * * *` |
-| **15m** | `*/15 * * * *` |
-| **1hr** | `0 * * * *` |
+| Control               | Writes                 |
+| --------------------- | ---------------------- |
+| **30s**               | `*/30 * * * * *`       |
+| **15m**               | `*/15 * * * *`         |
+| **1hr**               | `0 * * * *`            |
 | **Daily at** + a time | `30 9 * * *` for 09:30 |
 
 As the field changes, a green line below it shows when the expression next fires — `Next run: in 12h 58m · Sep 10, 2:45:00 PM`. An expression that does not parse shows the reason in amber instead, and is also rejected on save.
 
 ## API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/api/crons` | List, with next run time and live-run state |
-| POST | `/api/crons` | Create |
-| GET, PUT, DELETE | `/api/crons/:id` | Read, update, delete |
-| POST | `/api/crons/:id/run` | Trigger now (409 if already running, or if crons are paused) |
-| POST | `/api/crons/:id/stop` | Kill the in-flight run (409 if not running) |
-| GET | `/api/crons/:id/logs` | Run history, newest first |
-| GET | `/api/crons/:id/logs/:file` | One log as JSON |
-| GET | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream |
-| GET | `/api/events` | Activity stream |
-| GET | `/api/config` | Storage paths and retention limit |
-| GET | `/api/health` | Liveness, how many crons are scheduled, whether they are paused, and `updateAvailable` with the commits behind |
-| GET, PUT | `/api/settings` | Read settings; write `selfUpdate` and `updateCheckIntervalHours` |
-| GET | `/api/pause` | Pause state, the offered lengths, and how many runs are still in flight |
-| POST | `/api/pause` | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}` |
-| DELETE | `/api/pause` | Resume (409 if not paused, or if the pause belongs to an update) |
-| GET | `/api/update/check` | Whether `main` is behind. Read-only, never pulls |
-| POST | `/api/update/run` | Apply a pending update now. 202 with the updater's pid, or `waiting: true` and a null pid while runs drain. 409 and the reason if there is nothing to do. Ignores `selfUpdate` |
-| GET | `/api/browse?path=` | Subdirectories matching a partial path, for the Working Directory field |
-| GET | `/api/next-run?cron=` | Whether an expression parses, and when it next fires |
-| GET | `/api/models` | Discovered models, plus whether discovery is running |
-| POST | `/api/models/refresh` | Re-run discovery |
+| Method           | Path                               | Purpose                                                                                                                                                                        |
+| ---------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| GET              | `/api/crons`                       | List, with next run time and live-run state                                                                                                                                    |
+| POST             | `/api/crons`                       | Create                                                                                                                                                                         |
+| GET, PUT, DELETE | `/api/crons/:id`                   | Read, update, delete                                                                                                                                                           |
+| POST             | `/api/crons/:id/run`               | Trigger now (409 if already running, or if crons are paused)                                                                                                                   |
+| POST             | `/api/crons/:id/stop`              | Kill the in-flight run (409 if not running)                                                                                                                                    |
+| GET              | `/api/crons/:id/logs`              | Run history, newest first                                                                                                                                                      |
+| GET              | `/api/crons/:id/logs/:file`        | One log as JSON                                                                                                                                                                |
+| GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
+| GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
+| GET              | `/api/config`                      | Storage paths and retention limit                                                                                                                                              |
+| GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, and `updateAvailable` with the commits behind                                                                 |
+| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
+| GET              | `/api/pause`                       | Pause state, the offered lengths, and how many runs are still in flight                                                                                                        |
+| POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |
+| DELETE           | `/api/pause`                       | Resume (409 if not paused, or if the pause belongs to an update)                                                                                                               |
+| GET              | `/api/update/check`                | Whether `main` is behind. Read-only, never pulls                                                                                                                               |
+| POST             | `/api/update/run`                  | Apply a pending update now. 202 with the updater's pid, or `waiting: true` and a null pid while runs drain. 409 and the reason if there is nothing to do. Ignores `selfUpdate` |
+| GET              | `/api/browse?path=`                | Subdirectories matching a partial path, for the Working Directory field                                                                                                        |
+| GET              | `/api/next-run?cron=`              | Whether an expression parses, and when it next fires                                                                                                                           |
+| GET              | `/api/models`                      | Discovered models, plus whether discovery is running                                                                                                                           |
+| POST             | `/api/models/refresh`              | Re-run discovery                                                                                                                                                               |
 
 ## Notes
 
