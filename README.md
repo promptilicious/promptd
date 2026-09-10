@@ -155,6 +155,8 @@ The Settings page runs a check as soon as it opens and says what it found:
 
 **Check for updates** re-runs it. **Update now** applies a pending update immediately and works whether or not `selfUpdate` is on — that is the point of it: turn self update off and update on your own schedule, from the page. Both buttons use the same code path as the daily check, so there is no second behaviour to keep in step.
 
+After **Update now**, the page counts down from 10 and reloads onto the restarted server. Navigating away cancels the reload, so it cannot interrupt a form you moved on to. If the update runs `npm install` the restart can take longer than 10 seconds and the reload will arrive early; refresh again once the server is back.
+
 ### When it declines to update
 
 The checker refuses rather than guesses, and says why in the server log and in `/api/update/check`:
@@ -278,6 +280,18 @@ The numbers come from the `result` event's `modelUsage`, `duration_ms`, `usage` 
 
 A run that is stopped or that fails before producing a result event has no statistics block, only the footer.
 
+## Knowing the page is out of date
+
+`GET /api/health` reports the commit the server process started at, read once at startup rather than per request. That is deliberate: it identifies the code actually running, so it stays put when an update moves the working tree underneath it.
+
+The page records that commit on load and re-checks every 20 seconds, and on every reconnect. When the server comes back on a different commit, the header badge turns amber and reads **live - refresh window**, with the detail on hover:
+
+```
+This page loaded from b62237b; the server now runs newer code. Reload to catch up.
+```
+
+Nothing is forced. The page keeps working; the badge says a reload will get you the new version. Outside a git checkout there is no commit to compare, and the badge behaves as before.
+
 ## Real-time updates
 
 Two Server-Sent Event streams, no polling loops in the UI:
@@ -368,7 +382,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream |
 | GET | `/api/events` | Activity stream |
 | GET | `/api/config` | Storage paths and retention limit |
-| GET | `/api/health` | Liveness, plus how many crons are scheduled |
+| GET | `/api/health` | Liveness, how many crons are scheduled, and the commit this process is running |
 | GET, PUT | `/api/settings` | Read settings; write `selfUpdate` and `updateCheckIntervalHours` |
 | GET | `/api/update/check` | Whether `main` is behind. Read-only, never pulls |
 | POST | `/api/update/run` | Apply a pending update now. 202 with the updater's pid, or 409 and the reason. Ignores `selfUpdate` |

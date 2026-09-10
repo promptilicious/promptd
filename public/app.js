@@ -5,6 +5,11 @@ const toastsEl = document.getElementById('toasts');
 
 let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
+let reloadTimer = null; // counting down to a reload after an update was started
+// The commit the server reported when this page loaded. If it ever differs, the
+// server has been updated underneath us and this page is running old code.
+let loadedCommit = null;
+let staleBuild = false;
 
 // ---- helpers ----------------------------------------------------------
 
@@ -689,9 +694,21 @@ async function renderSettings() {
     updateButton.textContent = 'Updating…';
     try {
       const result = await api('/api/update/run', { method: 'POST' });
-      status.textContent = `Update started (pid ${result.pid}). Progress in ${result.updateLog}.`;
       status.className = 'hint ok';
-      toast('Update started — the server restarts when it finishes');
+      toast(`Update started — progress in ${result.updateLog}`);
+
+      // The update restarts the server, so reload onto the new version.
+      let secondsLeft = 10;
+      const countdown = () => {
+        if (secondsLeft <= 0) {
+          location.reload();
+          return;
+        }
+        status.textContent = `Update started (pid ${result.pid}). Reloading in ${secondsLeft}s…`;
+        secondsLeft -= 1;
+        reloadTimer = setTimeout(countdown, 1000);
+      };
+      countdown();
     } catch (err) {
       status.textContent = err.message;
       status.className = 'hint warn';
@@ -881,6 +898,7 @@ async function route() {
   const hash = location.hash.replace(/^#/, '') || '/';
   closeLogStream();
   clearTimeout(modelPollTimer);
+  clearTimeout(reloadTimer);
   const [, section, id] = hash.split('/');
   try {
     if (section === 'settings') await renderSettings();
@@ -912,8 +930,8 @@ function connectEvents() {
   const events = new EventSource('/api/events');
 
   events.addEventListener('hello', () => {
-    connEl.textContent = 'live';
-    connEl.className = 'conn live';
+    setConnState();
+    checkHealth();
   });
 
   for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping']) {
@@ -942,6 +960,32 @@ function connectEvents() {
   };
 }
 
+/** Live, or live-but-out-of-date once the server has moved to another commit. */
+function setConnState() {
+  if (staleBuild) {
+    connEl.textContent = 'live - refresh window';
+    connEl.className = 'conn stale';
+    connEl.title = `This page loaded from ${loadedCommit}; the server now runs newer code. Reload to catch up.`;
+    return;
+  }
+  connEl.textContent = 'live';
+  connEl.className = 'conn live';
+  connEl.title = 'Live connection';
+}
+
+/** Notices when the running commit changes, which means an update landed. */
+async function checkHealth() {
+  try {
+    const health = await api('/api/health');
+    if (!health.commit) return; // not a git checkout, nothing to compare
+    if (!loadedCommit) loadedCommit = health.commit;
+    else if (health.commit !== loadedCommit) staleBuild = true;
+    setConnState();
+  } catch {
+    /* the SSE error handler already reports a lost connection */
+  }
+}
+
 async function loadConfig() {
   try {
     const config = await api('/api/config');
@@ -953,6 +997,8 @@ async function loadConfig() {
 }
 
 window.addEventListener('hashchange', route);
+// Cheap, and a restart is exactly when the running commit changes.
+setInterval(checkHealth, 20000);
 // Keeps "3m ago" / "in 20m" honest without hammering the API.
 setInterval(() => {
   const [, section] = (location.hash.replace(/^#/, '') || '/').split('/');
@@ -960,5 +1006,6 @@ setInterval(() => {
 }, 15000);
 
 loadConfig();
+checkHealth();
 connectEvents();
 route();

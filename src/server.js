@@ -10,7 +10,7 @@ import { cronService, previewNextRun, validateCronExpression } from './cronServi
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
-import { checkForUpdates, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
+import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -382,7 +382,16 @@ app.get('/api/events', (req, res) => {
   });
 });
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, scheduled: cronService.jobs.size }));
+/**
+ * The commit is read once at startup, not per request: it identifies the code
+ * this process is running, which is what the page needs in order to notice that
+ * an update has moved on without it.
+ */
+let runningCommit = null;
+
+app.get('/api/health', (_req, res) =>
+  res.json({ ok: true, scheduled: cronService.jobs.size, commit: runningCommit }),
+);
 
 app.use((err, _req, res, _next) => {
   console.error('[server]', err);
@@ -391,6 +400,7 @@ app.use((err, _req, res, _next) => {
 
 await ensureDirs();
 await loadSettings(); // writes settings.json with defaults on first run
+runningCommit = await currentCommit();
 await cronService.reload();
 await cronFileWatcher.start();
 // Discovery spawns a probe per candidate model, so let it run behind the server
@@ -399,6 +409,6 @@ modelCatalog.refresh();
 selfUpdater.start();
 
 app.listen(PORT, HOST, () => {
-  console.log(`Claude Conductor listening on http://${HOST}:${PORT}`);
+  console.log(`Claude Conductor listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
   console.log(`Storage: ${ROOT}`);
 });

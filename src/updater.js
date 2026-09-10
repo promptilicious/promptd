@@ -45,6 +45,12 @@ function git(args, timeout = 60000) {
   });
 }
 
+/** The commit the project is checked out at, or null outside a repository. */
+export async function currentCommit() {
+  const head = await git(['rev-parse', '--short', 'HEAD'], 10000);
+  return head.ok && head.out ? head.out : null;
+}
+
 /**
  * Is the project's main branch behind its remote? Returns a reason instead of a
  * count whenever the question cannot be answered safely.
