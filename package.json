@@ -1,0 +1,19 @@
+{
+  "name": "claude-conductor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight web UI to schedule and run Claude prompts on a cron",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "croner": "^9.0.0",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,351 @@
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import { bus, sseInit, sseSend } from './events.js';
+import { CRONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
+import { cronService, previewNextRun, validateCronExpression } from './cronService.js';
+import { cronFileWatcher } from './watcher.js';
+import { modelCatalog } from './models.js';
+import {
+  MAX_LOGS_PER_CRON,
+  createCron,
+  deleteCron,
+  getCron,
+  listCrons,
+  listLogs,
+  logPath,
+  readLog,
+  updateCron,
+} from './store.js';
+
+const PORT = Number(process.env.PORT || 4321);
+const HOST = process.env.HOST || '127.0.0.1';
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static(PUBLIC_DIR));
+
+/** Validates and normalizes the cron form payload. */
+function readForm(body) {
+  const name = String(body?.name ?? '').trim();
+  const expression = String(body?.cron ?? '').trim();
+  const errors = [];
+  if (!name) errors.push('Name is required.');
+  if (name.length > 120) errors.push('Name must be 120 characters or fewer.');
+  if (!expression) errors.push('Cron is required.');
+  else {
+    const check = validateCronExpression(expression);
+    if (!check.ok) errors.push(`Cron expression is not valid: ${check.error}`);
+  }
+  if (!String(body?.prompt ?? '').trim()) errors.push('Prompt is required.');
+  return {
+    errors,
+    value: {
+      name,
+      description: String(body?.description ?? '').trim(),
+      cron: expression,
+      workingDirectory: String(body?.workingDirectory ?? '').trim(),
+      model: String(body?.model ?? '').trim(),
+      prompt: String(body?.prompt ?? ''),
+      isActive: Boolean(body?.isActive),
+    },
+  };
+}
+
+function decorate(cron) {
+  const run = cronService.currentRun(cron.id);
+  return {
+    ...cron,
+    nextRunAt: cronService.nextRun(cron.id),
+    isRunning: Boolean(run),
+    currentRun: run,
+  };
+}
+
+app.get('/api/config', (_req, res) => {
+  res.json({ storageRoot: ROOT, cronsDir: CRONS_DIR, logsDir: LOGS_DIR, maxLogsPerCron: MAX_LOGS_PER_CRON });
+});
+
+/**
+ * Directory suggestions for the Working Directory field.
+ * Splits what the user typed into an already-typed parent and a partial name,
+ * then lists the parent's subdirectories that start with that partial.
+ */
+app.get('/api/browse', async (req, res, next) => {
+  const typed = String(req.query.path ?? '');
+  try {
+    // Everything up to the last slash is settled; what follows is being typed.
+    const cut = typed.lastIndexOf('/');
+    const parentTyped = cut >= 0 ? typed.slice(0, cut + 1) : '~/';
+    const partial = cut >= 0 ? typed.slice(cut + 1) : typed;
+    const parentPath = resolveUserPath(parentTyped) ?? os.homedir();
+
+    const entries = await fsp.readdir(parentPath, { withFileTypes: true }).catch(() => []);
+    const wanted = partial.toLowerCase();
+    const names = [];
+    for (const entry of entries) {
+      if (!entry.name.toLowerCase().startsWith(wanted)) continue;
+      if (entry.name.startsWith('.') && !partial.startsWith('.')) continue;
+      if (entry.isDirectory()) names.push(entry.name);
+      else if (entry.isSymbolicLink()) {
+        const isDir = await fsp
+          .stat(path.join(parentPath, entry.name))
+          .then((s) => s.isDirectory())
+          .catch(() => false);
+        if (isDir) names.push(entry.name);
+      }
+      if (names.length >= 200) break;
+    }
+    names.sort((a, b) => a.localeCompare(b));
+
+    // Suggestions come back in the same style the user is typing, tilde included.
+    const suggestions = names.slice(0, 25).map((name) => `${parentTyped}${name}/`);
+    const resolved = resolveUserPath(typed);
+    const exists = resolved
+      ? await fsp
+          .stat(resolved)
+          .then((s) => s.isDirectory())
+          .catch(() => false)
+      : false;
+    res.json({ suggestions, resolved, exists, truncated: names.length > 25 });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Models the installed CLI recognises, for the Model dropdown. */
+app.get('/api/models', (_req, res) => {
+  res.json(modelCatalog.state());
+});
+
+/** Re-runs discovery, e.g. after the CLI is updated. */
+app.post('/api/models/refresh', async (_req, res, next) => {
+  try {
+    await modelCatalog.refresh();
+    res.json(modelCatalog.state());
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Live feedback for the Cron field: is this expression valid, and when does it next fire? */
+app.get('/api/next-run', (req, res) => {
+  const expression = String(req.query.cron ?? '').trim();
+  if (!expression) return res.json({ valid: false, error: 'Cron is required.', nextRunAt: null });
+  const check = validateCronExpression(expression);
+  if (!check.ok) return res.json({ valid: false, error: check.error, nextRunAt: null });
+  res.json({ valid: true, error: null, nextRunAt: previewNextRun(expression) });
+});
+
+app.get('/api/crons', async (_req, res, next) => {
+  try {
+    const crons = await listCrons();
+    res.json(crons.map(decorate));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/crons/:id', async (req, res, next) => {
+  try {
+    const cron = await getCron(req.params.id);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    res.json(decorate(cron));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/crons', async (req, res, next) => {
+  try {
+    const { errors, value } = readForm(req.body);
+    if (errors.length) return res.status(400).json({ error: errors.join(' ') });
+    const cron = await createCron(value);
+    await cronService.reload();
+    res.status(201).json(decorate(cron));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.put('/api/crons/:id', async (req, res, next) => {
+  try {
+    const { errors, value } = readForm(req.body);
+    if (errors.length) return res.status(400).json({ error: errors.join(' ') });
+    const cron = await updateCron(req.params.id, value);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    await cronService.reload();
+    res.json(decorate(cron));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/api/crons/:id', async (req, res, next) => {
+  try {
+    const removed = await deleteCron(req.params.id);
+    if (!removed) return res.status(404).json({ error: 'cron not found' });
+    await cronService.reload();
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/crons/:id/run', async (req, res, next) => {
+  try {
+    const cron = await getCron(req.params.id);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const run = await cronService.trigger(cron.id, 'manual');
+    if (!run) return res.status(409).json({ error: 'this cron is already running' });
+    res.status(202).json(run);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/crons/:id/stop', async (req, res, next) => {
+  try {
+    const cron = await getCron(req.params.id);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const run = await cronService.stop(cron.id, 'user');
+    if (!run) return res.status(409).json({ error: 'this cron is not running' });
+    // The schedule is untouched by a stop, so report when it next fires.
+    res.status(202).json({ ...run, nextRunAt: cronService.nextRun(cron.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/crons/:id/logs', async (req, res, next) => {
+  try {
+    const cron = await getCron(req.params.id);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const logs = await listLogs(cron.name);
+    res.json({
+      cron: decorate(cron),
+      logs: logs.map((log) => ({ ...log, isRunning: cronService.isRunningLog(cron.id, log.file) })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/crons/:id/logs/:file', async (req, res, next) => {
+  try {
+    const cron = await getCron(req.params.id);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const text = await readLog(cron.name, req.params.file);
+    res.json({ file: req.params.file, text, isRunning: cronService.isRunningLog(cron.id, req.params.file) });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'log not found' });
+    if (err.message === 'invalid log file name') return res.status(400).json({ error: err.message });
+    next(err);
+  }
+});
+
+/**
+ * Streams one log file: everything written so far, then each new chunk as it lands.
+ * Polls the file size rather than using fs.watch, which is unreliable on macOS.
+ */
+app.get('/api/crons/:id/logs/:file/stream', async (req, res, next) => {
+  let target;
+  let cron;
+  try {
+    cron = await getCron(req.params.id);
+    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    target = logPath(cron.name, req.params.file);
+    await fsp.access(target);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'log not found' });
+    if (err.message === 'invalid log file name') return res.status(400).json({ error: err.message });
+    return next(err);
+  }
+
+  sseInit(res);
+  let position = 0;
+  let closed = false;
+  let reading = false;
+
+  const pump = async () => {
+    if (closed || reading) return;
+    reading = true;
+    let handle;
+    try {
+      handle = await fsp.open(target, 'r');
+      const { size } = await handle.stat();
+      if (size > position) {
+        const length = size - position;
+        const buffer = Buffer.alloc(length);
+        await handle.read(buffer, 0, length, position);
+        position = size;
+        if (!closed) sseSend(res, 'chunk', { text: buffer.toString('utf8') });
+      } else if (size < position) {
+        // File was replaced or truncated; start over.
+        position = 0;
+      }
+    } catch (err) {
+      if (!closed) sseSend(res, 'error', { message: err.message });
+    } finally {
+      await handle?.close().catch(() => {});
+      reading = false;
+    }
+  };
+
+  const stop = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+    res.end();
+  };
+
+  const tick = async () => {
+    const live = cronService.isRunningLog(cron.id, req.params.file);
+    await pump();
+    if (!live && !closed) {
+      sseSend(res, 'done', { file: req.params.file });
+      stop();
+    }
+  };
+
+  const timer = setInterval(() => {
+    tick().catch(() => stop());
+  }, 400);
+  req.on('close', stop);
+  await tick();
+});
+
+/** Fans out cron and run activity so the UI can update without polling. */
+app.get('/api/events', (req, res) => {
+  sseInit(res);
+  sseSend(res, 'hello', { at: new Date().toISOString() });
+  const onEvent = (event) => sseSend(res, event.type, event);
+  bus.on('event', onEvent);
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    bus.off('event', onEvent);
+  });
+});
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, scheduled: cronService.jobs.size }));
+
+app.use((err, _req, res, _next) => {
+  console.error('[server]', err);
+  res.status(500).json({ error: err.message });
+});
+
+await ensureDirs();
+await cronService.reload();
+await cronFileWatcher.start();
+// Discovery spawns a probe per candidate model, so let it run behind the server
+// coming up rather than delaying the first page load by several seconds.
+modelCatalog.refresh();
+
+app.listen(PORT, HOST, () => {
+  console.log(`Claude Conductor listening on http://${HOST}:${PORT}`);
+  console.log(`Storage: ${ROOT}`);
+});
