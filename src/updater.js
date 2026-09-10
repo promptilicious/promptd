@@ -104,6 +104,35 @@ class SelfUpdater {
     this.draining = false;
     this.drainTimer = null;
     this.drainStartedAt = null;
+    /**
+     * The last answer to "is main behind?", whoever asked. Checking happens on
+     * the interval whether or not selfUpdate is on, so the header badge can
+     * offer an update the server has been told not to apply on its own.
+     */
+    this.lastCheck = { updatable: false, behind: 0, head: null, reason: null, at: null };
+  }
+
+  /** What the health endpoint and the header badge read. */
+  availability() {
+    return {
+      updateAvailable: Boolean(this.lastCheck.updatable),
+      updateBehind: this.lastCheck.behind,
+      updateCheckedAt: this.lastCheck.at,
+    };
+  }
+
+  /** Remembers a check result, announcing only a change of answer. */
+  recordCheck(result) {
+    const was = Boolean(this.lastCheck.updatable);
+    this.lastCheck = {
+      updatable: Boolean(result?.updatable),
+      behind: Number(result?.behind) || 0,
+      head: result?.head ?? null,
+      reason: result?.reason ?? null,
+      at: new Date().toISOString(),
+    };
+    if (was !== this.lastCheck.updatable) emit('update:availability', this.availability());
+    return result;
   }
 
   /** What the page polls while an update is queued behind a running cron. */
@@ -145,7 +174,7 @@ class SelfUpdater {
       // Already committed to updating; a second press just reports the wait.
       return { updatable: true, launched: true, waiting: true, pid: null, ...this.state() };
     }
-    const result = await checkForUpdates();
+    const result = this.recordCheck(await checkForUpdates());
     if (!result.updatable) {
       console.log(`[update] no update applied: ${result.reason}`);
       return { ...result, launched: false };
@@ -200,21 +229,36 @@ class SelfUpdater {
     this.draining = false;
   }
 
+  /**
+   * The interval always checks; `selfUpdate` decides only whether a pending
+   * update is applied. With it off the answer is kept for the header badge, so
+   * an update can be offered without ever being taken.
+   */
   async tick(force = false) {
     if (this.busy || this.draining) return null;
     const settings = await loadSettings();
-    if (!settings.selfUpdate) return null;
     if (!force && !this.due(settings)) return null;
 
     this.busy = true;
     try {
-      const result = await this.applyIfBehind();
+      const result = settings.selfUpdate
+        ? await this.applyIfBehind()
+        : this.reportOnly(this.recordCheck(await checkForUpdates()));
       // Only the scheduled check moves the daily clock; pressing the button does not.
       await patchSettings({ lastUpdateCheckAt: new Date().toISOString() });
       return result;
     } finally {
       this.busy = false;
     }
+  }
+
+  reportOnly(result) {
+    console.log(
+      result.updatable
+        ? `[update] ${result.behind} commit(s) behind ${REMOTE}/${BRANCH}; self update is off, so nothing was applied`
+        : `[update] no update available: ${result.reason}`,
+    );
+    return { ...result, launched: false, reason: result.updatable ? 'self update is off' : result.reason };
   }
 
   /**
