@@ -33,15 +33,49 @@ Overrides, if you need them:
 | Variable | Default | |
 | --- | --- | --- |
 | `PORT` | `4321` | Port the server listens on |
+| `HOST` | `127.0.0.1` | Bind address. `0.0.0.0` accepts connections from your network — read [Network access](#network-access) first |
 | `LABEL` | `local.claude-conductor` | launchd service name |
 | `FORCE` | unset | Replace an already-registered agent |
 
 ```bash
 PORT=5000 ./scripts/register-app-mac-os.sh     # a different port
+HOST=0.0.0.0 ./scripts/register-app-mac-os.sh  # reachable from your network
 FORCE=1 ./scripts/register-app-mac-os.sh       # re-register after moving the project
 ```
 
 Run again without `FORCE` and it changes nothing, just prints how to restart, replace or remove what is already there.
+
+### Network access
+
+By default the server binds `127.0.0.1`, so only this Mac can reach it. To reach it from a phone or another computer on your LAN, register with `HOST=0.0.0.0`:
+
+```bash
+HOST=0.0.0.0 ./scripts/register-app-mac-os.sh
+```
+
+The address goes into the plist, so it survives restarts and every login. On success the script prints the LAN URL — `http://<this-mac-ip>:4321` — which is the address other devices use. Already registered? Add `FORCE=1` to replace the existing agent:
+
+```bash
+HOST=0.0.0.0 FORCE=1 ./scripts/register-app-mac-os.sh
+```
+
+To go back to this machine only, re-register with the default:
+
+```bash
+FORCE=1 ./scripts/register-app-mac-os.sh
+```
+
+> **⚠️ Warning — no password, no authentication.** Claude Conductor has no login, no accounts, and no access control of any kind. Once it is bound to `0.0.0.0`, anyone who can reach the port can add a cron, run an arbitrary Claude prompt in any directory this Mac can read, browse your filesystem through the directory autocomplete, and read every past run's output. It spends your Claude quota doing it.
+>
+> Protecting it is on you. Keep it on a network you control, and treat exposure as your risk to accept:
+>
+> - Never put it on a public IP, and never forward a router port to it. Nothing here is safe on the open internet.
+> - On an untrusted network — cafés, hotels, shared offices, guest Wi-Fi — leave it on `127.0.0.1`.
+> - Prefer a private overlay to opening the LAN: Tailscale or WireGuard gives you remote access without anyone else on the network being able to reach the port.
+> - If you need it on a shared LAN, put access control in front of it — a reverse proxy with HTTP basic auth and TLS, or a firewall rule limiting the source addresses.
+> - macOS may ask you to allow incoming connections for `node` the first time. That prompt is the firewall, not authentication.
+>
+> You accept the risk of unauthorized access when you change this setting.
 
 ### Doing it by hand
 
@@ -66,6 +100,7 @@ cat > ~/Library/LaunchAgents/local.claude-conductor.plist <<EOF
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PORT</key><string>4321</string>
+    <key>HOST</key><string>127.0.0.1</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -84,6 +119,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-conductor.p
 ```
 
 That starts it now and at every login. Open http://127.0.0.1:4321.
+
+Set `HOST` to `0.0.0.0` in that plist to accept connections from your network — read [Network access](#network-access) before you do. Editing the plist takes a `bootout` then `bootstrap`, not a `kickstart`.
 
 ### Start and stop
 
@@ -290,7 +327,7 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `4321` | HTTP port |
-| `HOST` | `127.0.0.1` | Bind address. Localhost only by default. |
+| `HOST` | `127.0.0.1` | Bind address. Localhost only by default; `0.0.0.0` accepts connections from your network, with the caveats in [Network access](#network-access). |
 | `CONDUCTOR_HOME` | `~/.claude/claude-conductor` | Storage root |
 | `CLAUDE_BIN` | `claude` | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`. |
 | `WATCH_INTERVAL_MS` | `3000` | How often the crons folder is polled for outside changes. `0` disables it. |
@@ -379,7 +416,7 @@ As the field changes, a green line below it shows when the expression next fires
 
 ## Notes
 
-- The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control.
+- The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
 - Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone.
 - Renaming a cron moves its log folder, so history follows the new name.

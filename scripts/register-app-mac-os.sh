@@ -6,13 +6,23 @@
 #
 # Overrides:
 #   PORT=4321                       port the server listens on
+#   HOST=0.0.0.0                    bind address; 0.0.0.0 accepts connections
+#                                   from your whole network. The app has no
+#                                   password — see the README before using it.
 #   LABEL=local.claude-conductor    launchd service name
 #   FORCE=1                         re-register if it is already registered
 set -uo pipefail
 
 PORT="${PORT:-4321}"
+HOST="${HOST:-127.0.0.1}"
 LABEL="${LABEL:-local.claude-conductor}"
 FORCE="${FORCE:-0}"
+
+# 0.0.0.0 and :: listen on every interface; anything else is reachable at itself.
+case "$HOST" in
+  0.0.0.0|::|"") CHECK_HOST="127.0.0.1" ;;
+  *)             CHECK_HOST="$HOST" ;;
+esac
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -40,6 +50,18 @@ ok "node $("$NODE_BIN" -v) at $NODE_BIN"
 
 [ -f "$PROJECT_DIR/src/server.js" ] || die "$PROJECT_DIR does not look like the project (no src/server.js)"
 ok "project at $PROJECT_DIR"
+
+case "$HOST" in
+  127.0.0.1|localhost|::1)
+    ok "binding $HOST — this machine only"
+    ;;
+  *)
+    warn "binding $HOST — reachable from your network."
+    warn "Claude Conductor has no password. Anyone who can reach this port can run"
+    warn "arbitrary Claude prompts in any directory this Mac can read. Only do this on"
+    warn "a network you trust, and see 'Network access' in the README."
+    ;;
+esac
 
 # launchd gets a minimal PATH, so claude has to be findable from the one we set.
 CLAUDE_BIN="$(command -v claude || true)"
@@ -109,6 +131,7 @@ cat > "$PLIST" <<EOF
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$AGENT_PATH</string>
     <key>PORT</key><string>$PORT</string>
+    <key>HOST</key><string>$HOST</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -128,9 +151,13 @@ launchctl bootstrap "$DOMAIN" "$PLIST" 2>&1 || die "launchctl bootstrap failed. 
 
 printf '  • waiting for the server to answer'
 for _ in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+  if curl -fsS "http://$CHECK_HOST:$PORT/api/health" >/dev/null 2>&1; then
     printf '\n'
-    ok "serving on http://127.0.0.1:$PORT"
+    ok "serving on http://$CHECK_HOST:$PORT"
+    if [ "$CHECK_HOST" = "127.0.0.1" ] && [ "$HOST" != "127.0.0.1" ]; then
+      LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+      [ -n "$LAN_IP" ] && ok "on your network at http://$LAN_IP:$PORT"
+    fi
     printf '\nStart at login is on. Useful commands:\n\n'
     printf '  Restart      launchctl kickstart -k %s/%s\n' "$DOMAIN" "$LABEL"
     printf '  Stop         launchctl bootout %s/%s\n' "$DOMAIN" "$LABEL"
@@ -144,4 +171,4 @@ for _ in $(seq 1 30); do
 done
 
 printf '\n'
-die "registered, but nothing answered on port $PORT within 30s. Check $LOG_FILE"
+die "registered, but nothing answered on $CHECK_HOST:$PORT within 30s. Check $LOG_FILE"
