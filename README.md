@@ -20,7 +20,32 @@ npm run dev        # same, restarts on file changes
 
 ## Start at login (macOS)
 
-macOS starts per-user background processes with **launchd**, via a LaunchAgent plist in `~/Library/LaunchAgents`. Paste this block to generate one with your own absolute paths filled in:
+macOS starts per-user background processes with **launchd**. Run this once:
+
+```bash
+./scripts/register-app-mac-os.sh
+```
+
+It finds your `node` and `claude`, runs `npm install` if `node_modules` is missing, writes the LaunchAgent plist with absolute paths, registers it, and waits until the server answers before reporting success. Output ends with the commands for restarting, stopping and removing it.
+
+Overrides, if you need them:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `PORT` | `4321` | Port the server listens on |
+| `LABEL` | `local.claude-conductor` | launchd service name |
+| `FORCE` | unset | Replace an already-registered agent |
+
+```bash
+PORT=5000 ./scripts/register-app-mac-os.sh     # a different port
+FORCE=1 ./scripts/register-app-mac-os.sh       # re-register after moving the project
+```
+
+Run again without `FORCE` and it changes nothing, just prints how to restart, replace or remove what is already there.
+
+### Doing it by hand
+
+The script writes this; there is no need to do it yourself unless you want to change something it does not expose:
 
 ```bash
 mkdir -p ~/Library/Logs/claude-conductor
@@ -52,7 +77,7 @@ cat > ~/Library/LaunchAgents/local.claude-conductor.plist <<EOF
 EOF
 ```
 
-Run it from the project directory, since it uses `$PWD`. Then register and start:
+Run that from the project directory, since it uses `$PWD`. Then register and start:
 
 ```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-conductor.plist
