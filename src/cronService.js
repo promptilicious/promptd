@@ -318,20 +318,25 @@ class CronService {
     this.running.set(cron.id, run);
 
     const stream = fs.createWriteStream(fullPath, { flags: 'a' });
-    const header = [
-      `=== ${cron.name} ===`,
-      `started    ${startedAt.toISOString()}`,
-      `trigger    ${source}`,
-      `schedule   ${cron.cron}`,
-      `directory  ${cwd}`,
-      `model      ${cron.model?.trim() || '(CLI default)'}`,
-      `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs].join(' ')}`,
-      '--- prompt ---',
-      cron.prompt ?? '',
-      '--- output ---',
-      '',
-    ].join('\n');
-    stream.write(header);
+    // Written once the child exists, so the header can carry its pid.
+    const writeHeader = (pid) => {
+      stream.write(
+        [
+          `=== ${cron.name} ===`,
+          `started    ${startedAt.toISOString()}`,
+          `pid        ${pid ?? '(not started)'}`,
+          `trigger    ${source}`,
+          `schedule   ${cron.cron}`,
+          `directory  ${cwd}`,
+          `model      ${cron.model?.trim() || '(CLI default)'}`,
+          `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs].join(' ')}`,
+          '--- prompt ---',
+          cron.prompt ?? '',
+          '--- output ---',
+          '',
+        ].join('\n'),
+      );
+    };
 
     // Filled in from the CLI's final result event, when the run gets that far.
     let resultEvent = null;
@@ -367,6 +372,7 @@ class CronService {
       .then((s) => s.isDirectory())
       .catch(() => false);
     if (!dirOk) {
+      writeHeader(null);
       stream.write(`working directory not found: ${cwd}\n`);
       emit('run:started', run);
       await finish('failed', 'bad working directory');
@@ -383,6 +389,7 @@ class CronService {
         detached: true,
       });
     } catch (err) {
+      writeHeader(null);
       stream.write(`could not start ${CLAUDE_BIN}: ${err.message}\n`);
       emit('run:started', run);
       await finish('failed', 'spawn error');
@@ -390,6 +397,7 @@ class CronService {
     }
 
     run.pid = child.pid;
+    writeHeader(child.pid);
     this.handles.set(cron.id, { child, stream, killTimer: null });
 
     // stdout is newline-delimited JSON events; write through only the assistant's
