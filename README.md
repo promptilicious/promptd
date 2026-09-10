@@ -1,8 +1,16 @@
 # Claude Conductor
 
-A small Node.js web app that schedules prompts and runs them through `claude -p`. No database — every cron and every log line lives in plain files under `~/.claude/claude-conductor`.
+Schedule Claude prompts and watch them run. A small Node.js server holds a set of crons, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/claude-conductor`.
+
+- Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
+- Follow a run's output as it is produced, or read back any of the last 50 runs per cron.
+- Stop a run in progress. The schedule stays armed for its next trigger.
+- Choose the model per cron, from whatever the installed CLI recognises.
+- Every finished run records the model, runtime, tokens and cost that the CLI reported.
 
 ## Run it
+
+Needs Node 18 or newer, and Claude Code installed and signed in — `claude --version` should answer.
 
 ```bash
 npm install
@@ -192,6 +200,7 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | `HOST` | `127.0.0.1` | Bind address. Localhost only by default. |
 | `CONDUCTOR_HOME` | `~/.claude/claude-conductor` | Storage root |
 | `CLAUDE_BIN` | `claude` | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`. |
+| `WATCH_INTERVAL_MS` | `3000` | How often the crons folder is polled for outside changes. `0` disables it. |
 
 ## Model
 
@@ -264,6 +273,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream |
 | GET | `/api/events` | Activity stream |
 | GET | `/api/config` | Storage paths and retention limit |
+| GET | `/api/health` | Liveness, plus how many crons are scheduled |
 | GET | `/api/browse?path=` | Subdirectories matching a partial path, for the Working Directory field |
 | GET | `/api/next-run?cron=` | Whether an expression parses, and when it next fires |
 | GET | `/api/models` | Discovered models, plus whether discovery is running |
