@@ -14,7 +14,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 Needs Node 18 or newer, and Claude Code installed and signed in — `claude --version` should answer.
 
 ```bash
-npm install
+npm in stall
 npm start          # http://127.0.0.1:4321
 npm run dev        # same, restarts on file changes
 ```
