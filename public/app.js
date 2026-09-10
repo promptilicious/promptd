@@ -612,6 +612,143 @@ async function renderForm(id) {
   );
 }
 
+// ---- settings ---------------------------------------------------------
+
+async function renderSettings() {
+  const settings = await api('/api/settings');
+
+  const status = el('div', { class: 'hint' });
+  const checkButton = el('button', { class: 'btn small', text: 'Check for updates' });
+  const updateButton = el('button', { class: 'btn primary', text: 'Update now', disabled: 'disabled' });
+
+  const selfUpdate = el('input', { type: 'checkbox' });
+  selfUpdate.checked = Boolean(settings.selfUpdate);
+
+  // Tracked separately so rejecting a bad entry restores the value in force now,
+  // not the one the page happened to load with.
+  let intervalHours = Number(settings.updateCheckIntervalHours) || 24;
+  const interval = el('input', { type: 'text', class: 'mono narrow', value: String(intervalHours) });
+
+  /** Settings save as you change them; there is no Save button to forget. */
+  const save = async (patch, description) => {
+    try {
+      await api('/api/settings', { method: 'PUT', body: JSON.stringify(patch) });
+      toast(description);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+
+  selfUpdate.addEventListener('change', () =>
+    save({ selfUpdate: selfUpdate.checked }, selfUpdate.checked ? 'Self update on' : 'Self update off'),
+  );
+
+  interval.addEventListener('change', () => {
+    const hours = Number(interval.value);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      toast('Check interval must be a positive number of hours', true);
+      interval.value = String(intervalHours);
+      return;
+    }
+    intervalHours = hours;
+    save({ updateCheckIntervalHours: hours }, `Checking every ${hours}h`);
+  });
+
+  const showCheck = (result) => {
+    if (result.updatable) {
+      status.textContent = `Update available: ${result.behind} commit${result.behind === 1 ? '' : 's'} behind origin/main.`;
+      status.className = 'hint warn';
+      updateButton.disabled = false;
+    } else {
+      status.textContent = result.reason === 'already up to date' ? 'Up to date with origin/main.' : `No update: ${result.reason}`;
+      status.className = result.reason === 'already up to date' ? 'hint ok' : 'hint warn';
+      updateButton.disabled = true;
+    }
+  };
+
+  const check = async () => {
+    checkButton.disabled = true;
+    checkButton.textContent = 'Checking…';
+    status.textContent = 'Fetching origin/main…';
+    status.className = 'hint';
+    try {
+      showCheck(await api('/api/update/check'));
+    } catch (err) {
+      status.textContent = err.message;
+      status.className = 'hint warn';
+    } finally {
+      checkButton.disabled = false;
+      checkButton.textContent = 'Check for updates';
+    }
+  };
+
+  checkButton.addEventListener('click', check);
+
+  updateButton.addEventListener('click', async () => {
+    updateButton.disabled = true;
+    updateButton.textContent = 'Updating…';
+    try {
+      const result = await api('/api/update/run', { method: 'POST' });
+      status.textContent = `Update started (pid ${result.pid}). Progress in ${result.updateLog}.`;
+      status.className = 'hint ok';
+      toast('Update started — the server restarts when it finishes');
+    } catch (err) {
+      status.textContent = err.message;
+      status.className = 'hint warn';
+      updateButton.textContent = 'Update now';
+      updateButton.disabled = false;
+    }
+  });
+
+  const readOnly = (label, value) =>
+    el('div', { class: 'field' }, [el('label', { text: label }), el('div', { class: 'path-value mono', text: value })]);
+
+  view.replaceChildren(
+    el('div', { class: 'breadcrumb' }, [el('a', { href: '#/', text: '← All crons' })]),
+    el('div', { class: 'page-head' }, [
+      el('div', {}, [
+        el('h1', { text: 'Settings' }),
+        el('p', { class: 'sub', text: `Stored in ${settings.settingsFile}` }),
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
+      el('h2', { text: 'Self update' }),
+      el('label', { class: 'check' }, [
+        selfUpdate,
+        'Check for updates once per interval and apply them automatically',
+      ]),
+      el('div', { class: 'preset-row' }, [
+        checkButton,
+        updateButton,
+        el('span', { class: 'preset-sep' }),
+        el('span', { class: 'preset-label', text: 'Check every' }),
+        interval,
+        el('span', { class: 'preset-label', text: 'hours' }),
+      ]),
+      status,
+      el('div', { class: 'hint' }, [
+        'An update pulls ',
+        el('span', { class: 'mono', text: 'origin/main' }),
+        ' and restarts the service. Update now works even with self update off.',
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
+      el('h2', { text: 'Last check' }),
+      readOnly('Last checked', settings.lastUpdateCheckAt ? `${fmtDateTime(settings.lastUpdateCheckAt)} (${fmtRelative(settings.lastUpdateCheckAt)})` : 'never'),
+      readOnly(
+        'Last update started',
+        settings.lastUpdateLaunchedAt
+          ? `${fmtDateTime(settings.lastUpdateLaunchedAt)}${settings.lastUpdateFromCommit ? `, from ${settings.lastUpdateFromCommit}` : ''}`
+          : 'never',
+      ),
+      readOnly('Project folder', settings.projectDir),
+      readOnly('Update log', settings.updateLog),
+    ]),
+  );
+
+  check();
+}
+
 // ---- logs -------------------------------------------------------------
 
 const logsState = { cronId: null, selected: null, atBottom: true };
@@ -746,7 +883,8 @@ async function route() {
   clearTimeout(modelPollTimer);
   const [, section, id] = hash.split('/');
   try {
-    if (section === 'new') await renderForm(null);
+    if (section === 'settings') await renderSettings();
+    else if (section === 'new') await renderForm(null);
     else if (section === 'edit' && id) await renderForm(id);
     else if (section === 'logs' && id) await renderLogs(id);
     else await renderHome();

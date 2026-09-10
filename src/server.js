@@ -5,9 +5,12 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { bus, sseInit, sseSend } from './events.js';
 import { CRONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
+import { SETTINGS_FILE as SETTINGS_PATH } from './settings.js';
 import { cronService, previewNextRun, validateCronExpression } from './cronService.js';
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
+import { loadSettings, patchSettings } from './settings.js';
+import { checkForUpdates, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -116,6 +119,53 @@ app.get('/api/browse', async (req, res, next) => {
   }
 });
 
+app.get('/api/settings', async (_req, res, next) => {
+  try {
+    res.json({ ...(await loadSettings()), settingsFile: SETTINGS_PATH, projectDir: PROJECT_DIR, updateLog: UPDATE_LOG });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Only the documented settings are writable; everything else stays as it is on disk. */
+app.put('/api/settings', async (req, res, next) => {
+  try {
+    const patch = {};
+    if ('selfUpdate' in (req.body ?? {})) patch.selfUpdate = Boolean(req.body.selfUpdate);
+    if ('updateCheckIntervalHours' in (req.body ?? {})) {
+      const hours = Number(req.body.updateCheckIntervalHours);
+      if (!Number.isFinite(hours) || hours <= 0) return res.status(400).json({ error: 'updateCheckIntervalHours must be a positive number' });
+      patch.updateCheckIntervalHours = hours;
+    }
+    res.json(await patchSettings(patch));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Reports whether main is behind without touching the working tree. */
+app.get('/api/update/check', async (_req, res, next) => {
+  try {
+    res.json(await checkForUpdates());
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Applies a pending update now. Works whether or not selfUpdate is on, which is
+ * the point: it is how you update when you have chosen to do it by hand.
+ */
+app.post('/api/update/run', async (_req, res, next) => {
+  try {
+    const result = await selfUpdater.applyIfBehind();
+    if (!result.launched) return res.status(409).json({ error: result.reason ?? 'nothing to update', ...result });
+    res.status(202).json({ ...result, updateLog: UPDATE_LOG });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /** Models the installed CLI recognises, for the Model dropdown. */
 app.get('/api/models', (_req, res) => {
   res.json(modelCatalog.state());
@@ -125,6 +175,7 @@ app.get('/api/models', (_req, res) => {
 app.post('/api/models/refresh', async (_req, res, next) => {
   try {
     await modelCatalog.refresh();
+selfUpdater.start();
     res.json(modelCatalog.state());
   } catch (err) {
     next(err);
@@ -339,11 +390,13 @@ app.use((err, _req, res, _next) => {
 });
 
 await ensureDirs();
+await loadSettings(); // writes settings.json with defaults on first run
 await cronService.reload();
 await cronFileWatcher.start();
 // Discovery spawns a probe per candidate model, so let it run behind the server
 // coming up rather than delaying the first page load by several seconds.
 modelCatalog.refresh();
+selfUpdater.start();
 
 app.listen(PORT, HOST, () => {
   console.log(`Claude Conductor listening on http://${HOST}:${PORT}`);

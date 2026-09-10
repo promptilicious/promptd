@@ -92,15 +92,83 @@ Model discovery is slower on the first run after login, around 14 seconds agains
 - **`brew services`** manages Homebrew formulae, not arbitrary projects.
 - Running `npm start` in a terminal remains fine for occasional use; it stops when the terminal closes.
 
+## Settings and self update
+
+The **⚙ Settings** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
+
+`settings.json` sits in the storage root and is written with defaults the first time the server starts:
+
+```json
+{
+  "selfUpdate": true,
+  "updateCheckIntervalHours": 24,
+  "lastUpdateCheckAt": null,
+  "lastUpdateLaunchedAt": null,
+  "lastUpdateFromCommit": null
+}
+```
+
+The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
+
+With `selfUpdate` true, the server checks once a day whether the project checkout is behind its remote, and if so updates itself:
+
+1. `git fetch origin main`, then compare `main` with `origin/main`.
+2. If `main` is behind, spawn `scripts/self-update.sh` **detached**, so it outlives the server it is about to restart.
+3. That script re-checks everything, runs `git pull --ff-only origin main`, runs `npm install` if `package-lock.json` moved, and restarts the service with `launchctl kickstart -k`.
+
+Everything the updater does is appended to `logs/update.log`. The check itself is also available on demand at `GET /api/update/check`, which only reads — it never pulls.
+
+### Checking and updating by hand
+
+The Settings page runs a check as soon as it opens and says what it found:
+
+| Shown | Meaning |
+| --- | --- |
+| `Update available: 2 commits behind origin/main.` | **Update now** is enabled |
+| `Up to date with origin/main.` | Nothing to do |
+| `No update: <reason>` | See the table below |
+
+**Check for updates** re-runs it. **Update now** applies a pending update immediately and works whether or not `selfUpdate` is on — that is the point of it: turn self update off and update on your own schedule, from the page. Both buttons use the same code path as the daily check, so there is no second behaviour to keep in step.
+
+### When it declines to update
+
+The checker refuses rather than guesses, and says why in the server log and in `/api/update/check`:
+
+| Reason | Meaning |
+| --- | --- |
+| `not a git repository` | The project folder is not a checkout |
+| `on branch X, not main` | Only `main` is updated, and only when it is checked out |
+| `N uncommitted change(s) in the working tree` | Your work is never touched |
+| `diverged: N ahead, M behind` | Local commits that the remote does not have; resolve by hand |
+| `git fetch failed: …` | No network, or credentials that need a prompt |
+| `already up to date` | Nothing to do |
+
+`git pull --ff-only` means a merge is never attempted. All of these are re-checked inside the detached script too, since the working tree could have changed between the decision and the pull.
+
+### The restart needs the launchd agent
+
+Only launchd can bring the server back after it stops, so the updater restarts the service registered under `local.claude-conductor` (override with `CONDUCTOR_LAUNCHD_LABEL`). See [Start at login](#start-at-login-macos).
+
+If no such agent is registered — you are running `npm start` in a terminal, say — the update is still pulled, but the running server is left alone and the log says so:
+
+```
+[…] no launchd agent named local.claude-conductor is registered
+[…] the new code is on disk but the running server is still the old one — restart it yourself
+```
+
+Killing a server that nothing would restart would be worse than leaving it on old code.
+
 ## Storage layout
 
 ```
 ~/.claude/claude-conductor/
 ├── crons/
 │   └── <uuid>.json                 # one file per cron
-└── logs/
-    └── <Cron Name>/
-        └── 2026-09-10T06-11-12.789Z.txt   # one file per run, newest 50 kept
+├── logs/
+│   ├── <Cron Name>/
+│   │   └── 2026-09-10T06-11-12.789Z.txt   # one file per run, newest 50 kept
+│   └── update.log                  # appended by the self updater
+└── settings.json                   # app settings, written with defaults on first run
 ```
 
 A cron file:
@@ -201,6 +269,8 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | `CONDUCTOR_HOME` | `~/.claude/claude-conductor` | Storage root |
 | `CLAUDE_BIN` | `claude` | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`. |
 | `WATCH_INTERVAL_MS` | `3000` | How often the crons folder is polled for outside changes. `0` disables it. |
+| `CONDUCTOR_LAUNCHD_LABEL` | `local.claude-conductor` | The launchd service the updater restarts |
+| `CONDUCTOR_PROJECT_DIR` | the checkout this code lives in | Which repository the update check looks at |
 
 ## Model
 
@@ -274,6 +344,9 @@ As the field changes, a green line below it shows when the expression next fires
 | GET | `/api/events` | Activity stream |
 | GET | `/api/config` | Storage paths and retention limit |
 | GET | `/api/health` | Liveness, plus how many crons are scheduled |
+| GET, PUT | `/api/settings` | Read settings; write `selfUpdate` and `updateCheckIntervalHours` |
+| GET | `/api/update/check` | Whether `main` is behind. Read-only, never pulls |
+| POST | `/api/update/run` | Apply a pending update now. 202 with the updater's pid, or 409 and the reason. Ignores `selfUpdate` |
 | GET | `/api/browse?path=` | Subdirectories matching a partial path, for the Working Directory field |
 | GET | `/api/next-run?cron=` | Whether an expression parses, and when it next fires |
 | GET | `/api/models` | Discovered models, plus whether discovery is running |

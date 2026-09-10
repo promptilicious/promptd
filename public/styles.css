@@ -356,6 +356,30 @@ textarea:focus {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+/* Settings page */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.path-value {
+  color: var(--text);
+  font-size: 12.5px;
+  word-break: break-all;
+}
+
+input.narrow {
+  width: 72px;
+  text-align: center;
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
+
 /* Model dropdown */
 .select-row {
   display: flex;
