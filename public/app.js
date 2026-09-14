@@ -1194,6 +1194,29 @@ function setUpdateBadge(available, behind = 0) {
   updateBadgeEl.title = `${commits}Open Settings to update.`;
 }
 
+/** A clock, small enough to sit level with the meter labels. */
+const CLOCK_ICON =
+  '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" ' +
+  'stroke-linecap="round"><circle cx="8" cy="8" r="6.2" /><path d="M8 4.6V8l2.4 1.6" /></svg>';
+
+/**
+ * The clock to the left of the meters: when these numbers were pulled. The
+ * server answers from its last lookup, so without this the header gives no way
+ * to tell a reading taken a minute ago from one taken an hour ago.
+ */
+function readStamp(usage) {
+  const tip = usage?.checkedAt
+    ? [
+        `Usage last read ${fmtRelative(usage.checkedAt)}`,
+        fmtDateTime(usage.checkedAt),
+        usage.reason ? `Refresh is waiting: ${usage.reason}` : null,
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : 'Usage has not been read yet';
+  return el('span', { class: `usage-stamp${usage?.stale ? ' stale' : ''}`, 'data-tip': tip, html: CLOCK_ICON });
+}
+
 /**
  * Subscription usage, one meter per limit window the account reports. The
  * windows are whatever the server passes through, so a limit added to the plan
@@ -1212,6 +1235,7 @@ function setUsage(usage) {
 
   const asOf = usage?.stale && usage.checkedAt ? `Last read ${fmtRelative(usage.checkedAt)}` : null;
   const why = usage?.stale && usage.reason ? `Refresh is waiting: ${usage.reason}` : null;
+  if (windows.length) usageEl.append(readStamp(usage));
 
   for (const window of windows) {
     // Credits are a spending cap rather than a rate limit, so there is no reset

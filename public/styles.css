@@ -167,13 +167,27 @@ a {
   color: var(--red);
 }
 
+/* The clock ahead of the meters, hovered for when the reading was pulled. */
+.usage-stamp {
+  position: relative;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  cursor: help;
+}
+
+.usage-stamp.stale {
+  color: var(--amber);
+}
+
 /* Last-known numbers, dimmed: the server is serving its previous lookup. */
 .usage-meter.stale {
   opacity: 0.55;
 }
 
 /* Same tooltip treatment as the cron field, anchored under the header instead. */
-.usage-meter::after {
+.usage-meter::after,
+.usage-stamp::after {
   content: attr(data-tip);
   position: absolute;
   top: calc(100% + 8px);
@@ -196,7 +210,14 @@ a {
   z-index: 20;
 }
 
-.usage-meter:hover::after {
+/* The clock is the leftmost thing here, so its tooltip opens rightwards. */
+.usage-stamp::after {
+  right: auto;
+  left: 0;
+}
+
+.usage-meter:hover::after,
+.usage-stamp:hover::after {
   opacity: 1;
 }
 
