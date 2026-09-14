@@ -96,6 +96,112 @@ a {
   display: none;
 }
 
+/*
+ * Subscription usage: one small meter per limit window the account reports.
+ * Severity comes from the API rather than a threshold picked here, so the
+ * colours match what the CLI's own usage view shows.
+ */
+.usage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.usage[hidden] {
+  display: none;
+}
+
+.usage-meter {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 62px;
+  cursor: help;
+}
+
+.usage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 10.5px;
+  line-height: 1;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.usage-pct {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.usage-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.usage-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--green);
+  transition: width 240ms ease;
+}
+
+.usage-meter.warning .usage-fill {
+  background: var(--amber);
+}
+
+.usage-meter.warning .usage-pct {
+  color: var(--amber);
+}
+
+.usage-meter.critical .usage-fill {
+  background: var(--red);
+}
+
+.usage-meter.critical .usage-pct {
+  color: var(--red);
+}
+
+/* Same tooltip treatment as the cron field, anchored under the header instead. */
+.usage-meter::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: max-content;
+  max-width: 260px;
+  white-space: pre-line;
+  text-align: left;
+  background: #0b0d12;
+  color: var(--text);
+  border: 1px solid #3a4152;
+  border-radius: 7px;
+  padding: 6px 9px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 90ms ease;
+  z-index: 20;
+}
+
+.usage-meter:hover::after {
+  opacity: 1;
+}
+
+/* The meters are the first thing to go when the header runs out of room. */
+@media (max-width: 900px) {
+  .usage {
+    display: none;
+  }
+}
+
 .conn {
   font-size: 12px;
   color: var(--muted);

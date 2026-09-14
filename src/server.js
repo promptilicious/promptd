@@ -19,6 +19,7 @@ import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
+import { usageMonitor } from './usage.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -445,15 +446,19 @@ app.get('/api/events', (req, res) => {
  */
 let runningCommit = null;
 
-app.get('/api/health', (_req, res) =>
+app.get('/api/health', async (_req, res) => {
+  // Usage is cached and never rejects, so it cannot make the health check fail
+  // or hang: the worst case is the reading being up to a minute old.
+  const usage = await usageMonitor.state();
   res.json({
     ok: true,
     scheduled: cronService.jobs.size,
     commit: runningCommit,
     paused: cronService.isPaused(),
+    usage,
     ...selfUpdater.availability(),
-  }),
-);
+  });
+});
 
 app.use((err, _req, res, _next) => {
   console.error('[server]', err);

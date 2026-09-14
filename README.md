@@ -360,6 +360,19 @@ The numbers come from the `result` event's `modelUsage`, `duration_ms`, `usage` 
 
 A run that is stopped or that fails before producing a result event has no statistics block, only the footer.
 
+## Subscription usage
+
+The header carries one small meter per limit on the account the Claude CLI is signed in as — the 5-hour session, the rolling 7-day limit, any model-scoped weekly limit, and extra usage credits when they are turned on. Hovering one gives the full name, the percentage, and when it resets in local time.
+
+The numbers come from the same place the CLI's own `/usage` view reads them: the OAuth usage endpoint, asked with the access token the CLI already stores. Nothing is spawned and nothing is estimated from run logs. Reading that token is the only thing this does with it — it is never logged, never written anywhere, and never sent on to anything else.
+
+Two consequences worth knowing:
+
+- **The reading is up to a minute old.** Every open tab polls `/api/health`, so the answer is cached for 60 seconds and shared. A failed lookup is cached for five minutes rather than retried on every poll.
+- **Signed out means no meters, not an error.** If the CLI is not signed in, or its login has expired, the meters disappear and `usage.reason` on `/api/health` says which. Expired logins are left for the CLI to refresh: doing it here would rotate the refresh token underneath it.
+
+Amber and red are the API's own severity for a limit, not a threshold picked here, so they change when the CLI's usage view would change. The endpoint also reports a long tail of unreleased limit types; the server reads its normalized `limits` array instead, which means a limit added to the plan later shows up without a change to this code.
+
 ## Real-time updates
 
 Two Server-Sent Event streams, no polling loops in the UI:
@@ -450,7 +463,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
 | GET              | `/api/config`                      | Storage paths and retention limit                                                                                                                                              |
-| GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, and `updateAvailable` with the commits behind                                                                 |
+| GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, and how many runs are still in flight                                                                                                        |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |

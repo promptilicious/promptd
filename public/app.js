@@ -3,6 +3,7 @@ const connEl = document.getElementById('conn');
 const storageEl = document.getElementById('storage');
 const toastsEl = document.getElementById('toasts');
 const updateBadgeEl = document.getElementById('update-badge');
+const usageEl = document.getElementById('usage');
 
 let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
@@ -1193,6 +1194,35 @@ function setUpdateBadge(available, behind = 0) {
   updateBadgeEl.title = `${commits}Open Settings to update.`;
 }
 
+/**
+ * Subscription usage, one meter per limit window the account reports. The
+ * windows are whatever the server passes through, so a limit added to the plan
+ * later shows up here without a change.
+ */
+function setUsage(usage) {
+  if (!usageEl) return;
+  const windows = usage?.windows ?? [];
+  // Nothing to report is not worth a red header; the meters simply go away.
+  usageEl.hidden = !windows.length;
+  usageEl.replaceChildren();
+
+  for (const window of windows) {
+    const resets = window.resetsAt
+      ? `Resets ${fmtRelative(window.resetsAt)} (${fmtDateTime(window.resetsAt)})`
+      : 'A spending cap, so it has no reset';
+    const tip = `${window.detail}\n${window.usedPercent}% used\n${resets}`;
+    usageEl.append(
+      el('div', { class: `usage-meter ${window.severity}`, 'data-tip': tip }, [
+        el('div', { class: 'usage-head' }, [
+          el('span', { text: window.label }),
+          el('span', { class: 'usage-pct', text: `${Math.round(window.usedPercent)}%` }),
+        ]),
+        el('div', { class: 'usage-track' }, [el('div', { class: 'usage-fill', style: `width: ${window.usedPercent}%` })]),
+      ]),
+    );
+  }
+}
+
 /** Live, or live-but-out-of-date once the server has moved to another commit. */
 function setConnState() {
   if (staleBuild) {
@@ -1211,6 +1241,7 @@ async function checkHealth() {
   try {
     const health = await api('/api/health');
     setUpdateBadge(Boolean(health.updateAvailable), health.updateBehind);
+    setUsage(health.usage);
     if (!health.commit) return; // not a git checkout, nothing to compare
     if (!loadedCommit) loadedCommit = health.commit;
     else if (health.commit !== loadedCommit) staleBuild = true;
