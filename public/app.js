@@ -1214,9 +1214,9 @@ function setUsage(usage) {
   const why = usage?.stale && usage.reason ? `Refresh is waiting: ${usage.reason}` : null;
 
   for (const window of windows) {
-    const resets = window.resetsAt
-      ? `Resets ${fmtRelative(window.resetsAt)} (${fmtDateTime(window.resetsAt)})`
-      : 'A spending cap, so it has no reset';
+    // Credits are a spending cap rather than a rate limit, so there is no reset
+    // line to draw for them.
+    const resets = window.resetsAt ? `Resets ${fmtRelative(window.resetsAt)} (${fmtDateTime(window.resetsAt)})` : null;
     const tip = [`${window.detail}`, `${window.usedPercent}% used`, resets, asOf, why].filter(Boolean).join('\n');
     usageEl.append(
       el('div', { class: `usage-meter ${window.severity}${usage?.stale ? ' stale' : ''}`, 'data-tip': tip }, [
