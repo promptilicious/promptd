@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
+import { ROOT } from './paths.js';
 
 /**
  * Subscription usage for the account the Claude CLI is signed in as.
@@ -17,12 +18,23 @@ const OAUTH_BETA = 'oauth-2025-04-20';
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 const CREDENTIALS_FILE = path.join(os.homedir(), '.claude', '.credentials.json');
 
-// Usage moves slowly and every open tab polls /api/health, so the answer is
-// cached rather than fetched per request.
-const TTL_MS = 60 * 1000;
-// A failed lookup should not retry on every poll either.
-const ERROR_TTL_MS = 5 * 60 * 1000;
+// Usage moves slowly and every open tab polls /api/health, so the endpoint is
+// asked once per window at most and every request is answered from the cache.
+const TTL_MS = 5 * 60 * 1000;
+// A failed lookup backs off, doubling from here: a rate-limited endpoint should
+// not be asked again on the same timer that just tripped it.
+const ERROR_BACKOFF_MS = 5 * 60 * 1000;
+const MAX_BACKOFF_MS = 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
+
+/**
+ * The last good reading, kept across restarts. Only the drawn numbers are
+ * written — no token, no raw response — so a restart or a self-update redraws
+ * the meters from disk instead of blanking them until the first fetch lands.
+ */
+const CACHE_FILE = path.join(ROOT, 'usage-cache.json');
+// Older than this and a kept reading is not worth showing at all.
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Names for the limit kinds the endpoint reports. The response also carries a
@@ -146,6 +158,15 @@ function readSpend(spend) {
   };
 }
 
+/** `Retry-After` is either a count of seconds or an HTTP date; both appear. */
+function retryAfterMs(header) {
+  if (!header) return 0;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(header);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
+}
+
 async function fetchUsage() {
   const { token, reason } = await accessToken();
   if (!token) return { ok: false, reason, windows: [] };
@@ -164,7 +185,15 @@ async function fetchUsage() {
     if (res.status === 401 || res.status === 403) {
       return { ok: false, reason: 'the stored Claude login was rejected; sign in again with the CLI', windows: [] };
     }
-    if (!res.ok) return { ok: false, reason: `usage lookup failed (${res.status})`, windows: [] };
+    if (!res.ok) {
+      // A 429 says how long to wait; anything else falls back to the backoff.
+      return {
+        ok: false,
+        reason: `usage lookup failed (${res.status})`,
+        windows: [],
+        retryMs: retryAfterMs(res.headers.get('retry-after')),
+      };
+    }
 
     const body = await res.json();
     const windows = [
@@ -181,33 +210,124 @@ async function fetchUsage() {
   }
 }
 
+/** Writes the last good reading so a restart does not start from nothing. */
+async function persist(reading) {
+  try {
+    await fsp.mkdir(path.dirname(CACHE_FILE), { recursive: true });
+    const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
+    await fsp.writeFile(tmp, `${JSON.stringify(reading, null, 2)}\n`, 'utf8');
+    await fsp.rename(tmp, CACHE_FILE);
+  } catch {
+    // A cache that cannot be written is not worth failing a health check over.
+  }
+}
+
+/** The kept reading, or null when there is none, it is unreadable, or it is stale. */
+async function readCache() {
+  try {
+    const kept = JSON.parse(await fsp.readFile(CACHE_FILE, 'utf8'));
+    const at = Date.parse(kept?.checkedAt);
+    if (!Array.isArray(kept?.windows) || !kept.windows.length) return null;
+    if (!Number.isFinite(at) || Date.now() - at > CACHE_MAX_AGE_MS) return null;
+    return { windows: kept.windows, checkedAt: new Date(at).toISOString() };
+  } catch {
+    return null;
+  }
+}
+
 class UsageMonitor {
   constructor() {
-    this.cached = null;
-    this.expiresAt = 0;
+    /** The last reading that carried windows, however old it now is. */
+    this.lastGood = null;
+    /** Why the most recent refresh failed, or null when it succeeded. */
+    this.reason = null;
+    /** Earliest the endpoint may be asked again. */
+    this.nextFetchAt = 0;
+    /** Consecutive failures, which is what the backoff doubles on. */
+    this.failures = 0;
     /** Shared so concurrent polls make one request, not one each. @type {Promise|null} */
     this.inFlight = null;
+    /** The disk read, done once. @type {Promise|null} */
+    this.restoring = null;
   }
 
   /**
-   * The current reading. Never throws, and never waits on the network once
-   * something is cached — a health check must not hang on Anthropic being slow.
+   * The current reading. Never throws and never waits on the network: a poll
+   * that finds the window open starts a refresh and answers from what is
+   * already held, so /api/health stays instant and a page refresh redraws the
+   * meters from the last lookup rather than triggering one of its own.
    */
   async state() {
-    if (this.cached && Date.now() < this.expiresAt) return this.cached;
-    if (!this.inFlight) {
-      this.inFlight = fetchUsage()
-        .then((result) => {
-          this.cached = { ...result, checkedAt: new Date().toISOString() };
-          this.expiresAt = Date.now() + (result.ok ? TTL_MS : ERROR_TTL_MS);
-          return this.cached;
-        })
-        .finally(() => {
-          this.inFlight = null;
-        });
+    await this.restore();
+    if (Date.now() >= this.nextFetchAt) this.refresh();
+    return this.reading();
+  }
+
+  reading() {
+    const windows = this.lastGood?.windows ?? [];
+    const age = this.lastGood ? Date.now() - Date.parse(this.lastGood.checkedAt) : 0;
+    return {
+      ok: windows.length > 0,
+      // Kept even while windows are served, so the page can say why the numbers
+      // stopped moving.
+      reason: this.reason,
+      windows,
+      checkedAt: this.lastGood?.checkedAt ?? null,
+      // Older than a refresh window means these are last-known numbers, either
+      // because a refresh failed or because they came off disk at startup.
+      stale: windows.length > 0 && age > TTL_MS,
+    };
+  }
+
+  /** Starts a refresh unless one is already running. Failures are absorbed. */
+  refresh() {
+    if (this.inFlight) return this.inFlight;
+    // Claim the window before the request goes out, so a slow one cannot let
+    // the next poll start a second.
+    this.nextFetchAt = Date.now() + TTL_MS;
+    this.inFlight = fetchUsage()
+      .then((result) => this.record(result))
+      // fetchUsage answers rather than throws, so this is only ever a bug here;
+      // it still must not surface as an unhandled rejection or blank the meters.
+      .catch((err) => this.record({ ok: false, reason: `usage lookup failed: ${err.message}` }))
+      .finally(() => {
+        this.inFlight = null;
+      });
+    return this.inFlight;
+  }
+
+  /**
+   * Folds one lookup into the held state. A failure never clears the last good
+   * windows — it only records why they stopped moving and pushes the next
+   * attempt further out.
+   */
+  record(result) {
+    if (result.ok) {
+      this.lastGood = { windows: result.windows, checkedAt: new Date().toISOString() };
+      this.reason = null;
+      this.failures = 0;
+      this.nextFetchAt = Date.now() + TTL_MS;
+      void persist(this.lastGood);
+      return;
     }
-    // A stale reading beats making the page wait; the next poll picks up the new one.
-    return this.cached ?? this.inFlight;
+    this.reason = result.reason;
+    this.failures += 1;
+    const backoff = Math.min(ERROR_BACKOFF_MS * 2 ** (this.failures - 1), MAX_BACKOFF_MS);
+    this.nextFetchAt = Date.now() + Math.max(backoff, result.retryMs ?? 0);
+  }
+
+  /**
+   * The reading kept from a previous run, read once. Its age also sets the next
+   * fetch, so a server that restarts repeatedly does not ask on every boot.
+   */
+  restore() {
+    if (this.restoring) return this.restoring;
+    this.restoring = readCache().then((kept) => {
+      if (!kept || this.lastGood) return;
+      this.lastGood = kept;
+      this.nextFetchAt = Date.parse(kept.checkedAt) + TTL_MS;
+    });
+    return this.restoring;
   }
 }
 

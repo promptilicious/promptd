@@ -167,6 +167,11 @@ a {
   color: var(--red);
 }
 
+/* Last-known numbers, dimmed: the server is serving its previous lookup. */
+.usage-meter.stale {
+  opacity: 0.55;
+}
+
 /* Same tooltip treatment as the cron field, anchored under the header instead. */
 .usage-meter::after {
   content: attr(data-tip);

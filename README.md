@@ -366,9 +366,10 @@ The header carries one small meter per limit on the account the Claude CLI is si
 
 The numbers come from the same place the CLI's own `/usage` view reads them: the OAuth usage endpoint, asked with the access token the CLI already stores. Nothing is spawned and nothing is estimated from run logs. Reading that token is the only thing this does with it — it is never logged, never written anywhere, and never sent on to anything else.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
-- **The reading is up to a minute old.** Every open tab polls `/api/health`, so the answer is cached for 60 seconds and shared. A failed lookup is cached for five minutes rather than retried on every poll.
+- **The reading is up to five minutes old.** Every open tab polls `/api/health`, and every poll is answered from the last lookup, so the endpoint is asked at most once every five minutes no matter how many tabs are open. A page refresh redraws from that same reading rather than triggering a lookup of its own. The reading is also kept in `usage-cache.json`, so a restart or a self-update redraws the meters immediately.
+- **A failed lookup keeps the last numbers.** The endpoint rate-limits, and several Claude sessions on one machine share that limit. When a refresh fails the meters dim and their tooltip says when they were last read and why the refresh is waiting, rather than disappearing. Retries back off from five minutes, doubling to an hour, and a `Retry-After` header wins when it asks for longer.
 - **Signed out means no meters, not an error.** If the CLI is not signed in, or its login has expired, the meters disappear and `usage.reason` on `/api/health` says which. Expired logins are left for the CLI to refresh: doing it here would rotate the refresh token underneath it.
 
 Amber and red are the API's own severity for a limit, not a threshold picked here, so they change when the CLI's usage view would change. The endpoint also reports a long tail of unreleased limit types; the server reads its normalized `limits` array instead, which means a limit added to the plan later shows up without a change to this code.

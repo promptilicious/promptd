@@ -1198,6 +1198,10 @@ function setUpdateBadge(available, behind = 0) {
  * Subscription usage, one meter per limit window the account reports. The
  * windows are whatever the server passes through, so a limit added to the plan
  * later shows up here without a change.
+ *
+ * The server answers every poll from its last lookup, so these are last-known
+ * numbers whenever a refresh fails or the reading came off disk at startup. In
+ * that case the meters dim and say when they were read rather than vanishing.
  */
 function setUsage(usage) {
   if (!usageEl) return;
@@ -1206,13 +1210,16 @@ function setUsage(usage) {
   usageEl.hidden = !windows.length;
   usageEl.replaceChildren();
 
+  const asOf = usage?.stale && usage.checkedAt ? `Last read ${fmtRelative(usage.checkedAt)}` : null;
+  const why = usage?.stale && usage.reason ? `Refresh is waiting: ${usage.reason}` : null;
+
   for (const window of windows) {
     const resets = window.resetsAt
       ? `Resets ${fmtRelative(window.resetsAt)} (${fmtDateTime(window.resetsAt)})`
       : 'A spending cap, so it has no reset';
-    const tip = `${window.detail}\n${window.usedPercent}% used\n${resets}`;
+    const tip = [`${window.detail}`, `${window.usedPercent}% used`, resets, asOf, why].filter(Boolean).join('\n');
     usageEl.append(
-      el('div', { class: `usage-meter ${window.severity}`, 'data-tip': tip }, [
+      el('div', { class: `usage-meter ${window.severity}${usage?.stale ? ' stale' : ''}`, 'data-tip': tip }, [
         el('div', { class: 'usage-head' }, [
           el('span', { text: window.label }),
           el('span', { class: 'usage-pct', text: `${Math.round(window.usedPercent)}%` }),
