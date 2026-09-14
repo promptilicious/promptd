@@ -619,6 +619,47 @@ function modelPicker(selected) {
   };
 }
 
+/**
+ * Effort dropdown. The levels come from the server, so the list here and the
+ * value the run is allowed to pass stay one list. Empty leaves --effort off.
+ */
+function effortPicker(selected) {
+  const select = el('select', { class: 'select mono' });
+  const note = el('div', {
+    class: 'hint',
+    text: 'Passed to claude as --effort. Higher levels think longer, so runs cost more and take longer.',
+  });
+  const current = selected ?? '';
+
+  const paint = (levels) => {
+    const options = [
+      { value: '', label: 'Default (whatever the CLI is set to)' },
+      ...levels.map((level) => ({ value: level.id, label: level.label })),
+    ];
+    // An effort saved earlier that this server no longer offers must not be silently dropped.
+    if (current && !options.some((option) => option.value === current)) {
+      options.push({ value: current, label: `${current} (no longer offered)` });
+    }
+    select.replaceChildren(
+      ...options.map((option) => el('option', { value: option.value, selected: option.value === current }, option.label)),
+    );
+    select.value = current;
+  };
+
+  paint([]);
+  api('/api/config')
+    .then((config) => paint(config.effortLevels ?? []))
+    .catch((err) => {
+      note.textContent = `Could not load the effort levels: ${err.message}`;
+      note.className = 'hint warn';
+    });
+
+  return {
+    read: () => select.value,
+    field: el('div', { class: 'field' }, [el('label', { text: 'Effort' }), select, note]),
+  };
+}
+
 async function renderForm(id) {
   const cron = id ? await api(`/api/crons/${id}`) : null;
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
@@ -647,6 +688,7 @@ async function renderForm(id) {
   inputs.isActive.checked = cron ? Boolean(cron.isActive) : true;
 
   const model = modelPicker(cron?.model ?? '');
+  const effort = effortPicker(cron?.effort ?? '');
 
   const showError = (message) => {
     errorBox.textContent = message;
@@ -663,6 +705,7 @@ async function renderForm(id) {
       cron: inputs.cron.value,
       workingDirectory: inputs.workingDirectory.value,
       model: model.read(),
+      effort: effort.read(),
       prompt: inputs.prompt.value,
       isActive: inputs.isActive.checked,
     };
@@ -709,6 +752,7 @@ async function renderForm(id) {
       cronPicker(inputs.cron),
       directoryPicker(inputs.workingDirectory),
       model.field,
+      effort.field,
       field('Prompt', inputs.prompt),
       el('label', { class: 'check' }, [inputs.isActive, 'Is Active']),
       el('div', { class: 'form-actions' }, [

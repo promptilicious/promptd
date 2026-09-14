@@ -6,7 +6,15 @@ import express from 'express';
 import { bus, sseInit, sseSend } from './events.js';
 import { CRONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
 import { SETTINGS_FILE as SETTINGS_PATH } from './settings.js';
-import { PAUSE_OPTIONS, cronService, pauseOption, previewNextRun, validateCronExpression } from './cronService.js';
+import {
+  EFFORT_LEVELS,
+  PAUSE_OPTIONS,
+  cronService,
+  isEffortLevel,
+  pauseOption,
+  previewNextRun,
+  validateCronExpression,
+} from './cronService.js';
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
@@ -44,6 +52,10 @@ function readForm(body) {
     if (!check.ok) errors.push(`Cron expression is not valid: ${check.error}`);
   }
   if (!String(body?.prompt ?? '').trim()) errors.push('Prompt is required.');
+  const effort = String(body?.effort ?? '').trim();
+  if (effort && !isEffortLevel(effort)) {
+    errors.push(`Effort must be one of ${EFFORT_LEVELS.map((level) => level.id).join(', ')}.`);
+  }
   return {
     errors,
     value: {
@@ -52,6 +64,7 @@ function readForm(body) {
       cron: expression,
       workingDirectory: String(body?.workingDirectory ?? '').trim(),
       model: String(body?.model ?? '').trim(),
+      effort,
       prompt: String(body?.prompt ?? ''),
       isActive: Boolean(body?.isActive),
     },
@@ -69,7 +82,7 @@ function decorate(cron) {
 }
 
 app.get('/api/config', (_req, res) => {
-  res.json({ storageRoot: ROOT, cronsDir: CRONS_DIR, logsDir: LOGS_DIR, maxLogsPerCron: MAX_LOGS_PER_CRON });
+  res.json({ storageRoot: ROOT, cronsDir: CRONS_DIR, logsDir: LOGS_DIR, maxLogsPerCron: MAX_LOGS_PER_CRON, effortLevels: EFFORT_LEVELS });
 });
 
 /**

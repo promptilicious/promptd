@@ -30,6 +30,22 @@ export const PAUSE_OPTIONS = [
   { id: 'restart', label: 'until restart', ms: null },
 ];
 
+/**
+ * The effort levels the CLI accepts for `--effort`. An empty effort on a cron
+ * means the flag is left off, so the CLI uses whatever it is configured to use.
+ */
+export const EFFORT_LEVELS = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+  { id: 'xhigh', label: 'Extra high' },
+  { id: 'max', label: 'Max' },
+];
+
+export function isEffortLevel(value) {
+  return EFFORT_LEVELS.some((level) => level.id === value);
+}
+
 export function pauseOption(id) {
   return PAUSE_OPTIONS.find((option) => option.id === id) ?? null;
 }
@@ -303,6 +319,8 @@ class CronService {
     const cwd = resolveUserPath(cron.workingDirectory) ?? os.homedir();
     // No model on the cron means whatever the CLI is configured to use.
     const modelArgs = cron.model?.trim() ? ['--model', cron.model.trim()] : [];
+    // Same for effort: left off unless the cron names a level.
+    const effortArgs = cron.effort?.trim() ? ['--effort', cron.effort.trim()] : [];
 
     const run = {
       runId: randomUUID(),
@@ -329,7 +347,8 @@ class CronService {
           `schedule   ${cron.cron}`,
           `directory  ${cwd}`,
           `model      ${cron.model?.trim() || '(CLI default)'}`,
-          `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs].join(' ')}`,
+          `effort     ${cron.effort?.trim() || '(CLI default)'}`,
+          `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs].join(' ')}`,
           '--- prompt ---',
           cron.prompt ?? '',
           '--- output ---',
@@ -381,7 +400,7 @@ class CronService {
 
     let child;
     try {
-      child = spawn(CLAUDE_BIN, ['-p', cron.prompt ?? '', ...CLAUDE_ARGS, ...modelArgs], {
+      child = spawn(CLAUDE_BIN, ['-p', cron.prompt ?? '', ...CLAUDE_ARGS, ...modelArgs, ...effortArgs], {
         cwd,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
