@@ -167,8 +167,11 @@ function delayTitle(delayed) {
   lines.push(
     delayed.resumeAt
       ? `Estimated run: ${fmtRelative(delayed.resumeAt)} (${fmtDateTime(delayed.resumeAt)})`
-      : 'Estimated run: as soon as usage clears; checked every 30 seconds',
+      : 'Estimated run: as soon as a usage reading shows it clear',
   );
+  // Usage is only read every five minutes, and a held trigger deliberately adds
+  // no lookups of its own, so the start can trail the reset by that much.
+  lines.push('Starts on the first usage reading that shows these clear, which refreshes every 5 minutes.');
   lines.push(`Waiting since ${fmtDateTime(delayed.delayedAt)}. Stop drops it.`);
   return lines.join('\n');
 }
@@ -785,8 +788,10 @@ function usageDelayPicker(selected) {
     class: 'hint',
     text:
       'Checked at every trigger, Run now included. While a ticked limit is spent the run waits, ' +
-      'then starts as soon as that limit resets. Only one trigger waits at a time — a second one ' +
-      'arriving meanwhile is dropped, not queued — and a restart clears whatever was waiting.',
+      'then starts on the first usage reading that shows it clear. Readings refresh every 5 minutes ' +
+      'and waiting adds no lookups of its own, so a run can start up to that long after its limit ' +
+      'resets. Only one trigger waits at a time — a second one arriving meanwhile is dropped, not ' +
+      'queued — and a restart clears whatever was waiting.',
   });
 
   const paint = (categories) => {
@@ -1430,10 +1435,12 @@ function setUsage(usage) {
   if (windows.length) usageEl.append(readStamp(usage));
 
   for (const window of windows) {
-    // Credits are a spending cap rather than a rate limit, so there is no reset
-    // line to draw for them.
     const resets = window.resetsAt ? `Resets ${fmtRelative(window.resetsAt)} (${fmtDateTime(window.resetsAt)})` : null;
-    const tip = [`${window.detail}`, `${window.usedPercent}% used`, resets, asOf, why].filter(Boolean).join('\n');
+    // Credits are a spending cap rather than a rolling window, so they carry a
+    // note saying which kind of limit the reset date belongs to.
+    const tip = [`${window.detail}`, `${window.usedPercent}% used`, resets, window.note, asOf, why]
+      .filter(Boolean)
+      .join('\n');
     usageEl.append(
       el('div', { class: `usage-meter ${window.severity}${usage?.stale ? ' stale' : ''}`, 'data-tip': tip }, [
         el('div', { class: 'usage-head' }, [

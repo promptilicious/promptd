@@ -13,8 +13,9 @@ import { hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 // How often a trigger held for usage re-checks whether its limits have cleared.
-// Short, because the run is supposed to go the moment they do; the reading it
-// checks against is the cached one unless the reset time has passed.
+// This costs nothing on its own — it reads the usage reading already in memory,
+// and never asks the endpoint — so it is short enough to start the run promptly
+// once a refresh lands rather than adding a wait of its own on top.
 const DELAY_REVIEW_MS = 30 * 1000;
 
 /**
@@ -270,14 +271,24 @@ class CronService {
   }
 
   /**
-   * Which of this cron's watched limits are over their threshold right now.
-   * `fresh` asks the endpoint rather than answering from the last reading, which
-   * is what a trigger wants: it is deciding whether to run at all.
+   * Which of this cron's watched limits are over their threshold, according to
+   * the last usage reading.
+   *
+   * Always the cached reading, never a lookup of its own. The endpoint rate
+   * limits and several Claude sessions on one machine share that limit, so a
+   * held trigger rides the same one-per-five-minutes refresh the header meters
+   * already drive rather than adding requests of its own. The cost is that a
+   * limit which has just reset can read as spent for up to another refresh
+   * window; the trigger waits that out.
    */
-  async blockersFor(cron, { fresh = false } = {}) {
+  async blockersFor(cron) {
     const delay = normalizeUsageDelay(cron.usageDelay);
     if (!hasUsageDelay(delay)) return [];
-    const reading = fresh ? await usageMonitor.now() : await usageMonitor.state();
+    let reading = await usageMonitor.state();
+    // A cold start has nothing cached and state() does not wait on the lookup it
+    // just started, so the first trigger would read no limits and sail past the
+    // setting. Wait for that one request rather than send another.
+    if (!reading.windows.length) reading = await usageMonitor.settled();
     return usageBlockers(reading, delay);
   }
 
@@ -330,9 +341,14 @@ class CronService {
 
   /**
    * Re-checks every waiting trigger and starts the ones whose limits have
-   * cleared. The endpoint is only asked outside its normal window when a reset
-   * time has actually passed — the rest of the time this reads the same cached
-   * numbers the header meters draw.
+   * cleared.
+   *
+   * This reads the cached numbers the header meters draw and never asks the
+   * endpoint out of turn. Asking is left to the refresh that reading is already
+   * due for, so however many triggers are waiting, usage is still fetched at
+   * most once per window. A trigger therefore goes within a refresh window of
+   * its limit resetting rather than within seconds of it, which is the price of
+   * not getting the account rate limited.
    */
   async reviewDelays() {
     if (this.reviewing) return;
@@ -342,10 +358,7 @@ class CronService {
     }
     this.reviewing = true;
     try {
-      const resetPassed = [...this.delayed.values()].some(
-        (entry) => entry.resumeAt && Date.parse(entry.resumeAt) <= Date.now(),
-      );
-      const reading = resetPassed ? await usageMonitor.now() : await usageMonitor.state();
+      const reading = await usageMonitor.state();
 
       for (const entry of [...this.delayed.values()]) {
         const cron = await getCron(entry.cronId);
@@ -476,11 +489,9 @@ class CronService {
       return null;
     }
 
-    // Usage is read fresh here rather than from the cached meters: this is the
-    // moment the run is decided, and a five-minute-old reading can be on the
-    // wrong side of a reset. Run now goes through this too — it does not
-    // override the setting, it joins the queue of one.
-    const blockers = await this.blockersFor(cron, { fresh: true });
+    // Run now goes through this too: it does not override the setting, it joins
+    // the queue of one.
+    const blockers = await this.blockersFor(cron);
     if (blockers.length) return { delayed: this.hold(cron, source, blockers) };
 
     return this.execute(cron, source);

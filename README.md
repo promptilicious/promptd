@@ -195,7 +195,7 @@ These are the same limits the header meters draw, matched on what a limit *is* r
 When a cron with at least one box ticked triggers, usage is read and every ticked limit is checked. If any is over its threshold the run does not start: the cron goes to `delayed`, and the trigger waits.
 
 1. **The status reads `delayed`,** and hovering it names every limit holding the run, what each is at, when each resets, and the estimated start time. The Next run column shows that estimate too.
-2. **It starts the moment usage clears.** The wait is re-checked every 30 seconds against the same cached reading the meters use. Once a reset time has passed, that check asks the endpoint directly rather than waiting out the five minute cache, so a run goes within seconds of its limit resetting rather than minutes.
+2. **It starts on the first reading that shows the limit clear.** Waiting costs no extra API requests: the check reads the same cached numbers the header meters draw, and never asks the endpoint out of turn. That reading refreshes at most once every five minutes however many triggers are waiting, so a run can start up to five minutes after its limit actually resets. Getting the account rate limited is the worse outcome, and the endpoint is shared with every other Claude session on this machine.
 3. **Only one trigger waits at a time.** A second trigger arriving while one waits is lost, not queued — a cron that sits out a long reset comes back and runs once, not five times. The dropped trigger is reported as a toast, the same as any other skipped trigger.
 4. **Run now does not override the setting.** Pressing it on a blocked cron produces the same held trigger, not a run. It answers 202 with the delay rather than starting `claude`.
 5. **Stop drops a held trigger.** While a cron is `delayed` the Run now button is a **Stop** button, and pressing it throws the waiting trigger away. The schedule is untouched, so the next trigger checks usage again like any other.
@@ -204,7 +204,7 @@ Four more things worth knowing:
 
 - **A restart clears every wait.** Like a pause, held triggers live in memory only. The server comes back with nothing waiting, and the next trigger checks usage fresh.
 - **Updates are never held up by one.** A delayed cron is not a running cron, so it does not count towards the runs an update waits to drain. Updates check, apply and restart on their own schedule regardless of what is waiting.
-- **Extra credits are treated as monthly.** The endpoint reports no reset time for a spending cap, so the estimate is local midnight on the first of the next month.
+- **Extra credits are treated as monthly.** The endpoint reports no reset time for a spending cap, because it is not a rolling window. The cap is monthly, so the reset is local midnight on the first of the next month — for the delay estimate and for the header meter's own tooltip, which says so.
 - **No reading means no delay.** If the CLI is signed out, or the usage lookup is failing, nothing is held back. A reading we do not have is not evidence that the account is out of usage, and holding every cron on that would be the worse failure.
 
 A run that waited says so in its log header, above the prompt:
@@ -404,7 +404,7 @@ A run that is stopped or that fails before producing a result event has no stati
 
 ## Subscription usage
 
-The header carries one small meter per limit on the account the Claude CLI is signed in as — the 5-hour session, the rolling 7-day limit, any model-scoped weekly limit, and extra usage credits when they are turned on. Hovering one gives the full name, the percentage, and when it resets in local time.
+The header carries one small meter per limit on the account the Claude CLI is signed in as — the 5-hour session, the rolling 7-day limit, any model-scoped weekly limit, and extra usage credits when they are turned on. Hovering one gives the full name, the percentage, and when it resets in local time. Credits are a monthly spending cap rather than a rolling window, and their tooltip says so: they reset on the 1st of each month.
 
 The numbers come from the same place the CLI's own `/usage` view reads them: the OAuth usage endpoint, asked with the access token the CLI already stores. Nothing is spawned and nothing is estimated from run logs. Reading that token is the only thing this does with it — it is never logged, never written anywhere, and never sent on to anything else.
 
