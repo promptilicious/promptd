@@ -174,21 +174,20 @@ function delayNames(delayed) {
  */
 function delayTitle(delayed) {
   if (!delayed) return '';
-  const lines = ['Trigger held — a usage limit this cron waits on is spent.'];
+  const lines = ['Waiting on a spent usage limit.'];
   for (const reason of delayed.reasons ?? []) {
     const resets = reason.resetsAt
       ? `resets ${fmtRelative(reason.resetsAt)} (${fmtDateTime(reason.resetsAt)})`
       : 'no reset time reported';
-    lines.push(`${reason.label} — ${Math.round(reason.usedPercent)}% used, ${resets}`);
+    lines.push(`${reason.label}: ${Math.round(reason.usedPercent)}% used, ${resets}`);
   }
+  // Usage is only read every five minutes, and a waiting run adds no lookups of
+  // its own, so the start can trail the reset by that much.
   lines.push(
     delayed.resumeAt
-      ? `Estimated run: ${fmtRelative(delayed.resumeAt)} (${fmtDateTime(delayed.resumeAt)})`
-      : 'Estimated run: as soon as a usage reading shows it clear',
+      ? `Starts ${fmtRelative(delayed.resumeAt)} (${fmtDateTime(delayed.resumeAt)}), give or take the 5 minute usage check.`
+      : 'Starts when the next usage check shows it clear. Usage is checked every 5 minutes.',
   );
-  // Usage is only read every five minutes, and a held trigger deliberately adds
-  // no lookups of its own, so the start can trail the reset by that much.
-  lines.push('Starts on the first usage reading that shows these clear, which refreshes every 5 minutes.');
   lines.push(`Waiting since ${fmtDateTime(delayed.delayedAt)}. Stop drops it.`);
   return lines.join('\n');
 }
@@ -305,7 +304,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
         event.target.disabled = true;
         try {
           await api(`/api/crons/${cron.id}/stop`, { method: 'POST' });
-          toast(`Dropped the held trigger for "${cron.name}"`);
+          toast(`"${cron.name}" is no longer waiting`);
         } catch (err) {
           toast(err.message, true);
           event.target.disabled = false;
@@ -346,7 +345,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
         onStarted?.();
         // Run now does not override the usage delay setting; a blocked press
         // becomes the waiting trigger instead of starting claude anyway.
-        if (result?.delayed) toast(`"${cron.name}" held for usage: ${delayNames(result.delayed)}`, true);
+        if (result?.delayed) toast(`"${cron.name}" is waiting on ${delayNames(result.delayed)}.`, true);
         else toast(`Started "${cron.name}"`);
       } catch (err) {
         toast(err.message, true);
@@ -375,9 +374,9 @@ async function renderHome() {
   } else sub = `${armed} armed of ${crons.length}`;
 
   const held = crons.filter((c) => c.isDelayed).length;
-  if (held) sub += ` — ${held} held for usage`;
+  if (held) sub += ` · ${held} waiting on usage`;
   if (pause.paused && pause.droppedCount) {
-    sub += ` — ${pause.droppedCount} trigger${pause.droppedCount === 1 ? '' : 's'} dropped`;
+    sub += ` · ${pause.droppedCount} trigger${pause.droppedCount === 1 ? '' : 's'} dropped`;
   }
 
   const head = el('div', { class: 'page-head' }, [
@@ -815,11 +814,9 @@ function usageDelayPicker(selected) {
   const note = el('div', {
     class: 'hint',
     text:
-      'Checked at every trigger, Run now included. While a ticked limit is spent the run waits, ' +
-      'then starts on the first usage reading that shows it clear. Readings refresh every 5 minutes ' +
-      'and waiting adds no lookups of its own, so a run can start up to that long after its limit ' +
-      'resets. Only one trigger waits at a time — a second one arriving meanwhile is dropped, not ' +
-      'queued — and a restart clears whatever was waiting.',
+      'A ticked limit that is spent makes the run wait instead of starting, Run now included. ' +
+      'It starts when usage clears, within about 5 minutes. Only one run waits per cron; any ' +
+      'trigger that arrives while it waits is dropped.',
   });
 
   const paint = (categories) => {
@@ -1402,16 +1399,16 @@ function connectEvents() {
       const payload = JSON.parse(event.data);
       if (type === 'run:finished') toast(`"${payload.cronName}" ${payload.status} in ${payload.seconds}s`);
       if (type === 'run:delayed') {
-        const when = payload.resumeAt ? `, estimated ${fmtRelative(payload.resumeAt)}` : '';
-        toast(`"${payload.cronName}" held for usage: ${delayNames(payload)}${when}`, true);
+        const when = payload.resumeAt ? ` Starts ${fmtRelative(payload.resumeAt)}.` : '';
+        toast(`"${payload.cronName}" is waiting on ${delayNames(payload)}.${when}`, true);
       }
       // Only the release that actually starts the run is worth a toast; a
       // cancelled or dropped one already reported itself where it happened.
-      if (type === 'run:released' && payload.ran) toast(`"${payload.cronName}" usage cleared; starting now`);
+      if (type === 'run:released' && payload.ran) toast(`"${payload.cronName}" usage cleared, starting now`);
       if (type === 'run:dropped') {
         // A pause is missed time, not queued time, so the count says how many
         // runs this cron has now lost rather than how many are waiting.
-        const sofar = payload.droppedCount > 1 ? ` — ${payload.droppedCount} missed so far` : '';
+        const sofar = payload.droppedCount > 1 ? ` (${payload.droppedCount} missed so far)` : '';
         toast(`"${payload.cronName}" trigger dropped: ${payload.reason}${sofar}`, true, `dropped:${payload.cronId}`);
       }
       if (type === 'run:skipped') {

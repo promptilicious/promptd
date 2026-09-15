@@ -170,7 +170,7 @@ function readSpend(spend) {
     detail: spent && cap ? `${spent} of ${cap} extra usage credits` : 'Extra usage credits',
     // Drawn under the reset line, so the meter says what kind of limit this is
     // rather than leaving a date to be read as another rolling window.
-    note: 'Monthly — extra usage credits reset on the 1st of each month.',
+    note: 'Monthly limit. Credits reset on the 1st of each month.',
     usedPercent: used,
     severity: spend?.severity === 'critical' || spend?.severity === 'warning' ? spend.severity : 'normal',
     resetsAt: isoOrNull(spend?.resets_at) ?? firstOfNextMonth(),
@@ -199,28 +199,28 @@ export const USAGE_DELAY_CATEGORIES = [
   {
     id: 'session',
     label: 'Session',
-    hint: 'Hold the trigger while the 5-hour session limit is at 100%.',
+    hint: 'Wait while the 5-hour session limit is at 100%.',
     matches: (window) => kindOf(window) === 'session',
     blocks: (used) => used >= 100,
   },
   {
     id: 'weekly',
     label: 'Weekly',
-    hint: 'Hold the trigger while the rolling 7-day limit is at 100%.',
+    hint: 'Wait while the rolling 7-day limit, all models, is at 100%.',
     matches: (window) => kindOf(window) === 'weekly_all',
     blocks: (used) => used >= 100,
   },
   {
     id: 'fable',
     label: 'Fable',
-    hint: 'Hold the trigger while the Fable weekly limit is at 100%.',
+    hint: 'Wait while the Fable weekly limit is at 100%.',
     matches: (window) => kindOf(window) === 'weekly_scoped' && /fable/i.test(window?.scope ?? window?.label ?? ''),
     blocks: (used) => used >= 100,
   },
   {
     id: 'credits',
     label: 'Monthly Credits 90%',
-    hint: 'Hold the trigger once more than 90% of the extra usage credits are spent. Credits are monthly, so they clear on the first.',
+    hint: 'Wait while more than 90% of the extra usage credits are spent. Credits reset on the 1st of each month.',
     matches: (window) => kindOf(window) === 'spend',
     blocks: (used) => used > 90,
   },

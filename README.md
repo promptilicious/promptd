@@ -172,7 +172,7 @@ While paused, the dropdown is replaced by **Cancel pause**, which resumes immedi
 
 What a pause does and does not do:
 
-1. **Every trigger is dropped, and says so.** The schedules stay registered, so a cron whose time comes round during the pause still produces a trigger — which is thrown away rather than run. Each one raises a toast naming the cron and the pause (`"Ticker" trigger dropped: all crons are paused 15 minutes`), and the header line counts them. A cron that fires often reuses its own toast and updates the count rather than stacking hundreds of them. The Next run column shows when the next trigger arrives and marks it `dropped`.
+1. **Every trigger is dropped, and says so.** The schedules stay registered, so a cron whose time comes round during the pause still produces a trigger, which is thrown away rather than run. Each one raises a toast naming the cron and the pause (`"Ticker" trigger dropped: all crons are paused 15 minutes`), and repeats add a count in brackets, and the header line counts them. A cron that fires often reuses its own toast and updates the count rather than stacking hundreds of them. The Next run column shows when the next trigger arrives and marks it `dropped`.
 2. **A run already in flight is left alone.** It keeps its `running` badge and finishes normally; it picks up the paused badge once it is done.
 3. **A drop is missed time, not queued time.** The count says how many runs this cron has now lost, not how many are waiting. Nothing is replayed when the pause lifts; the cron simply runs at its next trigger. Each pause counts from zero.
 4. **Nothing new starts, by hand either.** **Run now** is disabled on the home page and the logs page, and says why on hover; `POST /api/crons/:id/run` answers 409. **Stop** is never disabled, so a run already going can always be ended.
@@ -196,9 +196,9 @@ These are the same limits the header meters draw, matched on what a limit *is* r
 
 When a cron with at least one box ticked triggers, usage is read and every ticked limit is checked. If any is over its threshold the run does not start: the cron goes to `delayed`, and the trigger waits.
 
-1. **The status reads `delayed`,** and hovering it names every limit holding the run, what each is at, when each resets, and the estimated start time. The Next run column shows that estimate too.
+1. **The status reads `delayed`,** and hovering it names every limit it is waiting on, what each is at, when each resets, and the estimated start. The Next run column shows that estimate too.
 2. **It starts on the first reading that shows the limit clear.** Waiting costs no extra API requests: the check reads the same cached numbers the header meters draw, and never asks the endpoint out of turn. That reading refreshes at most once every five minutes however many triggers are waiting, so a run can start up to five minutes after its limit actually resets. Getting the account rate limited is the worse outcome, and the endpoint is shared with every other Claude session on this machine.
-3. **Only one trigger waits at a time.** A second trigger arriving while one waits is lost, not queued — a cron that sits out a long reset comes back and runs once, not five times. The dropped trigger is reported as a toast, the same as any other skipped trigger.
+3. **Only one run waits per cron.** Any trigger arriving while one waits is dropped, not queued, so a cron that sits out a long reset comes back and runs once rather than five times. The dropped trigger raises a toast like any other skipped one.
 4. **Run now does not override the setting.** Pressing it on a blocked cron produces the same held trigger, not a run. It answers 202 with the delay rather than starting `claude`.
 5. **Stop drops a held trigger.** While a cron is `delayed` the Run now button is a **Stop** button, and pressing it throws the waiting trigger away. The schedule is untouched, so the next trigger checks usage again like any other.
 
@@ -206,7 +206,7 @@ Four more things worth knowing:
 
 - **A restart clears every wait.** Like a pause, held triggers live in memory only. The server comes back with nothing waiting, and the next trigger checks usage fresh.
 - **Updates are never held up by one.** A delayed cron is not a running cron, so it does not count towards the runs an update waits to drain. Updates check, apply and restart on their own schedule regardless of what is waiting.
-- **Extra credits are treated as monthly.** The endpoint reports no reset time for a spending cap, because it is not a rolling window. The cap is monthly, so the reset is local midnight on the first of the next month — for the delay estimate and for the header meter's own tooltip, which says so.
+- **Extra credits are treated as monthly.** The endpoint reports no reset time for a spending cap, because it is not a rolling window. The cap is monthly, so the reset is local midnight on the first of the next month. That date is used for the delay estimate and shown in the header meter's own tooltip, which says it is monthly.
 - **No reading means no delay.** If the CLI is signed out, or the usage lookup is failing, nothing is held back. A reading we do not have is not evidence that the account is out of usage, and holding every cron on that would be the worse failure.
 
 A run that waited says so in its log header, above the prompt:
@@ -430,9 +430,9 @@ They live on the cron file, not in the logs, so they keep counting after the log
 
 **Only successful runs count.** A run that failed or was stopped is left out of all three, so the averages are the cost and length of a run that worked. That is also why the run count here is usually lower than the number of logs listed below it.
 
-**A cron with no totals yet is read off its own logs**, the first time the logs page is opened. Each log's footer says how it ended and how long it took, and its statistics block says what it cost; only the last 4 KB of each file is read, so a folder of 50 long runs is scanned in milliseconds rather than megabytes. A run still being written has no footer yet and is skipped — it is counted when it finishes, which is what stops it being counted twice.
+**A cron with no totals yet is read off its own logs**, the first time the logs page is opened. Each log's footer says how it ended and how long it took, and its statistics block says what it cost; only the last 4 KB of each file is read, so a folder of 50 long runs is scanned in milliseconds rather than megabytes. A run still being written has no footer yet and is skipped. It is counted when it finishes, which is what stops it being counted twice.
 
-That first pass is a floor, not a true lifetime figure: runs pruned before it ran are gone, so a busy cron starts from its newest 50. Everything after it is counted exactly once, as it finishes, and grows past 50 from there. The cost a run reports is the CLI's own accounting — a run that died before reporting one logs `Cost: unknown` and adds nothing to the total while still counting as a run.
+That first pass is a floor, not a true lifetime figure: runs pruned before it ran are gone, so a busy cron starts from its newest 50. Everything after it is counted exactly once, as it finishes, and grows past 50 from there. The cost a run reports is the CLI's own accounting. A run that died before reporting one logs `Cost: unknown`, adding nothing to the total while still counting as a run.
 
 To recount from the logs, delete the three fields from the cron's JSON file; the next visit to its logs page fills them in again.
 
