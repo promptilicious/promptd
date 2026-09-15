@@ -73,6 +73,135 @@ export const SYSTEM_METRICS = [
   },
 ];
 
+/**
+ * When a reading is worth telling someone about.
+ *
+ * Three rules keep these from becoming noise, and all three matter:
+ *
+ * 1. **A window, not a sample.** Every alert is judged on the mean of a whole
+ *    minute. One busy five-second sample is a cron doing its job.
+ * 2. **One alert per episode.** It fires when the metric crosses the line, and
+ *    then says nothing until the metric has come back below the clear level.
+ *    A disk sitting at 81% is one alert, not one every ten minutes forever.
+ * 3. **Never more than one per metric per ten minutes**, whatever else happens.
+ *
+ * The clear level sits below the threshold on purpose: a metric hovering at the
+ * line would otherwise alternate between firing and clearing.
+ */
+export const ALERT_COOLDOWN_MS = 10 * 60 * 1000;
+
+/** The mean of one metric over the last `ms`, or null without a full window. */
+function meanOver(samples, id, ms, intervalMs) {
+  const needed = Math.max(1, Math.round(ms / intervalMs));
+  const recent = samples.slice(-needed);
+  if (recent.length < needed) return null;
+  const values = recent.map((sample) => sample[id]).filter((value) => Number.isFinite(value));
+  // A gap in the window is not a low reading; it is no reading, and no verdict.
+  return values.length === needed ? values.reduce((sum, value) => sum + value, 0) / needed : null;
+}
+
+/** The middle value, which a burst cannot drag the way it drags a mean. */
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+export const SYSTEM_ALERTS = [
+  {
+    id: 'cpu',
+    label: 'High CPU',
+    windowMs: 60 * 1000,
+    threshold: 80,
+    clear: 70,
+    read(samples, intervalMs) {
+      const value = meanOver(samples, 'cpu', this.windowMs, intervalMs);
+      if (value === null) return null;
+      return {
+        value,
+        breached: value >= this.threshold,
+        cleared: value < this.clear,
+        summary: `${Math.round(value)}% of all cores, averaged over the last minute`,
+      };
+    },
+  },
+  {
+    id: 'memory',
+    label: 'High memory',
+    windowMs: 60 * 1000,
+    threshold: 80,
+    clear: 72,
+    read(samples, intervalMs) {
+      const value = meanOver(samples, 'memory', this.windowMs, intervalMs);
+      if (value === null) return null;
+      return {
+        value,
+        breached: value >= this.threshold,
+        cleared: value < this.clear,
+        summary: `${Math.round(value)}% of memory in use, averaged over the last minute`,
+      };
+    },
+  },
+  {
+    /**
+     * Throughput has no natural ceiling, so "high" here means high *for this
+     * machine*: several times what this disk has been doing, and enough in
+     * absolute terms to be worth saying.
+     *
+     * The baseline is the median of everything in the window older than the
+     * last minute. A mean would be dragged upward by the very burst being
+     * looked for, and would talk itself out of alerting. The absolute floor is
+     * what stops an idle disk alerting because 0.05 MB/s became 0.4 MB/s.
+     */
+    id: 'io',
+    label: 'Unusual storage I/O',
+    windowMs: 60 * 1000,
+    /** Multiples of the usual rate. */
+    multiple: 4,
+    /** Below this it is not worth calling unusual, whatever the multiple says. */
+    floorMbPerSecond: 50,
+    /** Five minutes of history before there is any "usual" to compare against. */
+    baselineSamples: 60,
+    read(samples, intervalMs) {
+      const value = meanOver(samples, 'io', this.windowMs, intervalMs);
+      if (value === null) return null;
+      const windowCount = Math.max(1, Math.round(this.windowMs / intervalMs));
+      const older = samples.slice(0, -windowCount).map((sample) => sample.io).filter((rate) => Number.isFinite(rate));
+      if (older.length < this.baselineSamples) return null;
+      const usual = median(older);
+      const bar = Math.max(this.floorMbPerSecond, usual * this.multiple);
+      return {
+        value,
+        breached: value >= bar,
+        cleared: value < bar * 0.6,
+        summary: `${round1(value)} MB/s over the last minute, against a usual ${round1(usual)} MB/s`,
+      };
+    },
+  },
+  {
+    /**
+     * Space does not move in minutes, so this one is judged on the latest
+     * reading rather than an average. Rule 2 is what keeps a full disk from
+     * saying so every ten minutes: it is one alert until space is freed.
+     */
+    id: 'disk',
+    label: 'Low disk space',
+    threshold: 80,
+    clear: 75,
+    read(samples) {
+      const value = samples.at(-1)?.disk;
+      if (!Number.isFinite(value)) return null;
+      return {
+        value,
+        breached: value >= this.threshold,
+        cleared: value < this.clear,
+        summary: `${round1(100 - value)}% of the volume is free`,
+      };
+    },
+  },
+];
+
 const round1 = (value) => Math.round(value * 10) / 10;
 const round2 = (value) => Math.round(value * 100) / 100;
 
@@ -335,6 +464,10 @@ class SystemMonitor {
     this.cpuBaseline = null;
     this.ioBaseline = null;
     this.iostat = null;
+    /** Per alert: whether it is currently firing, and when it last said so. */
+    this.alerts = new Map();
+    /** What is running right now, supplied by whoever owns the crons. */
+    this.runningCrons = () => [];
   }
 
   get enabled() {
@@ -348,7 +481,8 @@ class SystemMonitor {
    * Reporting the since-boot average there instead would be a different number
    * wearing the same label.
    */
-  start() {
+  start({ runningCrons } = {}) {
+    if (typeof runningCrons === 'function') this.runningCrons = runningCrons;
     if (!this.enabled || this.timer) return;
     if (process.platform === 'darwin') {
       this.iostat = new IostatReader(SAMPLE_INTERVAL_MS);
@@ -447,6 +581,7 @@ class SystemMonitor {
 
       this.samples.push(sample);
       this.trim();
+      this.checkAlerts();
       // Pushed rather than polled: the page holds its own copy of the window and
       // appends, so a 5-second meter costs one event, not a request per tab. The
       // detail rides along because the tooltips draw it, and a reading with no
@@ -455,6 +590,46 @@ class SystemMonitor {
       return sample;
     } finally {
       this.sampling = false;
+    }
+  }
+
+  /**
+   * Every alert, against the window just added to.
+   *
+   * The three rules above SYSTEM_ALERTS are all applied here: a firing alert
+   * says nothing until it has cleared, a cleared one can fire again, and
+   * neither can happen more than once per ten minutes.
+   */
+  checkAlerts() {
+    const now = Date.now();
+    for (const alert of SYSTEM_ALERTS) {
+      const state = this.alerts.get(alert.id) ?? { firing: false, lastSentAt: 0 };
+      this.alerts.set(alert.id, state);
+      const reading = alert.read(this.samples, SAMPLE_INTERVAL_MS);
+      if (!reading) continue;
+
+      if (state.firing) {
+        // Still over the line is the same episode, not a new one.
+        if (reading.cleared) state.firing = false;
+        continue;
+      }
+      if (!reading.breached) continue;
+
+      // Marked as firing even when the cooldown swallows the notification, so
+      // a cooldown expiring mid-episode does not produce a late one.
+      state.firing = true;
+      if (now - state.lastSentAt < ALERT_COOLDOWN_MS) continue;
+      state.lastSentAt = now;
+      const running = this.runningCrons();
+      console.warn(`[system] ${alert.label}: ${reading.summary}`);
+      emit('system:alert', {
+        metric: alert.id,
+        label: alert.label,
+        summary: reading.summary,
+        value: round1(reading.value),
+        threshold: alert.threshold ?? null,
+        running,
+      });
     }
   }
 

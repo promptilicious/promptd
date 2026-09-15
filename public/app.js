@@ -1431,6 +1431,12 @@ function connectEvents() {
   // Another tab read something; this one's badge is now wrong.
   events.addEventListener('notification:read', (event) => setBellBadge(JSON.parse(event.data).unread));
 
+  // A machine alert is worth interrupting for; it is also in the drawer.
+  events.addEventListener('system:alert', (event) => {
+    const { metric, label, summary } = JSON.parse(event.data);
+    toast(`${label}: ${summary}`, true, `system-alert:${metric}`);
+  });
+
   for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released', 'run:dropped']) {
     events.addEventListener(type, (event) => {
       const payload = JSON.parse(event.data);
@@ -1545,7 +1551,7 @@ function setBellBadge(count) {
 /** The coloured dot: what kind of thing this was, at a glance. */
 function noteKindClass(kind) {
   if (kind === 'run-failed' || kind === 'cron-broken') return 'bad';
-  if (kind === 'delayed' || kind === 'update') return 'warn';
+  if (kind === 'delayed' || kind === 'update' || kind === 'system') return 'warn';
   return 'plain';
 }
 

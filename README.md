@@ -12,6 +12,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Lifetime totals per cron — runs completed, what they cost, how long they took, and the average of each.
 - Machine stats in the header — CPU, memory, storage throughput and disk space, sampled every 5 seconds, with a 15-minute chart on hover.
 - A notification centre behind the bell: everything the server announces, kept on disk, with an unread count and a drawer that marks what you have actually read.
+- Alerts when the machine is in trouble — CPU, memory, unusual disk throughput, low disk space — each one naming the crons that were running at the time.
 
 ## Run it
 
@@ -498,6 +499,31 @@ Four things worth knowing:
 - **A reading that cannot be taken leaves a gap, not a flat line.** A metric the platform will not report draws nothing and says why under the chart, and points are plotted by their timestamp, so a restart shows as a gap rather than a line drawn straight through it.
 
 Samples are pushed over `/api/events`, so the page holds its own copy of the window and appends to it — a five-second meter costs one event, not a request per tab. `GET /api/system` is read once when a page opens or reconnects, which is also what fills the chart back in after a dropped connection.
+
+### Alerts
+
+The service also watches for trouble and writes a notification when it finds it. Each alert names the crons that were running when it fired, and how far into their runs they were, because "the CPU was pinned" is only half an answer.
+
+| Alert                   | Fires when                                                        | Clears below     |
+| ----------------------- | ----------------------------------------------------------------- | ---------------- |
+| **High CPU**            | 80% of all cores or more, averaged over a minute                  | 70%              |
+| **High memory**         | 80% of memory or more in use, averaged over a minute              | 72%              |
+| **Unusual storage I/O** | 4x this disk's usual rate over a minute, and at least 50 MB/s     | 60% of that bar  |
+| **Low disk space**      | Less than 20% of the volume free                                  | More than 25%    |
+
+Three rules keep these from becoming noise, and all three matter:
+
+1. **A window, not a sample.** Every alert is judged on the mean of a whole minute, so one busy five-second sample is a cron doing its job. A window with a gap in it gets no verdict at all.
+2. **One alert per episode.** An alert fires when the metric crosses the line and then says nothing until the metric has come back below the clear level. A disk sitting at 81% is one alert, not one every ten minutes forever.
+3. **At most one per metric per ten minutes**, whatever else happens.
+
+The clear level sits below the threshold on purpose. A metric hovering at the line would otherwise alternate between firing and clearing.
+
+**On the I/O alert**, which is the one with no obvious threshold: throughput has no natural ceiling, so "high" means high *for this machine*. The baseline is the median of everything in the window older than the last minute — a median rather than a mean, because a mean would be dragged upward by the very burst being looked for and would talk itself out of alerting. The 50 MB/s floor is what stops an idle disk alerting because 0.05 MB/s became 0.4 MB/s. There is no verdict until five minutes of history exist, because before that there is no "usual" to compare against.
+
+In practice that means a disk that normally idles alerts at 320 MB/s, and a disk that normally runs at 150 MB/s does not alert at 300 MB/s but does at 900 MB/s.
+
+Two things worth saying plainly about the windows. The ask was 30 seconds for CPU and memory; this uses 60. A 30-second average of 80% CPU is what a cron doing real work looks like, and a minute is quieter without meaningfully delaying anything you would act on. Both, and every threshold above, are named constants at the top of `src/system.js`.
 
 Set `SYSTEM_SAMPLE_MS=0` to turn the service off; the meters go with it. On a narrow window they are the first thing dropped from the header, below 1160px, before the subscription meters go at 900px.
 

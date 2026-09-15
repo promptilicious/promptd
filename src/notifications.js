@@ -33,6 +33,25 @@ function fileName(record) {
   return `${record.at.replace(/:/g, '-')}-${record.id.slice(0, 8)}.json`;
 }
 
+/**
+ * What was running when a machine alert fired, and how far into its run each
+ * was — the other half of the answer to "why was the CPU pinned".
+ *
+ * Three names at most. A machine busy enough to alert may have several runs on
+ * it, and a notification is a line to read, not a table.
+ */
+function runningSummary(running = []) {
+  if (!running.length) return 'No crons were running.';
+  const named = running.slice(0, 3).map((run) => {
+    const ms = Date.now() - Date.parse(run.startedAt);
+    if (!Number.isFinite(ms) || ms < 0) return `"${run.name}"`;
+    const minutes = Math.floor(ms / 60000);
+    return `"${run.name}" (${minutes ? `${minutes}m` : `${Math.round(ms / 1000)}s`} in)`;
+  });
+  const rest = running.length - named.length;
+  return `Running: ${named.join(', ')}${rest ? ` and ${rest} more` : ''}.`;
+}
+
 /** The limits a held trigger is waiting on, e.g. "Session, Weekly". */
 function blockerNames(event) {
   return (event?.reasons ?? []).map((reason) => reason.label).join(', ');
@@ -129,6 +148,13 @@ function describe(event) {
       return { kind: 'update', read: false, message: `Update gave up waiting on ${event.runningCount} run(s); schedules resumed` };
     case 'update:failed':
       return { kind: 'update', read: false, message: `Update script failed (exit ${event.code}); schedules resumed` };
+    case 'system:alert':
+      return {
+        kind: 'system',
+        // The whole reason the machine stats are watched at all.
+        read: false,
+        message: `${event.label}: ${event.summary}. ${runningSummary(event.running)}`,
+      };
     case 'crons:files-changed': {
       const out = [];
       for (const cronName of event.added ?? []) out.push({ kind: 'cron', read: true, message: `Cron file added: "${cronName}" — now scheduled` });

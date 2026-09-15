@@ -464,6 +464,16 @@ class CronService {
     return this.running.get(cronId) ?? null;
   }
 
+  /**
+   * What is in flight right now, name and start time each.
+   *
+   * Read by the machine-stat alerts: an alert that says the CPU is pinned is
+   * half an answer, and this is the other half.
+   */
+  runningCrons() {
+    return [...this.running.values()].map((run) => ({ name: run.cronName, startedAt: run.startedAt }));
+  }
+
   /** True while a specific log file is being written by a live run. */
   isRunningLog(cronId, file) {
     return this.running.get(cronId)?.logFile === file;

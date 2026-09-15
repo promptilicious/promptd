@@ -556,7 +556,9 @@ await cronFileWatcher.start();
 // coming up rather than delaying the first page load by several seconds.
 modelCatalog.refresh();
 selfUpdater.start();
-systemMonitor.start();
+// The stats service does not know what a cron is; it is handed a way to ask, so
+// an alert can say what was running when it fired.
+systemMonitor.start({ runningCrons: () => cronService.runningCrons() });
 
 app.listen(PORT, HOST, () => {
   console.log(`Claude Conductor listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
