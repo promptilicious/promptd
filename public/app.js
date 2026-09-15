@@ -1128,10 +1128,9 @@ async function renderSettings() {
         'Check for updates once per interval and apply them automatically',
       ]),
       el('div', { class: 'hint warn' }, [
-        'During an update, automatic or manual, every cron is paused until the update finishes. ',
+        'Every cron is paused while an update runs. ',
         'A trigger due in that window is missed, not queued. ',
-        'Turn this off if you would rather handle updates by hand — the server keeps checking either way, ',
-        'and offers what it finds as an Update available badge in the header.',
+        'With this off, the server still checks and shows an Update available badge in the header.',
       ]),
       el('div', { class: 'preset-row' }, [
         checkButton,
@@ -1165,7 +1164,7 @@ async function renderSettings() {
       el('h2', { text: 'Storage' }),
       readOnly('Storage root', config.storageRoot),
       readOnly('Crons', config.cronsDir),
-      readOnly('Logs', `${config.logsDir} — newest ${config.maxLogsPerCron} runs kept per cron`),
+      readOnly('Logs', `${config.logsDir} (newest ${config.maxLogsPerCron} runs kept per cron)`),
       el('div', { class: 'hint' }, [
         'Every cron and every log line is a plain file under the storage root. Editing one by hand is fine: the folder is watched.',
       ]),
@@ -1483,11 +1482,11 @@ function connectEvents() {
   // Cron files changed on disk outside the app: one toast per file, then redraw.
   events.addEventListener('crons:files-changed', (event) => {
     const { added = [], updated = [], removed = [], broken = [], repaired = [] } = JSON.parse(event.data);
-    for (const name of added) toast(`Cron file added: "${name}" — now scheduled`);
-    for (const name of updated) toast(`Cron file updated: "${name}" — rescheduled`);
-    for (const name of removed) toast(`Cron file deleted: "${name}" — unscheduled`, true);
-    for (const item of broken) toast(`${item.file} is not valid JSON — still running its last saved version`, true);
-    for (const name of repaired) toast(`Cron file fixed: "${name}" — rescheduled`);
+    for (const name of added) toast(`Cron file added: "${name}", now scheduled`);
+    for (const name of updated) toast(`Cron file updated: "${name}", rescheduled`);
+    for (const name of removed) toast(`Cron file deleted: "${name}", unscheduled`, true);
+    for (const item of broken) toast(`${item.file} is not valid JSON; still running its last saved version`, true);
+    for (const name of repaired) toast(`Cron file fixed: "${name}", rescheduled`);
     refreshCurrentView();
   });
 

@@ -157,14 +157,14 @@ function describe(event) {
       };
     case 'crons:files-changed': {
       const out = [];
-      for (const cronName of event.added ?? []) out.push({ kind: 'cron', read: true, message: `Cron file added: "${cronName}" — now scheduled` });
-      for (const cronName of event.updated ?? []) out.push({ kind: 'cron', read: true, message: `Cron file updated: "${cronName}" — rescheduled` });
-      for (const cronName of event.removed ?? []) out.push({ kind: 'cron', read: true, message: `Cron file deleted: "${cronName}" — unscheduled` });
-      for (const cronName of event.repaired ?? []) out.push({ kind: 'cron', read: true, message: `Cron file fixed: "${cronName}" — rescheduled` });
+      for (const cronName of event.added ?? []) out.push({ kind: 'cron', read: true, message: `Cron file added: "${cronName}", now scheduled` });
+      for (const cronName of event.updated ?? []) out.push({ kind: 'cron', read: true, message: `Cron file updated: "${cronName}", rescheduled` });
+      for (const cronName of event.removed ?? []) out.push({ kind: 'cron', read: true, message: `Cron file deleted: "${cronName}", unscheduled` });
+      for (const cronName of event.repaired ?? []) out.push({ kind: 'cron', read: true, message: `Cron file fixed: "${cronName}", rescheduled` });
       // A file that will not parse is running its last saved version, which is
       // worth noticing before it drifts further from what is on disk.
       for (const item of event.broken ?? []) {
-        out.push({ kind: 'cron-broken', read: false, message: `${item.file} is not valid JSON — still running its last saved version` });
+        out.push({ kind: 'cron-broken', read: false, message: `${item.file} is not valid JSON; still running its last saved version` });
       }
       return out;
     }
