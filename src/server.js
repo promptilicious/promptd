@@ -22,7 +22,7 @@ import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } 
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
 import { lifetimeStats } from './stats.js';
 import { systemMonitor } from './system.js';
-import { PAGE_SIZE, notificationCenter } from './notifications.js';
+import { MAX_NOTIFICATIONS, NOTIFICATIONS_DIR, PAGE_SIZE, notificationCenter } from './notifications.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -105,6 +105,8 @@ app.get('/api/config', (_req, res) => {
     cronsDir: CRONS_DIR,
     logsDir: LOGS_DIR,
     maxLogsPerCron: MAX_LOGS_PER_CRON,
+    notificationsDir: NOTIFICATIONS_DIR,
+    maxNotifications: MAX_NOTIFICATIONS,
     effortLevels: EFFORT_LEVELS,
     usageDelayCategories: USAGE_DELAY_CATEGORIES,
   });

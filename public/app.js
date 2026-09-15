@@ -1019,10 +1019,12 @@ function watchUpdate(status, updateButton, updateLog) {
 async function renderSettings() {
   // Health comes along for the boot time: it is the one fact on this page that
   // belongs to the running process rather than to a file on disk.
-  const [settings, config, health] = await Promise.all([
+  const [settings, config, health, notifications] = await Promise.all([
     api('/api/settings'),
     api('/api/config'),
     api('/api/health').catch(() => ({})),
+    // One item's worth of payload; it is the counts either side of it we want.
+    api('/api/notifications?limit=1').catch(() => ({})),
   ]);
 
   const status = el('div', { class: 'hint' });
@@ -1165,8 +1167,16 @@ async function renderSettings() {
       readOnly('Storage root', config.storageRoot),
       readOnly('Crons', config.cronsDir),
       readOnly('Logs', `${config.logsDir} (newest ${config.maxLogsPerCron} runs kept per cron)`),
+      readOnly(
+        'Notifications',
+        Number.isFinite(notifications.total)
+          ? `${config.notificationsDir} (${notifications.total} stored, ${notifications.unread} unread)`
+          : config.notificationsDir,
+      ),
       el('div', { class: 'hint' }, [
-        'Every cron and every log line is a plain file under the storage root. Editing one by hand is fine: the folder is watched.',
+        'Every cron, every log line and every notification is a plain file under the storage root. ',
+        'Editing a cron by hand is fine: the folder is watched. ',
+        `The newest ${config.maxNotifications} notifications are kept, and the oldest are deleted as new ones arrive.`,
       ]),
     ]),
   );
