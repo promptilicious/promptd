@@ -9,6 +9,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Hold a cron until your Claude usage resets, per limit, instead of firing it into a spent quota.
 - Choose the model per cron, from whatever the installed CLI recognises.
 - Every finished run records the model, runtime, tokens and cost that the CLI reported.
+- Lifetime totals per cron — runs completed, what they cost, how long they took, and the average of each.
 
 ## Run it
 
@@ -171,11 +172,12 @@ While paused, the dropdown is replaced by **Cancel pause**, which resumes immedi
 
 What a pause does and does not do:
 
-1. **Schedules are unregistered, not just ignored.** Nothing fires, and the Next run column reads `paused` because there is no armed job to ask.
+1. **Every trigger is dropped, and says so.** The schedules stay registered, so a cron whose time comes round during the pause still produces a trigger — which is thrown away rather than run. Each one raises a toast naming the cron and the pause (`"Ticker" trigger dropped: all crons are paused 15 minutes`), and the header line counts them. A cron that fires often reuses its own toast and updates the count rather than stacking hundreds of them. The Next run column shows when the next trigger arrives and marks it `dropped`.
 2. **A run already in flight is left alone.** It keeps its `running` badge and finishes normally; it picks up the paused badge once it is done.
-3. **Nothing new starts, by hand either.** **Run now** is disabled on the home page and the logs page, and says why on hover; `POST /api/crons/:id/run` answers 409. **Stop** is never disabled, so a run already going can always be ended.
-4. **Deactivated crons stay `deactivated`.** A pause is not the cron's own `isActive` setting, and lifting the pause will not arm something you turned off.
-5. **It is never written to disk.** A restart always comes back unpaused, with every active cron armed again — which is why `Until restart` means what it says.
+3. **A drop is missed time, not queued time.** The count says how many runs this cron has now lost, not how many are waiting. Nothing is replayed when the pause lifts; the cron simply runs at its next trigger. Each pause counts from zero.
+4. **Nothing new starts, by hand either.** **Run now** is disabled on the home page and the logs page, and says why on hover; `POST /api/crons/:id/run` answers 409. **Stop** is never disabled, so a run already going can always be ended.
+5. **Deactivated crons stay `deactivated`.** A pause is not the cron's own `isActive` setting, and lifting the pause will not arm something you turned off.
+6. **It is never written to disk.** A restart always comes back unpaused, with every active cron armed again — which is why `Until restart` means what it says.
 
 When the time is up, or you cancel, the crons are re-read from disk and re-armed, so any edit made during the pause takes effect.
 
@@ -334,7 +336,10 @@ A cron file:
   "lastRunAt": "2026-09-10T06:11:12.789Z",
   "lastRunStatus": "succeeded",
   "lastRunLog": "2026-09-10T06-11-12.789Z.txt",
-  "lastRunDurationSeconds": 3.3
+  "lastRunDurationSeconds": 3.3,
+  "lifetimeRuns": 7,
+  "lifetimeCostUsd": 18.6535,
+  "lifetimeRuntimeSeconds": 3161.5
 }
 ```
 
@@ -357,7 +362,7 @@ Set `WATCH_INTERVAL_MS` to change the interval, or `0` to switch the watcher off
 Two things the watcher deliberately stays quiet about, so you don't get told twice about your own actions:
 
 - **Changes made through the UI or API.** Those already reload the scheduler and show their own toast.
-- **Run bookkeeping.** Every run rewrites `lastRunAt`, `lastRunStatus`, `lastRunLog` and `lastRunDurationSeconds` in the cron file. Only the config fields (`name`, `description`, `cron`, `workingDirectory`, `model`, `effort`, `usageDelay`, `prompt`, `isActive`) count as a change.
+- **Run bookkeeping.** Every run rewrites `lastRunAt`, `lastRunStatus`, `lastRunLog`, `lastRunDurationSeconds` and the three `lifetime*` totals in the cron file. Only the config fields (`name`, `description`, `cron`, `workingDirectory`, `model`, `effort`, `usageDelay`, `prompt`, `isActive`) count as a change.
 
 A file caught mid-write is treated as unchanged rather than deleted, so a save from an editor that truncates before writing does not cause a delete-then-add flicker.
 
@@ -402,6 +407,35 @@ The numbers come from the `result` event's `modelUsage`, `duration_ms`, `usage` 
 
 A run that is stopped or that fails before producing a result event has no statistics block, only the footer.
 
+## Lifetime totals
+
+The logs page carries three totals under the cron's name: runs completed, total cost with the average per run, and total runtime with the average per run.
+
+```
+Logs · Nightly Digest
+9 runs kept, newest first. Oldest are pruned past 50.
+
+  7                 $18.65             52m 42s
+  runs completed    total cost         total runtime
+  lifetime          $2.6648 per run    7m 32s per run
+```
+
+They live on the cron file, not in the logs, so they keep counting after the logs they came from are pruned:
+
+```json
+"lifetimeRuns": 7,
+"lifetimeCostUsd": 18.6535,
+"lifetimeRuntimeSeconds": 3161.5
+```
+
+**Only successful runs count.** A run that failed or was stopped is left out of all three, so the averages are the cost and length of a run that worked. That is also why the run count here is usually lower than the number of logs listed below it.
+
+**A cron with no totals yet is read off its own logs**, the first time the logs page is opened. Each log's footer says how it ended and how long it took, and its statistics block says what it cost; only the last 4 KB of each file is read, so a folder of 50 long runs is scanned in milliseconds rather than megabytes. A run still being written has no footer yet and is skipped — it is counted when it finishes, which is what stops it being counted twice.
+
+That first pass is a floor, not a true lifetime figure: runs pruned before it ran are gone, so a busy cron starts from its newest 50. Everything after it is counted exactly once, as it finishes, and grows past 50 from there. The cost a run reports is the CLI's own accounting — a run that died before reporting one logs `Cost: unknown` and adds nothing to the total while still counting as a run.
+
+To recount from the logs, delete the three fields from the cron's JSON file; the next visit to its logs page fills them in again.
+
 ## Subscription usage
 
 The header carries one small meter per limit on the account the Claude CLI is signed in as — the 5-hour session, the rolling 7-day limit, any model-scoped weekly limit, and extra usage credits when they are turned on. Hovering one gives the full name, the percentage, and when it resets in local time. Credits are a monthly spending cap rather than a rolling window, and their tooltip says so: they reset on the 1st of each month.
@@ -422,7 +456,7 @@ Amber and red are the API's own severity for a limit, not a threshold picked her
 
 Two Server-Sent Event streams, no polling loops in the UI:
 
-- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger held for usage, trigger released. The home page redraws when one arrives.
+- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger dropped by a pause, trigger held for usage, trigger released. The home page redraws when one arrives.
 - `GET /api/crons/:id/logs/:file/stream` — one log file: everything written so far, then each new chunk. Closes itself with a `done` event when the run ends.
 
 ## Configuration
@@ -503,14 +537,14 @@ As the field changes, a green line below it shows when the expression next fires
 | GET, PUT, DELETE | `/api/crons/:id`                   | Read, update, delete                                                                                                                                                           |
 | POST             | `/api/crons/:id/run`               | Trigger now. 409 if already running, if crons are paused, or if a trigger is already waiting on usage. 202 with `delayed` instead of a run when a watched limit is spent        |
 | POST             | `/api/crons/:id/stop`              | Kill the in-flight run, or drop a trigger waiting on usage (409 if neither)                                                                                                    |
-| GET              | `/api/crons/:id/logs`              | Run history, newest first                                                                                                                                                      |
+| GET              | `/api/crons/:id/logs`              | Run history newest first, plus the cron's lifetime totals and per-run averages                                                                                                 |
 | GET              | `/api/crons/:id/logs/:file`        | One log as JSON                                                                                                                                                                |
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
 | GET              | `/api/config`                      | Storage paths, retention limit, effort levels, and the usage-delay categories                                                                                                  |
 | GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, how many triggers are held for usage, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
-| GET              | `/api/pause`                       | Pause state, the offered lengths, and how many runs are still in flight                                                                                                        |
+| GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |
 | DELETE           | `/api/pause`                       | Resume (409 if not paused, or if the pause belongs to an update)                                                                                                               |
 | GET              | `/api/update/check`                | Whether `main` is behind. Read-only, never pulls                                                                                                                               |
@@ -526,5 +560,6 @@ As the field changes, a green line below it shows when the expression next fires
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
 - A pause lives in memory only. Restarting the server clears it, whichever length was chosen. So does a trigger held for usage: a restart comes back with nothing waiting.
 - The **Update available** badge reflects the last check, so it can lag a push by up to `updateCheckIntervalHours`. **Check for updates** on the Settings page refreshes it at once.
-- Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone.
+- Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone — and with the cron file gone, its lifetime totals go with it.
+- Renaming a cron carries its lifetime totals, because they live on the cron file rather than being recounted from the logs.
 - Renaming a cron moves its log folder, so history follows the new name.

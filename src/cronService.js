@@ -9,6 +9,7 @@ import { emit } from './events.js';
 import { resolveUserPath } from './paths.js';
 import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from './store.js';
 import { hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
+import { countRun } from './stats.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -172,6 +173,13 @@ class CronService {
     this.delayed = new Map();
     this.delayTimer = null;
     this.reviewing = false;
+    /**
+     * Triggers dropped because every schedule is paused, counted per cron for
+     * the current pause. A pause is missed time, not queued time, so this is
+     * only ever a report of what did not run; it is reset by each new pause.
+     * @type {Map<string, number>} cron id -> triggers dropped this pause
+     */
+    this.droppedDuringPause = new Map();
   }
 
   isPaused() {
@@ -191,7 +199,7 @@ class CronService {
   /** JSON-safe pause state for the API and the status badges. */
   pauseInfo() {
     if (!this.pauseState) {
-      return { paused: false, mode: null, label: null, badge: null, until: null, startedAt: null, remainingMs: null, cancellable: false, runningCount: this.running.size };
+      return { paused: false, mode: null, label: null, badge: null, until: null, startedAt: null, remainingMs: null, cancellable: false, runningCount: this.running.size, droppedCount: 0 };
     }
     const { mode, label, option, startedAt, until } = this.pauseState;
     return {
@@ -206,6 +214,7 @@ class CronService {
       remainingMs: until ? Math.max(0, new Date(until).getTime() - Date.now()) : null,
       cancellable: mode === 'manual',
       runningCount: this.running.size,
+      droppedCount: [...this.droppedDuringPause.values()].reduce((total, n) => total + n, 0),
     };
   }
 
@@ -218,6 +227,8 @@ class CronService {
     this.pauseTimer = null;
 
     const startedAt = new Date();
+    // Each pause reports its own missed triggers, not the last one's.
+    this.droppedDuringPause.clear();
     this.pauseState = {
       mode,
       label,
@@ -412,13 +423,6 @@ class CronService {
     this.jobs.clear();
 
     const crons = await listCrons();
-    // Paused: the jobs above are stopped and none get rebuilt, so nothing fires.
-    // Cron files can still be edited meanwhile; resuming re-reads them.
-    if (this.pauseState) {
-      console.log(`[cron] paused ${this.pauseState.label}; ${crons.length} cron(s) left unscheduled`);
-      emit('crons:changed');
-      return 0;
-    }
     for (const cron of crons) {
       if (!cron.isActive) continue;
       const check = validateCronExpression(cron.cron);
@@ -433,7 +437,15 @@ class CronService {
       });
       this.jobs.set(cron.id, job);
     }
-    console.log(`[cron] scheduled ${this.jobs.size} of ${crons.length} cron(s)`);
+    // Schedules stay registered through a pause, and every trigger they produce
+    // is dropped on arrival by `trigger`. Nothing runs either way; the
+    // difference is that a dropped trigger can be reported, and an unregistered
+    // job cannot report the run it never started.
+    console.log(
+      this.pauseState
+        ? `[cron] scheduled ${this.jobs.size} of ${crons.length} cron(s); paused ${this.pauseState.label}, so their triggers will be dropped`
+        : `[cron] scheduled ${this.jobs.size} of ${crons.length} cron(s)`,
+    );
     emit('crons:changed');
     return this.jobs.size;
   }
@@ -465,8 +477,24 @@ class CronService {
     // in the moment before it was stopped. An update pause also blocks manual
     // runs, because the update is waiting for the last run to finish.
     if (this.pauseState && (source === 'schedule' || this.pauseState.mode === 'update')) {
-      console.warn(`[cron] "${cron.name}" ${source} trigger skipped: paused ${this.pauseState.label}`);
-      emit('run:skipped', { cronId, cronName: cron.name, source, reason: `paused ${this.pauseState.label}` });
+      const dropped = (this.droppedDuringPause.get(cronId) ?? 0) + 1;
+      this.droppedDuringPause.set(cronId, dropped);
+      console.warn(`[cron] "${cron.name}" ${source} trigger dropped: paused ${this.pauseState.label}`);
+      // Its own event rather than run:skipped: a pause drop is the one skip the
+      // user did not ask for cron by cron, so it gets wording of its own.
+      emit('run:dropped', {
+        cronId,
+        cronName: cron.name,
+        source,
+        reason:
+          this.pauseState.mode === 'update'
+            ? 'an update is holding every schedule'
+            : `all crons are paused ${this.pauseState.label}`,
+        pauseMode: this.pauseState.mode,
+        pauseLabel: this.pauseState.label,
+        droppedCount: dropped,
+        nextRunAt: this.nextRun(cronId),
+      });
       return null;
     }
     if (this.running.has(cronId)) {
@@ -605,11 +633,23 @@ class CronService {
       if (handle?.killTimer) clearTimeout(handle.killTimer);
       this.handles.delete(cron.id);
       this.running.delete(cron.id);
+      // Read fresh rather than trusting the copy this run started with: a long
+      // run can outlive the page visit that initialized these counters.
+      const current = (await getCron(cron.id).catch(() => null)) ?? cron;
+      const lifetime = await countRun(current, {
+        status,
+        seconds: Number(seconds),
+        costUsd: resultEvent?.total_cost_usd,
+      }).catch((err) => {
+        console.error(`[cron] could not total lifetime stats: ${err.message}`);
+        return {};
+      });
       await patchCron(cron.id, {
         lastRunAt: startedAt.toISOString(),
         lastRunStatus: status,
         lastRunLog: file,
         lastRunDurationSeconds: Number(seconds),
+        ...lifetime,
       }).catch((err) => console.error(`[cron] could not record last run: ${err.message}`));
       const pruned = await pruneLogs(cron.name).catch((err) => {
         console.error(`[cron] log cleanup failed for "${cron.name}": ${err.message}`);

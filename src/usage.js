@@ -26,10 +26,6 @@ const TTL_MS = 5 * 60 * 1000;
 const ERROR_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_BACKOFF_MS = 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
-// A delayed cron asks for a reading outside the normal window when the limit it
-// is waiting on should have reset. This is the floor on how often that is
-// allowed, so a reset time that keeps reading as past cannot become a hot loop.
-const FORCED_FETCH_GAP_MS = 60 * 1000;
 
 /**
  * The last good reading, kept across restarts. Only the drawn numbers are
@@ -136,6 +132,11 @@ function readLimit(entry, index) {
   };
 }
 
+/** Local midnight on the first of next month. */
+function firstOfNextMonth(now = new Date()) {
+  return new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
+}
+
 /** Money is reported in minor units with its own exponent, e.g. 272985 / 10^2. */
 function money(amount) {
   if (!Number.isFinite(amount?.amount_minor)) return null;
@@ -148,8 +149,13 @@ function money(amount) {
 }
 
 /**
- * Extra usage credits, which are a spend cap rather than a rate limit: they
- * have no reset time, and are only shown when the account has them turned on.
+ * Extra usage credits, which are a spend cap rather than a rate limit, and are
+ * only shown when the account has them turned on.
+ *
+ * The endpoint reports no reset time for the cap because it is not a rolling
+ * window. The cap is monthly and clears on the first, so that is filled in here
+ * — one place, so the header meter and a trigger held on credits both say the
+ * same thing. Anything the endpoint does report wins over it.
  */
 function readSpend(spend) {
   const used = percent(spend?.percent);
@@ -162,9 +168,12 @@ function readSpend(spend) {
     scope: null,
     label: 'Credits',
     detail: spent && cap ? `${spent} of ${cap} extra usage credits` : 'Extra usage credits',
+    // Drawn under the reset line, so the meter says what kind of limit this is
+    // rather than leaving a date to be read as another rolling window.
+    note: 'Monthly — extra usage credits reset on the 1st of each month.',
     usedPercent: used,
     severity: spend?.severity === 'critical' || spend?.severity === 'warning' ? spend.severity : 'normal',
-    resetsAt: null,
+    resetsAt: isoOrNull(spend?.resets_at) ?? firstOfNextMonth(),
   };
 }
 
@@ -175,11 +184,6 @@ function readSpend(spend) {
  */
 function kindOf(window) {
   return window?.kind ?? String(window?.key ?? '').split(':')[0];
-}
-
-/** Local midnight on the first of next month. */
-function firstOfNextMonth(now = new Date()) {
-  return new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
 }
 
 /**
@@ -219,8 +223,6 @@ export const USAGE_DELAY_CATEGORIES = [
     hint: 'Hold the trigger once more than 90% of the extra usage credits are spent. Credits are monthly, so they clear on the first.',
     matches: (window) => kindOf(window) === 'spend',
     blocks: (used) => used > 90,
-    // The endpoint reports no reset time for a spending cap; the cap is monthly.
-    resetsAt: () => firstOfNextMonth(),
   },
 ];
 
@@ -256,7 +258,7 @@ export function usageBlockers(reading, delay) {
       id: category.id,
       label: category.label,
       usedPercent: window.usedPercent,
-      resetsAt: category.resetsAt ? category.resetsAt() : (window.resetsAt ?? null),
+      resetsAt: window.resetsAt ?? null,
     });
   }
   return blockers;
@@ -347,8 +349,6 @@ class UsageMonitor {
     this.reason = null;
     /** Earliest the endpoint may be asked again. */
     this.nextFetchAt = 0;
-    /** Earliest a delayed cron may ask outside that window. */
-    this.nextForcedFetchAt = 0;
     /** Consecutive failures, which is what the backoff doubles on. */
     this.failures = 0;
     /** Shared so concurrent polls make one request, not one each. @type {Promise|null} */
@@ -358,10 +358,16 @@ class UsageMonitor {
   }
 
   /**
-   * The current reading. Never throws and never waits on the network: a poll
-   * that finds the window open starts a refresh and answers from what is
-   * already held, so /api/health stays instant and a page refresh redraws the
-   * meters from the last lookup rather than triggering one of its own.
+   * The current reading, and the only way to ask for one. Never throws and never
+   * waits on the network: a poll that finds the window open starts a refresh and
+   * answers from what is already held, so /api/health stays instant and a page
+   * refresh redraws the meters from the last lookup rather than triggering one
+   * of its own.
+   *
+   * There is deliberately no way to ask outside that window. The endpoint rate
+   * limits, and several Claude sessions on one machine share that limit, so
+   * everything that wants usage — the header meters and the triggers held for
+   * usage alike — comes through here and shares the one request per window.
    */
   async state() {
     await this.restore();
@@ -370,19 +376,15 @@ class UsageMonitor {
   }
 
   /**
-   * The current reading, waiting on a lookup rather than answering from the last
-   * one. This is what a delayed cron uses the moment the limit it is waiting on
-   * should have cleared: answering from a five-minute-old reading there would
-   * hold the run back for another five minutes for no reason.
+   * The reading once a lookup already in flight has landed.
+   *
+   * Never starts one. It only joins the request `state()` may have just sent, so
+   * a caller that cannot act on an empty reading — a trigger deciding whether to
+   * hold — can wait for the first one without adding to the request budget. With
+   * nothing in flight this answers immediately, empty reading and all.
    */
-  async now() {
-    await this.restore();
-    if (Date.now() >= this.nextForcedFetchAt) {
-      this.nextForcedFetchAt = Date.now() + FORCED_FETCH_GAP_MS;
-      await this.refresh();
-    } else if (Date.now() >= this.nextFetchAt) {
-      await this.refresh();
-    }
+  async settled() {
+    if (this.inFlight) await this.inFlight;
     return this.reading();
   }
 

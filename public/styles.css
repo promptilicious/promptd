@@ -764,6 +764,44 @@ input.narrow {
   box-shadow: inset 0 0 0 1px rgba(217, 119, 87, 0.45);
 }
 
+/* Lifetime totals under the cron name on the logs page. Wraps rather than
+   squeezing, so a narrow window stacks them instead of clipping the digits. */
+.stat-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.stat {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 14px;
+  min-width: 132px;
+}
+
+.stat-value {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.25;
+  /* Tabular figures so a total that ticks up does not shift the label under it. */
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-label {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+
+.stat-sub {
+  font-size: 11.5px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  margin-top: 3px;
+}
+
 /* Delay for usage: the checkboxes wrap on a narrow window rather than forcing
    the form wider. */
 .delay-grid {

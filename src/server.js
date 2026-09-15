@@ -20,6 +20,7 @@ import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
+import { lifetimeStats } from './stats.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -361,8 +362,12 @@ app.get('/api/crons/:id/logs', async (req, res, next) => {
     const cron = await getCron(req.params.id);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
     const logs = await listLogs(cron.name);
+    // Read here rather than on the cron list: the first read scans the log
+    // folder, and this is the one page that draws the result.
+    const stats = await lifetimeStats(cron);
     res.json({
       cron: decorate(cron),
+      stats,
       logs: logs.map((log) => ({ ...log, isRunning: cronService.isRunningLog(cron.id, log.file) })),
     });
   } catch (err) {

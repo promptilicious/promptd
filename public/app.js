@@ -107,15 +107,32 @@ function tickRuntimes() {
   }
 }
 
+/**
+ * Money, at the precision the number deserves: a run costs cents and needs four
+ * decimals to say so, a lifetime total of hundreds does not.
+ */
+function fmtCost(usd) {
+  if (!Number.isFinite(usd)) return '—';
+  return usd >= 10 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(4)}`;
+}
+
 function fmtBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/** Toasts stack, so several changes landing at once stay readable. */
-function toast(message, bad = false) {
+/**
+ * Toasts stack, so several changes landing at once stay readable.
+ *
+ * A `key` makes one replace itself instead. That is what keeps a cron on a
+ * 30-second schedule from stacking hundreds of identical drop notices through a
+ * six hour pause: the same cron reuses its toast and updates the count.
+ */
+function toast(message, bad = false, key = null) {
+  if (key) toastsEl.querySelector(`[data-toast-key="${CSS.escape(key)}"]`)?.remove();
   const node = el('div', { class: bad ? 'toast bad' : 'toast', text: message });
+  if (key) node.dataset.toastKey = key;
   toastsEl.append(node);
   setTimeout(() => {
     node.classList.add('leaving');
@@ -359,6 +376,9 @@ async function renderHome() {
 
   const held = crons.filter((c) => c.isDelayed).length;
   if (held) sub += ` — ${held} held for usage`;
+  if (pause.paused && pause.droppedCount) {
+    sub += ` — ${pause.droppedCount} trigger${pause.droppedCount === 1 ? '' : 's'} dropped`;
+  }
 
   const head = el('div', { class: 'page-head' }, [
     el('div', {}, [el('h1', { text: 'Crons' }), el('p', { class: 'sub', text: sub })]),
@@ -412,16 +432,24 @@ async function renderHome() {
               }),
             ])
           : cron.nextRunAt
-          ? el('div', {}, [
-              el('div', { text: fmtRelative(cron.nextRunAt) }),
-              el('div', { class: 'cron-desc', text: fmtDateTime(cron.nextRunAt) }),
-            ])
-          : // Paused means the schedule is not registered, so there is no next
-            // fire time to show for a cron that is otherwise armed.
-            el('span', {
-              class: 'muted',
-              text: !cron.isActive ? 'deactivated' : pause.paused ? 'paused' : 'not scheduled',
-            }),
+          ? // A pause leaves the schedule registered, so this time is real — it
+            // is when the trigger arrives and is thrown away, not when it runs.
+            el(
+              'div',
+              {
+                title: pause.paused
+                  ? 'Every schedule is paused, so this trigger is dropped when it arrives. A pause misses runs, it does not queue them.'
+                  : null,
+              },
+              [
+                el('div', { text: fmtRelative(cron.nextRunAt) }),
+                el('div', {
+                  class: 'cron-desc',
+                  text: pause.paused ? `${fmtDateTime(cron.nextRunAt)} · dropped` : fmtDateTime(cron.nextRunAt),
+                }),
+              ],
+            )
+          : el('span', { class: 'muted', text: cron.isActive ? 'not scheduled' : 'deactivated' }),
       ]),
       el('td', {}, [
         el('div', { class: 'row-actions' }, [
@@ -1131,8 +1159,51 @@ async function renderSettings() {
 
 const logsState = { cronId: null, selected: null, atBottom: true };
 
+/**
+ * Lifetime totals for one cron, drawn under its name on the logs page.
+ *
+ * These count completed runs only, and they outlive the logs below them — the
+ * newest 50 runs are all that is kept on disk, while these keep counting. A
+ * cron whose counters were read back from its logs therefore starts from
+ * whatever had not been pruned yet.
+ */
+function statStrip(stats) {
+  if (!stats) return null;
+
+  const stat = (value, label, sub, tip) =>
+    el('div', { class: 'stat', title: tip }, [
+      el('div', { class: 'stat-value', text: value }),
+      el('div', { class: 'stat-label', text: label }),
+      el('div', { class: 'stat-sub', text: sub }),
+    ]);
+
+  const runs = stats.runs ?? 0;
+  const perRun = runs > 0 ? `over ${runs} run${runs === 1 ? '' : 's'}` : 'no completed runs yet';
+
+  return el('div', { class: 'stat-strip' }, [
+    stat(
+      runs.toLocaleString(),
+      runs === 1 ? 'run completed' : 'runs completed',
+      'lifetime',
+      'Runs that finished successfully. Failed and stopped runs are not counted.',
+    ),
+    stat(
+      fmtCost(stats.costUsd),
+      'total cost',
+      runs > 0 ? `${fmtCost(stats.averageCostUsd)} per run` : perRun,
+      'What every successful run has cost, as the CLI reported it.',
+    ),
+    stat(
+      Number.isFinite(stats.runtimeSeconds) ? fmtDuration(stats.runtimeSeconds * 1000) : '—',
+      'total runtime',
+      runs > 0 ? `${fmtDuration(stats.averageRuntimeSeconds * 1000)} per run` : perRun,
+      'Wall-clock time across every successful run.',
+    ),
+  ]);
+}
+
 async function renderLogs(id) {
-  const [{ cron, logs }, pause] = await Promise.all([api(`/api/crons/${id}/logs`), api('/api/pause')]);
+  const [{ cron, logs, stats }, pause] = await Promise.all([api(`/api/crons/${id}/logs`), api('/api/pause')]);
   logsState.cronId = id;
 
   // Default to the live run if there is one, else the newest run.
@@ -1214,6 +1285,7 @@ async function renderLogs(id) {
           class: 'sub',
           text: `${logs.length} run${logs.length === 1 ? '' : 's'} kept, newest first. Oldest are pruned past 50.`,
         }),
+        statStrip(stats),
       ]),
       el('div', { class: 'row-actions' }, [
         el('a', { class: 'btn', href: `#/edit/${cron.id}`, text: 'Edit cron' }),
@@ -1325,7 +1397,7 @@ function connectEvents() {
     checkHealth();
   });
 
-  for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released']) {
+  for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released', 'run:dropped']) {
     events.addEventListener(type, (event) => {
       const payload = JSON.parse(event.data);
       if (type === 'run:finished') toast(`"${payload.cronName}" ${payload.status} in ${payload.seconds}s`);
@@ -1336,6 +1408,12 @@ function connectEvents() {
       // Only the release that actually starts the run is worth a toast; a
       // cancelled or dropped one already reported itself where it happened.
       if (type === 'run:released' && payload.ran) toast(`"${payload.cronName}" usage cleared; starting now`);
+      if (type === 'run:dropped') {
+        // A pause is missed time, not queued time, so the count says how many
+        // runs this cron has now lost rather than how many are waiting.
+        const sofar = payload.droppedCount > 1 ? ` — ${payload.droppedCount} missed so far` : '';
+        toast(`"${payload.cronName}" trigger dropped: ${payload.reason}${sofar}`, true, `dropped:${payload.cronId}`);
+      }
       if (type === 'run:skipped') {
         toast(payload.reason ? `"${payload.cronName}" skipped: ${payload.reason}` : `"${payload.cronName}" was still running; trigger skipped`, true);
       }
