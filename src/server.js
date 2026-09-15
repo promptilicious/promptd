@@ -34,6 +34,9 @@ import {
   updateCron,
 } from './store.js';
 
+/** When this process came up, which is what the Settings page calls the last boot. */
+const STARTED_AT = new Date().toISOString();
+
 const PORT = Number(process.env.PORT || 4321);
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -498,6 +501,7 @@ app.get('/api/health', async (_req, res) => {
     ok: true,
     scheduled: cronService.jobs.size,
     commit: runningCommit,
+    startedAt: STARTED_AT,
     paused: cronService.isPaused(),
     delayed: cronService.delayedCount(),
     usage,

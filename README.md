@@ -220,7 +220,7 @@ A pause outranks a delay. If usage clears while every schedule is paused, the tr
 
 ## Settings and self update
 
-The **⚙ Settings** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
+The **⚙** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
 
 `settings.json` sits in the storage root and is written with defaults the first time the server starts:
 
@@ -569,7 +569,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
 | GET              | `/api/config`                      | Storage paths, retention limit, effort levels, and the usage-delay categories                                                                                                  |
 | GET              | `/api/system`                      | Machine stats: the current reading, the last fifteen minutes behind it, what each meter means, and this machine's cores, memory and storage path                                |
-| GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, how many triggers are held for usage, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
+| GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are held for usage, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |

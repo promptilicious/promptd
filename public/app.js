@@ -1017,7 +1017,13 @@ function watchUpdate(status, updateButton, updateLog) {
 }
 
 async function renderSettings() {
-  const [settings, config] = await Promise.all([api('/api/settings'), api('/api/config')]);
+  // Health comes along for the boot time: it is the one fact on this page that
+  // belongs to the running process rather than to a file on disk.
+  const [settings, config, health] = await Promise.all([
+    api('/api/settings'),
+    api('/api/config'),
+    api('/api/health').catch(() => ({})),
+  ]);
 
   const status = el('div', { class: 'hint' });
   const checkButton = el('button', { class: 'btn small', text: 'Check for updates' });
@@ -1141,6 +1147,19 @@ async function renderSettings() {
         el('span', { class: 'mono', text: 'origin/main' }),
         ' and restarts the service. Update now works even with self update off.',
       ]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Last check' }),
+      readOnly('Last checked', settings.lastUpdateCheckAt ? `${fmtDateTime(settings.lastUpdateCheckAt)} (${fmtRelative(settings.lastUpdateCheckAt)})` : 'never'),
+      readOnly(
+        'Last update started',
+        settings.lastUpdateLaunchedAt
+          ? `${fmtDateTime(settings.lastUpdateLaunchedAt)}${settings.lastUpdateFromCommit ? `, from ${settings.lastUpdateFromCommit}` : ''}`
+          : 'never',
+      ),
+      // An update restarts the service, so this says whether the last one landed.
+      readOnly('Server last boot time', health.startedAt ? `${fmtDateTime(health.startedAt)} (${fmtRelative(health.startedAt)})` : 'unknown'),
+      readOnly('Project folder', settings.projectDir),
+      readOnly('Update log', settings.updateLog),
     ]),
     el('div', { class: 'card' }, [
       el('h2', { text: 'Storage' }),
@@ -1150,18 +1169,6 @@ async function renderSettings() {
       el('div', { class: 'hint' }, [
         'Every cron and every log line is a plain file under the storage root. Editing one by hand is fine: the folder is watched.',
       ]),
-    ]),
-    el('div', { class: 'card' }, [
-      el('h2', { text: 'Last check' }),
-      readOnly('Last checked', settings.lastUpdateCheckAt ? `${fmtDateTime(settings.lastUpdateCheckAt)} (${fmtRelative(settings.lastUpdateCheckAt)})` : 'never'),
-      readOnly(
-        'Last update started',
-        settings.lastUpdateLaunchedAt
-          ? `${fmtDateTime(settings.lastUpdateLaunchedAt)}${settings.lastUpdateFromCommit ? `, from ${settings.lastUpdateFromCommit}` : ''}`
-          : 'never',
-      ),
-      readOnly('Project folder', settings.projectDir),
-      readOnly('Update log', settings.updateLog),
     ]),
   );
 
