@@ -1,9 +1,9 @@
 const view = document.getElementById('view');
 const connEl = document.getElementById('conn');
-const storageEl = document.getElementById('storage');
 const toastsEl = document.getElementById('toasts');
 const updateBadgeEl = document.getElementById('update-badge');
 const usageEl = document.getElementById('usage');
+const systemEl = document.getElementById('system');
 
 let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
@@ -117,9 +117,16 @@ function fmtCost(usd) {
 }
 
 function fmtBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '—';
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
 }
 
 /**
@@ -1010,7 +1017,7 @@ function watchUpdate(status, updateButton, updateLog) {
 }
 
 async function renderSettings() {
-  const settings = await api('/api/settings');
+  const [settings, config] = await Promise.all([api('/api/settings'), api('/api/config')]);
 
   const status = el('div', { class: 'hint' });
   const checkButton = el('button', { class: 'btn small', text: 'Check for updates' });
@@ -1133,6 +1140,15 @@ async function renderSettings() {
         'An update pulls ',
         el('span', { class: 'mono', text: 'origin/main' }),
         ' and restarts the service. Update now works even with self update off.',
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
+      el('h2', { text: 'Storage' }),
+      readOnly('Storage root', config.storageRoot),
+      readOnly('Crons', config.cronsDir),
+      readOnly('Logs', `${config.logsDir} — newest ${config.maxLogsPerCron} runs kept per cron`),
+      el('div', { class: 'hint' }, [
+        'Every cron and every log line is a plain file under the storage root. Editing one by hand is fine: the folder is watched.',
       ]),
     ]),
     el('div', { class: 'card' }, [
@@ -1392,7 +1408,12 @@ function connectEvents() {
   events.addEventListener('hello', () => {
     setConnState();
     checkHealth();
+    // Also the reconnect path: a page that dropped missed samples, and this is
+    // what fills the chart back in.
+    loadSystem();
   });
+
+  events.addEventListener('system:sample', (event) => pushSystemSample(JSON.parse(event.data)));
 
   for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released', 'run:dropped']) {
     events.addEventListener(type, (event) => {
@@ -1464,6 +1485,257 @@ function setUpdateBadge(available, behind = 0) {
   if (!available) return;
   const commits = behind ? `${behind} commit${behind === 1 ? '' : 's'} behind origin/main. ` : '';
   updateBadgeEl.title = `${commits}Open Settings to update.`;
+}
+
+// ---- machine stats ----------------------------------------------------
+
+/**
+ * The meters left of the subscription ones: how busy this machine is while it
+ * runs your crons — CPU, memory, storage throughput, and how full the disk is.
+ *
+ * The server samples on its own timer and pushes each sample down /api/events,
+ * so the page keeps its own copy of the window and appends to it. Nothing here
+ * polls.
+ */
+let systemConfig = null; // metric metadata and the window length, from the server
+let systemSamples = []; // the retained window, oldest first
+let systemDetail = {}; // byte counts behind the latest percentages
+let systemNotes = {}; // why a metric is reporting nothing, by id
+/** Nodes are built once and written to in place: rebuilding under the cursor would close an open chart. */
+const systemNodes = new Map();
+
+const SPARK_WIDTH = 228;
+const SPARK_HEIGHT = 52;
+const SPARK_TOP = 3;
+const SPARK_BOTTOM = SPARK_HEIGHT - 3;
+
+/**
+ * What the bar is full of. A percentage fills against 100. A rate has no
+ * ceiling, so it fills against the busiest moment still in the window — never
+ * less than the metric's floor, or an idle disk would draw a full bar off a
+ * 0.2 MB/s blip.
+ */
+function metricScale(metric) {
+  if (metric.kind !== 'rate') return 100;
+  let peak = metric.minScale ?? 1;
+  for (const sample of systemSamples) {
+    const value = sample[metric.id];
+    if (Number.isFinite(value) && value > peak) peak = value;
+  }
+  return peak;
+}
+
+function fmtMetricValue(metric, value) {
+  if (!Number.isFinite(value)) return '—';
+  if (metric.kind === 'rate') return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${metric.unit}`;
+  return `${Math.round(value)}${metric.unit}`;
+}
+
+/** The API hands out its own severity for usage; here the thresholds are ours. */
+function metricSeverity(metric, value) {
+  if (!Number.isFinite(value) || metric.kind !== 'percent') return 'normal';
+  if (Number.isFinite(metric.critical) && value >= metric.critical) return 'critical';
+  if (Number.isFinite(metric.warning) && value >= metric.warning) return 'warning';
+  return 'normal';
+}
+
+/**
+ * The average and the peak across the window, ignoring gaps. `now` is the
+ * newest sample rather than the newest reading: if the last sample could not
+ * read this metric, the chart says so instead of repeating an older number.
+ */
+function metricSummary(metric) {
+  const values = systemSamples.map((sample) => sample[metric.id]).filter((value) => Number.isFinite(value));
+  if (!values.length) return { now: null, average: null, peak: null };
+  return {
+    now: systemSamples.at(-1)?.[metric.id] ?? null,
+    average: values.reduce((sum, value) => sum + value, 0) / values.length,
+    peak: Math.max(...values),
+  };
+}
+
+/**
+ * The 15-minute line, as an SVG path.
+ *
+ * Points are placed by their timestamp rather than their position in the array,
+ * so a gap in the samples — a restart, a metric the platform could not read —
+ * shows as a gap rather than being drawn through. Each run of readings is its
+ * own subpath for the same reason.
+ */
+function sparkPaths(metric) {
+  const scale = metricScale(metric);
+  const windowMs = systemConfig?.windowMs ?? 15 * 60 * 1000;
+  const endsAt = Date.now();
+  const x = (iso) => {
+    const at = Date.parse(iso);
+    const ratio = (at - (endsAt - windowMs)) / windowMs;
+    return Math.max(0, Math.min(1, ratio)) * SPARK_WIDTH;
+  };
+  const y = (value) => SPARK_BOTTOM - (Math.min(value, scale) / scale) * (SPARK_BOTTOM - SPARK_TOP);
+
+  const runs = [];
+  let run = [];
+  for (const sample of systemSamples) {
+    const value = sample[metric.id];
+    if (!Number.isFinite(value)) {
+      if (run.length) runs.push(run);
+      run = [];
+      continue;
+    }
+    run.push([x(sample.at), y(value)]);
+  }
+  if (run.length) runs.push(run);
+
+  const point = ([px, py]) => `${px.toFixed(1)} ${py.toFixed(1)}`;
+  const line = runs
+    .map((points) => points.map((p, index) => `${index ? 'L' : 'M'}${point(p)}`).join(' '))
+    .join(' ');
+  const area = runs
+    .filter((points) => points.length > 1)
+    .map(
+      (points) =>
+        `M${points[0][0].toFixed(1)} ${SPARK_BOTTOM} ` +
+        points.map((p) => `L${point(p)}`).join(' ') +
+        ` L${points.at(-1)[0].toFixed(1)} ${SPARK_BOTTOM} Z`,
+    )
+    .join(' ');
+  return { line, area, scale };
+}
+
+/** The line under the chart: what is actually behind the percentage. */
+function metricDetailText(metric) {
+  const detail = systemDetail?.[metric.id];
+  if (!detail) return null;
+  if (metric.id === 'cpu') {
+    const load = Number.isFinite(detail.loadAverage) ? ` · load ${detail.loadAverage}` : '';
+    return `${detail.cores} cores${load}`;
+  }
+  if (metric.id === 'memory') return `${fmtBytes(detail.usedBytes)} of ${fmtBytes(detail.totalBytes)} in use`;
+  if (metric.id === 'io') {
+    return Number.isFinite(detail.transfersPerSecond) ? `${detail.transfersPerSecond} transfers/s` : null;
+  }
+  if (metric.id === 'disk') return `${fmtBytes(detail.usedBytes)} used · ${fmtBytes(detail.freeBytes)} free`;
+  return null;
+}
+
+/** One meter, plus the chart that opens under it on hover. */
+function buildSystemMeter(metric) {
+  const fill = el('div', { class: 'usage-fill' });
+  const pct = el('span', { class: 'usage-pct', text: '—' });
+  const area = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  area.setAttribute('class', 'spark-area');
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  line.setAttribute('class', 'spark-line');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'spark');
+  svg.setAttribute('viewBox', `0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.append(area, line);
+
+  const top = el('span', { class: 'spark-top', text: '' });
+  const now = el('dd', { text: '—' });
+  const average = el('dd', { text: '—' });
+  const peak = el('dd', { text: '—' });
+  const detail = el('div', { class: 'pop-detail', text: '' });
+  const note = el('div', { class: 'pop-note', text: '' });
+
+  const pop = el('div', { class: 'metric-pop' }, [
+    el('div', { class: 'pop-title' }, [el('span', { text: metric.title }), top]),
+    el('div', { class: 'pop-sub', text: metric.detail }),
+    svg,
+    el('div', { class: 'pop-axis' }, [el('span', { class: 'pop-span' }), el('span', { text: 'now' })]),
+    el('dl', { class: 'pop-stats' }, [
+      el('div', {}, [el('dt', { text: 'Now' }), now]),
+      el('div', {}, [el('dt', { text: 'Avg' }), average]),
+      el('div', {}, [el('dt', { text: 'Peak' }), peak]),
+    ]),
+    detail,
+    note,
+  ]);
+
+  const root = el('div', { class: 'usage-meter system-meter' }, [
+    el('div', { class: 'usage-head' }, [el('span', { text: metric.label }), pct]),
+    el('div', { class: 'usage-track' }, [fill]),
+    pop,
+  ]);
+
+  pop.querySelector('.pop-span').textContent = `${Math.round((systemConfig?.windowMs ?? 900000) / 60000)}m ago`;
+  systemNodes.set(metric.id, { root, fill, pct, area, line, top, now, average, peak, detail, note });
+  return root;
+}
+
+/** Writes the current reading into nodes that already exist. */
+function updateSystemMeters() {
+  if (!systemConfig) return;
+  const latest = systemSamples.at(-1) ?? null;
+  systemEl.hidden = !latest;
+  if (!latest) return;
+
+  for (const metric of systemConfig.metrics) {
+    const nodes = systemNodes.get(metric.id);
+    if (!nodes) continue;
+    const value = latest[metric.id];
+    const summary = metricSummary(metric);
+    const { line, area, scale } = sparkPaths(metric);
+
+    nodes.root.className = `usage-meter system-meter ${metricSeverity(metric, value)}`;
+    nodes.pct.textContent = fmtMetricValue(metric, value);
+    nodes.fill.style.width = `${Number.isFinite(value) ? Math.max(0, Math.min(100, (value / scale) * 100)) : 0}%`;
+    nodes.line.setAttribute('d', line);
+    nodes.area.setAttribute('d', area);
+    // A rate's chart is only readable if it says what the top of it means.
+    nodes.top.textContent = metric.kind === 'rate' ? `top ${fmtMetricValue(metric, scale)}` : '100%';
+    nodes.now.textContent = fmtMetricValue(metric, summary.now);
+    nodes.average.textContent = fmtMetricValue(metric, summary.average);
+    nodes.peak.textContent = fmtMetricValue(metric, summary.peak);
+
+    const detailText = metricDetailText(metric);
+    nodes.detail.textContent = detailText ?? '';
+    nodes.detail.hidden = !detailText;
+    const note = systemNotes?.[metric.id] ?? null;
+    nodes.note.textContent = note ?? '';
+    nodes.note.hidden = !note;
+  }
+}
+
+/**
+ * Loads the window from the server and builds the meters.
+ *
+ * Called on every SSE hello, which covers both the first connection and every
+ * reconnection after one — a page that was disconnected missed samples, and
+ * this is what fills them back in rather than leaving a hole in the chart.
+ */
+async function loadSystem() {
+  if (!systemEl) return;
+  try {
+    const state = await api('/api/system');
+    if (!state.enabled) {
+      systemEl.hidden = true;
+      return;
+    }
+    const firstLoad = !systemConfig;
+    systemConfig = state;
+    systemSamples = state.samples ?? [];
+    systemDetail = state.detail ?? {};
+    systemNotes = state.notes ?? {};
+    if (firstLoad) {
+      systemEl.replaceChildren(...state.metrics.map(buildSystemMeter));
+    }
+    updateSystemMeters();
+  } catch {
+    /* the header simply carries no machine meters */
+  }
+}
+
+/** One sample off the event stream, appended and trimmed to the window. */
+function pushSystemSample(payload) {
+  if (!systemConfig || !payload?.sample) return;
+  systemSamples.push(payload.sample);
+  systemDetail = payload.detail ?? systemDetail;
+  systemNotes = payload.notes ?? systemNotes;
+  const cutoff = Date.now() - systemConfig.windowMs;
+  while (systemSamples.length && Date.parse(systemSamples[0].at) < cutoff) systemSamples.shift();
+  updateSystemMeters();
 }
 
 /** A clock, small enough to sit level with the meter labels. */
@@ -1556,16 +1828,6 @@ async function checkHealth() {
   }
 }
 
-async function loadConfig() {
-  try {
-    const config = await api('/api/config');
-    storageEl.textContent = config.storageRoot;
-    storageEl.title = `Crons: ${config.cronsDir}\nLogs: ${config.logsDir}`;
-  } catch {
-    /* not fatal */
-  }
-}
-
 window.addEventListener('hashchange', route);
 // Live run clocks, wherever they are on the page.
 setInterval(tickRuntimes, 1000);
@@ -1577,7 +1839,6 @@ setInterval(() => {
   if (!section) renderHome().catch(() => {});
 }, 15000);
 
-loadConfig();
 checkHealth();
 connectEvents();
 route();

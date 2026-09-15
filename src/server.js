@@ -21,6 +21,7 @@ import { loadSettings, patchSettings } from './settings.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
 import { lifetimeStats } from './stats.js';
+import { systemMonitor } from './system.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -103,6 +104,16 @@ app.get('/api/config', (_req, res) => {
     effortLevels: EFFORT_LEVELS,
     usageDelayCategories: USAGE_DELAY_CATEGORIES,
   });
+});
+
+/**
+ * Machine stats: the current reading, the last fifteen minutes behind it, and
+ * what each meter means. Answered from memory — the service samples on its own
+ * timer and pushes each sample over /api/events, so this is only ever read to
+ * fill a page that has just opened or reconnected.
+ */
+app.get('/api/system', (_req, res) => {
+  res.json(systemMonitor.state());
 });
 
 /**
@@ -508,6 +519,7 @@ await cronFileWatcher.start();
 // coming up rather than delaying the first page load by several seconds.
 modelCatalog.refresh();
 selfUpdater.start();
+systemMonitor.start();
 
 app.listen(PORT, HOST, () => {
   console.log(`Claude Conductor listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);

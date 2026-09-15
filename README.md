@@ -10,6 +10,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Choose the model per cron, from whatever the installed CLI recognises.
 - Every finished run records the model, runtime, tokens and cost that the CLI reported.
 - Lifetime totals per cron — runs completed, what they cost, how long they took, and the average of each.
+- Machine stats in the header — CPU, memory, storage throughput and disk space, sampled every 5 seconds, with a 15-minute chart on hover.
 
 ## Run it
 
@@ -306,6 +307,8 @@ Killing a server that nothing would restart would be worse than leaving it on ol
 
 ## Storage layout
 
+The paths in use are listed on the Settings page, under **Storage**.
+
 ```
 ~/.claude/claude-conductor/
 ├── crons/
@@ -452,11 +455,33 @@ A cron can also be told to wait on any of these limits rather than run into one;
 
 Amber and red are the API's own severity for a limit, not a threshold picked here, so they change when the CLI's usage view would change. The endpoint also reports a long tail of unreleased limit types; the server reads its normalized `limits` array instead, which means a limit added to the plan later shows up without a change to this code.
 
+## Machine stats
+
+Left of the subscription meters, four more: how busy this computer is while it runs your crons. A service starts with the server and samples every five seconds, keeping the last fifteen minutes in memory. Hovering a meter opens that window as a chart, with the current value, the average and the peak, and the numbers behind the percentage.
+
+| Meter    | Is                                               | Read from                                                    |
+| -------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| **CPU**  | Share of all cores in use since the last sample  | Node's own per-core counters — no process spawned            |
+| **Mem**  | Active, wired and compressed memory              | `vm_stat` on macOS, `MemAvailable` on Linux                  |
+| **I/O**  | Megabytes per second read and written, all disks | one long-lived `iostat` on macOS, `/proc/diskstats` on Linux |
+| **Disk** | How full the volume holding the storage root is  | `fs.statfs`, falling back to `df`                            |
+
+Four things worth knowing:
+
+- **Memory is the figure Activity Monitor shows, not `freemem`.** macOS counts file caches as used memory, so `os.freemem()` calls a machine 95% full that Activity Monitor calls 60%. This counts active, wired and compressed pages instead.
+- **The I/O bar has no fixed ceiling.** Throughput has no 100%, so the bar fills against the busiest moment still in the window — never less than 50 MB/s, or an idle disk would draw a full bar off a 0.2 MB/s blip. The chart says what its top is worth.
+- **The first sample reports no CPU or I/O.** Both are differences between two cumulative counters, so the first sample after a restart only takes the baseline. Those two bars fill in on the next tick.
+- **A reading that cannot be taken leaves a gap, not a flat line.** A metric the platform will not report draws nothing and says why under the chart, and points are plotted by their timestamp, so a restart shows as a gap rather than a line drawn straight through it.
+
+Samples are pushed over `/api/events`, so the page holds its own copy of the window and appends to it — a five-second meter costs one event, not a request per tab. `GET /api/system` is read once when a page opens or reconnects, which is also what fills the chart back in after a dropped connection.
+
+Set `SYSTEM_SAMPLE_MS=0` to turn the service off; the meters go with it. On a narrow window they are the first thing dropped from the header, below 1160px, before the subscription meters go at 900px.
+
 ## Real-time updates
 
 Two Server-Sent Event streams, no polling loops in the UI:
 
-- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger dropped by a pause, trigger held for usage, trigger released. The home page redraws when one arrives.
+- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger dropped by a pause, trigger held for usage, trigger released, and one machine-stat sample every five seconds. The home page redraws when one arrives.
 - `GET /api/crons/:id/logs/:file/stream` — one log file: everything written so far, then each new chunk. Closes itself with a `done` event when the run ends.
 
 ## Configuration
@@ -468,6 +493,7 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | `CONDUCTOR_HOME`          | `~/.claude/claude-conductor`    | Storage root                                                                                                                                     |
 | `CLAUDE_BIN`              | `claude`                        | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`.                                                                 |
 | `WATCH_INTERVAL_MS`       | `3000`                          | How often the crons folder is polled for outside changes. `0` disables it.                                                                       |
+| `SYSTEM_SAMPLE_MS`        | `5000`                          | How often machine stats are sampled. `0` disables the service and its meters. Floored at `1000`.                                                 |
 | `CONDUCTOR_LAUNCHD_LABEL` | `local.claude-conductor`        | The launchd service the updater restarts                                                                                                         |
 | `CONDUCTOR_PROJECT_DIR`   | the checkout this code lives in | Which repository the update check looks at                                                                                                       |
 
@@ -542,6 +568,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
 | GET              | `/api/config`                      | Storage paths, retention limit, effort levels, and the usage-delay categories                                                                                                  |
+| GET              | `/api/system`                      | Machine stats: the current reading, the last fifteen minutes behind it, what each meter means, and this machine's cores, memory and storage path                                |
 | GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, how many triggers are held for usage, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |

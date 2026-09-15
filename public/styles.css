@@ -48,6 +48,8 @@ a {
   gap: 10px;
   font-weight: 600;
   letter-spacing: 0.2px;
+  flex: none;
+  white-space: nowrap;
 }
 
 .brand .dot {
@@ -105,7 +107,9 @@ a {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-width: 0;
+  /* Meters hold their width rather than squeezing into each other. When the
+     header runs out of room a whole group is dropped instead, below. */
+  flex: none;
 }
 
 .usage[hidden] {
@@ -221,6 +225,162 @@ a {
   opacity: 1;
 }
 
+/*
+ * Machine stats: the same meter as above, drawn from this computer rather than
+ * the account, and separated from the subscription ones by a rule so the two
+ * groups do not read as one row of eight.
+ */
+.usage.system {
+  gap: 14px;
+  padding-right: 14px;
+  border-right: 1px solid var(--border);
+}
+
+.system-meter {
+  min-width: 76px;
+}
+
+/* The text tooltip above is for the usage meters; these carry a chart instead. */
+.system-meter::after {
+  display: none;
+}
+
+.system-meter .usage-fill {
+  background: var(--accent);
+}
+
+/*
+ * The chart, under the meter on hover. Fixed width so the SVG's viewBox and the
+ * box it is drawn in agree, which is what keeps the line from stretching.
+ */
+.metric-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 252px;
+  background: #0b0d12;
+  border: 1px solid #3a4152;
+  border-radius: 8px;
+  padding: 9px 11px 10px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 90ms ease;
+  z-index: 20;
+  cursor: default;
+}
+
+.system-meter:hover .metric-pop {
+  opacity: 1;
+}
+
+.pop-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* What the top of the chart is worth, which a rate needs and a percentage says anyway. */
+.spark-top {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pop-sub {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.spark {
+  display: block;
+  width: 228px;
+  height: 52px;
+  margin: 8px 0 2px;
+  overflow: visible;
+}
+
+.spark-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.spark-area {
+  fill: var(--accent-soft);
+  stroke: none;
+}
+
+.pop-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+}
+
+.pop-stats {
+  display: flex;
+  gap: 14px;
+  margin: 8px 0 0;
+}
+
+.pop-stats div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.pop-stats dt {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.pop-stats dd {
+  margin: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pop-detail {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pop-note {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--amber);
+}
+
+.pop-detail[hidden],
+.pop-note[hidden] {
+  display: none;
+}
+
+/*
+ * The header runs out of room from the left: the machine meters go first, the
+ * subscription ones next, since the second group is about the account and stays
+ * useful on a laptop screen.
+ */
+@media (max-width: 1160px) {
+  .usage.system {
+    display: none;
+  }
+}
+
 /* The meters are the first thing to go when the header runs out of room. */
 @media (max-width: 900px) {
   .usage {
@@ -253,16 +413,6 @@ a {
   border-color: rgba(229, 185, 92, 0.5);
   background: rgba(229, 185, 92, 0.1);
   cursor: help;
-}
-
-.storage {
-  font-size: 12px;
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 40vw;
 }
 
 .view {
@@ -355,6 +505,21 @@ h2 {
 .btn.small {
   padding: 5px 10px;
   font-size: 12px;
+}
+
+/*
+ * Icon only. The glyph carries the meaning on its own, so it takes the room the
+ * label used to, and the name it answers to lives in title and aria-label.
+ */
+.btn.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
 }
 
 .panel {
@@ -1002,9 +1167,6 @@ input.narrow {
 @media (max-width: 820px) {
   .logs-layout {
     grid-template-columns: 1fr;
-  }
-  .storage {
-    display: none;
   }
   table {
     font-size: 13px;
