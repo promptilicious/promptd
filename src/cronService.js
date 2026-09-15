@@ -19,6 +19,25 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_ARGS = ['--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
 
 /**
+ * Prepended to every prompt the CLI is given. A cron run has no session to come
+ * back to: the process is gone the moment the turn ends, so work deferred to a
+ * wakeup, a background command, or a loop is simply lost. The run's own prompt
+ * is what the user wrote, so this stays out of the log — the header still shows
+ * the prompt as it was typed.
+ */
+const PROMPT_PREFIX =
+  'Headless run: nothing resumes you. The moment you end a turn without a tool call, this process exits. ' +
+  'A scheduled wakeup, a backgrounded command, or a task notification never arrives. Do all waiting inside ' +
+  'the turn with a blocking command. Never use ScheduleWakeup, run_in_background, or /loop to carry ' +
+  'remaining work forward.';
+
+/** The prompt as the CLI receives it: the preamble, then what the cron says. */
+function promptFor(cron) {
+  const prompt = cron.prompt ?? '';
+  return prompt.trim() ? `${PROMPT_PREFIX}\n\n${prompt}` : PROMPT_PREFIX;
+}
+
+/**
  * The durations the Pause for control offers. `ms: null` means "no timer" — the
  * pause is only lifted by cancelling it or by the process restarting, since the
  * pause is never written to disk.
@@ -400,7 +419,7 @@ class CronService {
 
     let child;
     try {
-      child = spawn(CLAUDE_BIN, ['-p', cron.prompt ?? '', ...CLAUDE_ARGS, ...modelArgs, ...effortArgs], {
+      child = spawn(CLAUDE_BIN, ['-p', promptFor(cron), ...CLAUDE_ARGS, ...modelArgs, ...effortArgs], {
         cwd,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
