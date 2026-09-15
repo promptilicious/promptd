@@ -1422,6 +1422,15 @@ function connectEvents() {
 
   events.addEventListener('system:sample', (event) => pushSystemSample(JSON.parse(event.data)));
 
+  events.addEventListener('notification:new', (event) => {
+    const { notification, unread } = JSON.parse(event.data);
+    setBellBadge(unread);
+    prependNotification(notification);
+  });
+
+  // Another tab read something; this one's badge is now wrong.
+  events.addEventListener('notification:read', (event) => setBellBadge(JSON.parse(event.data).unread));
+
   for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released', 'run:dropped']) {
     events.addEventListener(type, (event) => {
       const payload = JSON.parse(event.data);
@@ -1493,6 +1502,218 @@ function setUpdateBadge(available, behind = 0) {
   const commits = behind ? `${behind} commit${behind === 1 ? '' : 's'} behind origin/main. ` : '';
   updateBadgeEl.title = `${commits}Open Settings to update.`;
 }
+
+// ---- notifications ----------------------------------------------------
+
+/**
+ * The bell, and the drawer behind it.
+ *
+ * Toasts are gone in a few seconds and nobody watches a dashboard all day, so
+ * the server writes the same events down and this reads them back. Unread is
+ * the only state that matters here: a run that succeeded arrives already read,
+ * and what is left is what a person would have wanted to be told.
+ */
+const bellEl = document.getElementById('bell');
+const bellBadgeEl = document.getElementById('bell-badge');
+const drawerEl = document.getElementById('drawer');
+const drawerListEl = document.getElementById('drawer-list');
+const drawerBackdropEl = document.getElementById('drawer-backdrop');
+const drawerCloseEl = document.getElementById('drawer-close');
+
+/** On screen this long and it counts as read. */
+const READ_AFTER_MS = 3000;
+
+let drawerOpen = false;
+let nextBefore = null; // cursor for the next page; null once the end is reached
+let loadingPage = false;
+const drawnIds = new Set(); // a notification arriving as both a page and an event
+const readTimers = new Map(); // id -> the timer counting out its three seconds
+const pendingRead = new Set(); // seen, not yet reported to the server
+let readFlushTimer = null;
+let viewObserver = null; // watches items for the three-second rule
+let moreObserver = null; // watches the end of the list for the next page
+let sentinelEl = null;
+
+function setBellBadge(count) {
+  if (!bellBadgeEl) return;
+  const unread = Number(count) || 0;
+  bellBadgeEl.hidden = unread === 0;
+  bellBadgeEl.textContent = unread > 99 ? '99+' : String(unread);
+  bellEl?.setAttribute('title', unread ? `Notifications — ${unread} unread` : 'Notifications');
+}
+
+/** The coloured dot: what kind of thing this was, at a glance. */
+function noteKindClass(kind) {
+  if (kind === 'run-failed' || kind === 'cron-broken') return 'bad';
+  if (kind === 'delayed' || kind === 'update') return 'warn';
+  return 'plain';
+}
+
+function renderNotification(record) {
+  const meta = `${fmtRelative(record.at)} · ${fmtDateTime(record.at)}`;
+  const node = el('div', { class: `note ${record.read ? '' : 'unread'}`.trim(), 'data-id': record.id }, [
+    el('span', { class: `note-dot ${noteKindClass(record.kind)}` }),
+    el('div', { class: 'note-body' }, [
+      el('div', { class: 'note-message', text: record.message }),
+      el('div', { class: 'note-meta', text: meta }),
+    ]),
+  ]);
+  // A notification about a cron is a shortcut to that cron's runs.
+  if (record.cronId) {
+    node.classList.add('linked');
+    node.addEventListener('click', () => {
+      closeDrawer();
+      location.hash = `#/logs/${record.cronId}`;
+    });
+  }
+  return node;
+}
+
+/** Reports what has been seen, in one request rather than one per item. */
+function flushRead() {
+  clearTimeout(readFlushTimer);
+  readFlushTimer = setTimeout(async () => {
+    const ids = [...pendingRead];
+    if (!ids.length) return;
+    pendingRead.clear();
+    try {
+      const result = await api('/api/notifications/read', { method: 'POST', body: JSON.stringify({ ids }) });
+      setBellBadge(result.unread);
+    } catch {
+      // Put them back: the next flush tries again, and the worst case is that
+      // something stays unread rather than being marked read without proof.
+      for (const id of ids) pendingRead.add(id);
+    }
+  }, 400);
+}
+
+/** One item has now been on screen long enough. */
+function markSeen(id, node) {
+  node.classList.remove('unread');
+  viewObserver?.unobserve(node);
+  pendingRead.add(id);
+  flushRead();
+}
+
+/** Only unread items are watched; the rest have nothing left to change. */
+function observeItem(node, record) {
+  if (record.read || !viewObserver) return;
+  viewObserver.observe(node);
+}
+
+async function loadNextPage() {
+  if (loadingPage || !drawerOpen) return;
+  loadingPage = true;
+  try {
+    const query = nextBefore ? `?before=${encodeURIComponent(nextBefore)}` : '';
+    const page = await api(`/api/notifications${query}`);
+    setBellBadge(page.unread);
+    for (const record of page.items) {
+      if (drawnIds.has(record.id)) continue;
+      drawnIds.add(record.id);
+      const node = renderNotification(record);
+      drawerListEl.insertBefore(node, sentinelEl);
+      observeItem(node, record);
+    }
+    nextBefore = page.nextBefore;
+    if (!drawnIds.size) {
+      drawerListEl.insertBefore(el('div', { class: 'drawer-empty', text: 'Nothing yet.' }), sentinelEl);
+    }
+    // A short first page leaves the sentinel on screen, and an observer that is
+    // already intersecting will not fire again — so ask once more by hand.
+    if (nextBefore) {
+      requestAnimationFrame(() => {
+        const list = drawerListEl.getBoundingClientRect();
+        const end = sentinelEl.getBoundingClientRect();
+        if (end.top <= list.bottom + 120) loadNextPage();
+      });
+    }
+  } catch (err) {
+    drawerListEl.insertBefore(el('div', { class: 'drawer-empty', text: err.message }), sentinelEl);
+  } finally {
+    loadingPage = false;
+  }
+}
+
+/** A notification that lands while the drawer is open, from the event stream. */
+function prependNotification(record) {
+  if (!drawerOpen || drawnIds.has(record.id)) return;
+  // Only when the reader is at the top. Inserting above where they are reading
+  // would move the list under them.
+  if (drawerListEl.scrollTop > 40) return;
+  drawnIds.add(record.id);
+  drawerListEl.querySelector('.drawer-empty')?.remove();
+  const node = renderNotification(record);
+  drawerListEl.prepend(node);
+  observeItem(node, record);
+}
+
+function openDrawer() {
+  if (drawerOpen) return;
+  drawerOpen = true;
+  drawnIds.clear();
+  nextBefore = null;
+  sentinelEl = el('div', { class: 'drawer-sentinel' });
+  drawerListEl.replaceChildren(sentinelEl);
+  drawerEl.classList.add('open');
+  drawerEl.setAttribute('aria-hidden', 'false');
+  drawerBackdropEl.classList.add('open');
+
+  viewObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        const id = entry.target.dataset.id;
+        if (entry.isIntersecting) {
+          if (readTimers.has(id)) continue;
+          readTimers.set(id, setTimeout(() => {
+            readTimers.delete(id);
+            markSeen(id, entry.target);
+          }, READ_AFTER_MS));
+        } else {
+          // Scrolled past before the three seconds were up: it does not count.
+          clearTimeout(readTimers.get(id));
+          readTimers.delete(id);
+        }
+      }
+    },
+    { root: drawerListEl, threshold: 0.6 },
+  );
+
+  moreObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) loadNextPage();
+    },
+    { root: drawerListEl, rootMargin: '120px' },
+  );
+  moreObserver.observe(sentinelEl);
+
+  loadNextPage();
+  drawerListEl.focus({ preventScroll: true });
+}
+
+function closeDrawer() {
+  if (!drawerOpen) return;
+  drawerOpen = false;
+  drawerEl.classList.remove('open');
+  drawerEl.setAttribute('aria-hidden', 'true');
+  drawerBackdropEl.classList.remove('open');
+  viewObserver?.disconnect();
+  moreObserver?.disconnect();
+  viewObserver = null;
+  moreObserver = null;
+  for (const timer of readTimers.values()) clearTimeout(timer);
+  readTimers.clear();
+  // Anything that earned its three seconds still counts, even if the drawer
+  // closed before the debounce ran.
+  if (pendingRead.size) flushRead();
+}
+
+bellEl?.addEventListener('click', () => (drawerOpen ? closeDrawer() : openDrawer()));
+drawerCloseEl?.addEventListener('click', closeDrawer);
+drawerBackdropEl?.addEventListener('click', closeDrawer);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeDrawer();
+});
 
 // ---- machine stats ----------------------------------------------------
 
@@ -1825,6 +2046,7 @@ async function checkHealth() {
   try {
     const health = await api('/api/health');
     setUpdateBadge(Boolean(health.updateAvailable), health.updateBehind);
+    setBellBadge(health.unreadNotifications);
     setUsage(health.usage);
     if (!health.commit) return; // not a git checkout, nothing to compare
     if (!loadedCommit) loadedCommit = health.commit;

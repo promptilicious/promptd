@@ -22,8 +22,25 @@
         <a id="update-badge" class="badge-update" href="#/settings" hidden>Update available</a>
         <span id="conn" class="conn" title="Live connection">connecting</span>
         <a class="btn small icon" href="#/settings" title="Settings" aria-label="Settings">&#9881;</a>
+        <button id="bell" class="btn small icon bell" type="button" title="Notifications" aria-label="Notifications">
+          <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 6.6a4 4 0 0 1 8 0c0 3 .9 4 1.4 4.5H2.6C3.1 10.6 4 9.6 4 6.6Z" />
+            <path d="M6.5 13.3a1.7 1.7 0 0 0 3 0" />
+          </svg>
+          <span id="bell-badge" class="bell-badge" hidden></span>
+        </button>
       </div>
     </header>
+
+    <div id="drawer-backdrop" class="drawer-backdrop"></div>
+    <aside id="drawer" class="drawer" aria-label="Notifications" aria-hidden="true">
+      <div class="drawer-head">
+        <h2>Notifications</h2>
+        <button id="drawer-close" class="btn small icon" type="button" title="Close" aria-label="Close">&times;</button>
+      </div>
+      <p class="drawer-sub">Anything still unread is marked read once it has been on screen for three seconds.</p>
+      <div id="drawer-list" class="drawer-list" tabindex="-1"></div>
+    </aside>
 
     <main id="view" class="view"></main>
 

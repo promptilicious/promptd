@@ -11,6 +11,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Every finished run records the model, runtime, tokens and cost that the CLI reported.
 - Lifetime totals per cron — runs completed, what they cost, how long they took, and the average of each.
 - Machine stats in the header — CPU, memory, storage throughput and disk space, sampled every 5 seconds, with a 15-minute chart on hover.
+- A notification centre behind the bell: everything the server announces, kept on disk, with an unread count and a drawer that marks what you have actually read.
 
 ## Run it
 
@@ -317,6 +318,8 @@ The paths in use are listed on the Settings page, under **Storage**.
 │   ├── <Cron Name>/
 │   │   └── 2026-09-10T06-11-12.789Z.txt   # one file per run, newest 50 kept
 │   └── update.log                  # appended by the self updater
+├── notifications/
+│   └── 2026-09-15T22-38-33.816Z-25ec7aca.json  # one file per notice, newest 5000 kept
 └── settings.json                   # app settings, written with defaults on first run
 ```
 
@@ -455,6 +458,27 @@ A cron can also be told to wait on any of these limits rather than run into one;
 
 Amber and red are the API's own severity for a limit, not a threshold picked here, so they change when the CLI's usage view would change. The endpoint also reports a long tail of unreleased limit types; the server reads its normalized `limits` array instead, which means a limit added to the plan later shows up without a change to this code.
 
+## Notifications
+
+The bell at the right of the header carries a count of what has not been read, and opens a drawer of everything the server has announced. A toast is gone in a few seconds and nobody watches a dashboard all day, so the same events are written down: one small JSON file each under `notifications/`, holding the message, when it happened, and whether it has been read.
+
+**Most of it arrives already read.** A cron that ran and succeeded is not news. What is left unread is what you would have wanted to be told:
+
+| Left unread                         | Arrives read                                              |
+| ----------------------------------- | --------------------------------------------------------- |
+| A run that did not succeed          | A run that started, succeeded, was stopped or was skipped |
+| A trigger held for usage            | A held trigger that cleared and ran                       |
+| Anything the updater did            | A pause, a resume, and the triggers a pause dropped       |
+| A cron file that will not parse     | A cron file added, changed, deleted or fixed              |
+
+**Reading is not clicking.** An unread notification is marked read once it has been on screen for three seconds — the list is the acknowledgement, not a button. Scrolling past something faster than that leaves it unread. What has been seen is reported in one request rather than one per item, and the count travels to your other open tabs.
+
+**The drawer pages as you scroll.** Twenty at a time, oldest paging off a cursor rather than an offset, so a notification arriving while you read cannot push one onto the next page and show it twice.
+
+**Only the newest 5000 are kept.** The oldest are deleted, file and all, as new ones land, and the folder is swept back down to 5000 at startup in case a restart interrupted that.
+
+Notifications come from the server's own events, which is every toast except the ones confirming something you just did — "Cron created", "Self update on" and the like are answers to your own click and are not written down.
+
 ## Machine stats
 
 Left of the subscription meters, four more: how busy this computer is while it runs your crons. A service starts with the server and samples every five seconds, keeping the last fifteen minutes in memory. Hovering a meter opens that window as a chart, with the current value, the average and the peak, and the numbers behind the percentage.
@@ -481,7 +505,7 @@ Set `SYSTEM_SAMPLE_MS=0` to turn the service off; the meters go with it. On a na
 
 Two Server-Sent Event streams, no polling loops in the UI:
 
-- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger dropped by a pause, trigger held for usage, trigger released, and one machine-stat sample every five seconds. The home page redraws when one arrives.
+- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger dropped by a pause, trigger held for usage, trigger released, each new notification and each batch marked read, and one machine-stat sample every five seconds. The home page redraws when one arrives.
 - `GET /api/crons/:id/logs/:file/stream` — one log file: everything written so far, then each new chunk. Closes itself with a `done` event when the run ends.
 
 ## Configuration
@@ -569,7 +593,9 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
 | GET              | `/api/config`                      | Storage paths, retention limit, effort levels, and the usage-delay categories                                                                                                  |
 | GET              | `/api/system`                      | Machine stats: the current reading, the last fifteen minutes behind it, what each meter means, and this machine's cores, memory and storage path                                |
-| GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are held for usage, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
+| GET              | `/api/notifications?before=&limit=` | One page of notifications, newest first, plus the unread count and the cursor for the next page                                                                                 |
+| POST             | `/api/notifications/read`          | Mark notifications read. Body `{"ids":[...]}`; answers with what is still unread                                                                                               |
+| GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are held for usage, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |

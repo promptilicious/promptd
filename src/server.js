@@ -22,6 +22,7 @@ import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } 
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
 import { lifetimeStats } from './stats.js';
 import { systemMonitor } from './system.js';
+import { PAGE_SIZE, notificationCenter } from './notifications.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -107,6 +108,31 @@ app.get('/api/config', (_req, res) => {
     effortLevels: EFFORT_LEVELS,
     usageDelayCategories: USAGE_DELAY_CATEGORIES,
   });
+});
+
+/**
+ * One page of notifications, newest first. `before` is the id of the last one
+ * already shown rather than an offset: new notices arrive while the list is
+ * open, and an offset would show one of them a second time.
+ */
+app.get('/api/notifications', async (req, res, next) => {
+  try {
+    const before = String(req.query.before ?? '').trim() || null;
+    res.json(await notificationCenter.page({ before, limit: req.query.limit ?? PAGE_SIZE }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Marks what the reader has actually had on screen. Body `{"ids":[...]}`. */
+app.post('/api/notifications/read', async (req, res, next) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    if (!ids.length) return res.status(400).json({ error: 'ids must be a non-empty array' });
+    res.json(await notificationCenter.markRead(ids));
+  } catch (err) {
+    next(err);
+  }
 });
 
 /**
@@ -497,6 +523,9 @@ app.get('/api/health', async (_req, res) => {
   // Usage is cached and never rejects, so it cannot make the health check fail
   // or hang: the worst case is the reading being up to a minute old.
   const usage = await usageMonitor.state();
+  // The one await that can be slow, and only once: the folder is read at
+  // startup, and every poll after that is answered from memory.
+  await notificationCenter.ready;
   res.json({
     ok: true,
     scheduled: cronService.jobs.size,
@@ -504,6 +533,7 @@ app.get('/api/health', async (_req, res) => {
     startedAt: STARTED_AT,
     paused: cronService.isPaused(),
     delayed: cronService.delayedCount(),
+    unreadNotifications: notificationCenter.unreadCount(),
     usage,
     ...selfUpdater.availability(),
   });
@@ -515,6 +545,9 @@ app.use((err, _req, res, _next) => {
 });
 
 await ensureDirs();
+// Subscribes to the event bus before anything can emit, and reads the folder
+// behind the server coming up: 5000 small files are not worth a slow start.
+notificationCenter.start();
 await loadSettings(); // writes settings.json with defaults on first run
 runningCommit = await currentCommit();
 await cronService.reload();
