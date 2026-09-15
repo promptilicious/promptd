@@ -6,6 +6,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Follow a run's output as it is produced, or read back any of the last 50 runs per cron.
 - Stop a run in progress. The schedule stays armed for its next trigger.
 - Pause every schedule for 15 minutes, an hour, 6 hours, or until the next restart.
+- Hold a cron until your Claude usage resets, per limit, instead of firing it into a spent quota.
 - Choose the model per cron, from whatever the installed CLI recognises.
 - Every finished run records the model, runtime, tokens and cost that the CLI reported.
 
@@ -178,6 +179,42 @@ What a pause does and does not do:
 
 When the time is up, or you cancel, the crons are re-read from disk and re-armed, so any edit made during the pause takes effect.
 
+## Delaying a cron for usage
+
+Each cron has a **Delay for usage** section on its form: four checkboxes, all off by default.
+
+| Checkbox                | Holds the trigger while                                     |
+| ----------------------- | ----------------------------------------------------------- |
+| Session                 | the 5-hour session limit is at 100%                          |
+| Weekly                  | the rolling 7-day limit, all models, is at 100%              |
+| Fable                   | the Fable weekly limit is at 100%                            |
+| Monthly Credits 90%     | more than 90% of the extra usage credits are spent           |
+
+These are the same limits the header meters draw, matched on what a limit *is* rather than on its label, so nothing has to change here when the wording does. Tick none and the cron behaves exactly as it always has.
+
+When a cron with at least one box ticked triggers, usage is read and every ticked limit is checked. If any is over its threshold the run does not start: the cron goes to `delayed`, and the trigger waits.
+
+1. **The status reads `delayed`,** and hovering it names every limit holding the run, what each is at, when each resets, and the estimated start time. The Next run column shows that estimate too.
+2. **It starts the moment usage clears.** The wait is re-checked every 30 seconds against the same cached reading the meters use. Once a reset time has passed, that check asks the endpoint directly rather than waiting out the five minute cache, so a run goes within seconds of its limit resetting rather than minutes.
+3. **Only one trigger waits at a time.** A second trigger arriving while one waits is lost, not queued — a cron that sits out a long reset comes back and runs once, not five times. The dropped trigger is reported as a toast, the same as any other skipped trigger.
+4. **Run now does not override the setting.** Pressing it on a blocked cron produces the same held trigger, not a run. It answers 202 with the delay rather than starting `claude`.
+5. **Stop drops a held trigger.** While a cron is `delayed` the Run now button is a **Stop** button, and pressing it throws the waiting trigger away. The schedule is untouched, so the next trigger checks usage again like any other.
+
+Four more things worth knowing:
+
+- **A restart clears every wait.** Like a pause, held triggers live in memory only. The server comes back with nothing waiting, and the next trigger checks usage fresh.
+- **Updates are never held up by one.** A delayed cron is not a running cron, so it does not count towards the runs an update waits to drain. Updates check, apply and restart on their own schedule regardless of what is waiting.
+- **Extra credits are treated as monthly.** The endpoint reports no reset time for a spending cap, so the estimate is local midnight on the first of the next month.
+- **No reading means no delay.** If the CLI is signed out, or the usage lookup is failing, nothing is held back. A reading we do not have is not evidence that the account is out of usage, and holding every cron on that would be the worse failure.
+
+A run that waited says so in its log header, above the prompt:
+
+```
+held       waited 43m 18s for Session
+```
+
+A pause outranks a delay. If usage clears while every schedule is paused, the trigger keeps waiting and goes when the pause lifts. Deactivating a cron throws away a scheduled trigger that is still waiting; a **Run now** that is waiting survives, because that one is your own press.
+
 ## Settings and self update
 
 The **⚙ Settings** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
@@ -288,6 +325,8 @@ A cron file:
   "cron": "0 9 * * *",
   "workingDirectory": "/Users/you/code/project",
   "model": "claude-sonnet-4-5",
+  "effort": "",
+  "usageDelay": { "session": true, "weekly": false, "fable": false, "credits": true },
   "prompt": "Write a two line summary of today.",
   "isActive": true,
   "createdAt": "2026-09-10T06:11:04.188Z",
@@ -318,16 +357,17 @@ Set `WATCH_INTERVAL_MS` to change the interval, or `0` to switch the watcher off
 Two things the watcher deliberately stays quiet about, so you don't get told twice about your own actions:
 
 - **Changes made through the UI or API.** Those already reload the scheduler and show their own toast.
-- **Run bookkeeping.** Every run rewrites `lastRunAt`, `lastRunStatus`, `lastRunLog` and `lastRunDurationSeconds` in the cron file. Only the config fields (`name`, `description`, `cron`, `workingDirectory`, `prompt`, `isActive`) count as a change.
+- **Run bookkeeping.** Every run rewrites `lastRunAt`, `lastRunStatus`, `lastRunLog` and `lastRunDurationSeconds` in the cron file. Only the config fields (`name`, `description`, `cron`, `workingDirectory`, `model`, `effort`, `usageDelay`, `prompt`, `isActive`) count as a change.
 
 A file caught mid-write is treated as unchanged rather than deleted, so a save from an editor that truncates before writing does not cause a delete-then-add flicker.
 
 ## How a run works
 
 1. The schedule fires, or you press **Run now**.
-2. The server spawns `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages` in the cron's working directory.
-3. The assistant's text is pulled out of the event stream and written to `logs/<name>/<start time>.txt` as it arrives, so the log reads as plain output and can be tailed mid-run. stderr goes in verbatim, as does any stdout line that is not JSON (a CLI warning, say).
-4. On exit, the run's statistics block is written, then a footer records the outcome (`succeeded` / `failed` / `stopped`, duration, exit code). Logs beyond the newest 50 for that cron are deleted.
+2. If the cron has [Delay for usage](#delaying-a-cron-for-usage) boxes ticked, usage is read; the run waits here while any ticked limit is spent.
+3. The server spawns `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages` in the cron's working directory.
+4. The assistant's text is pulled out of the event stream and written to `logs/<name>/<start time>.txt` as it arrives, so the log reads as plain output and can be tailed mid-run. stderr goes in verbatim, as does any stdout line that is not JSON (a CLI warning, say).
+5. On exit, the run's statistics block is written, then a footer records the outcome (`succeeded` / `failed` / `stopped`, duration, exit code). Logs beyond the newest 50 for that cron are deleted.
 
 A cron never runs twice at once. If a schedule fires while the previous run is still going, that trigger is skipped and the UI says so.
 
@@ -342,6 +382,8 @@ While a run is in flight, that cron's **Run now** button becomes **Stop**. Stopp
 ```
 
 The run's outcome is recorded as `stopped`, distinct from `succeeded` and `failed`. The schedule is left alone: an active cron stays armed and fires again at its next trigger, so stopping one run never disables the cron. Use the Is Active checkbox for that.
+
+**Stop** is also what the button becomes while a trigger is [held for usage](#delaying-a-cron-for-usage). Nothing is running in that case, so there is no process to signal and nothing to log — pressing it throws the waiting trigger away and the cron goes back to `armed`.
 
 ## Run statistics
 
@@ -372,13 +414,15 @@ Three consequences worth knowing:
 - **A failed lookup keeps the last numbers.** The endpoint rate-limits, and several Claude sessions on one machine share that limit. When a refresh fails the meters dim and their tooltip says when they were last read and why the refresh is waiting, rather than disappearing. Retries back off from five minutes, doubling to an hour, and a `Retry-After` header wins when it asks for longer.
 - **Signed out means no meters, not an error.** If the CLI is not signed in, or its login has expired, the meters disappear and `usage.reason` on `/api/health` says which. Expired logins are left for the CLI to refresh: doing it here would rotate the refresh token underneath it.
 
+A cron can also be told to wait on any of these limits rather than run into one; see [Delaying a cron for usage](#delaying-a-cron-for-usage).
+
 Amber and red are the API's own severity for a limit, not a threshold picked here, so they change when the CLI's usage view would change. The endpoint also reports a long tail of unreleased limit types; the server reads its normalized `limits` array instead, which means a limit added to the plan later shows up without a change to this code.
 
 ## Real-time updates
 
 Two Server-Sent Event streams, no polling loops in the UI:
 
-- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped. The home page redraws when one arrives.
+- `GET /api/events` — cron changes, run started, run stopping, run finished, trigger skipped, trigger held for usage, trigger released. The home page redraws when one arrives.
 - `GET /api/crons/:id/logs/:file/stream` — one log file: everything written so far, then each new chunk. Closes itself with a `done` event when the run ends.
 
 ## Configuration
@@ -457,14 +501,14 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/crons`                       | List, with next run time and live-run state                                                                                                                                    |
 | POST             | `/api/crons`                       | Create                                                                                                                                                                         |
 | GET, PUT, DELETE | `/api/crons/:id`                   | Read, update, delete                                                                                                                                                           |
-| POST             | `/api/crons/:id/run`               | Trigger now (409 if already running, or if crons are paused)                                                                                                                   |
-| POST             | `/api/crons/:id/stop`              | Kill the in-flight run (409 if not running)                                                                                                                                    |
+| POST             | `/api/crons/:id/run`               | Trigger now. 409 if already running, if crons are paused, or if a trigger is already waiting on usage. 202 with `delayed` instead of a run when a watched limit is spent        |
+| POST             | `/api/crons/:id/stop`              | Kill the in-flight run, or drop a trigger waiting on usage (409 if neither)                                                                                                    |
 | GET              | `/api/crons/:id/logs`              | Run history, newest first                                                                                                                                                      |
 | GET              | `/api/crons/:id/logs/:file`        | One log as JSON                                                                                                                                                                |
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
-| GET              | `/api/config`                      | Storage paths and retention limit                                                                                                                                              |
-| GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
+| GET              | `/api/config`                      | Storage paths, retention limit, effort levels, and the usage-delay categories                                                                                                  |
+| GET              | `/api/health`                      | Liveness, how many crons are scheduled, whether they are paused, how many triggers are held for usage, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, and how many runs are still in flight                                                                                                        |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |
@@ -480,7 +524,7 @@ As the field changes, a green line below it shows when the expression next fires
 
 - The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
-- A pause lives in memory only. Restarting the server clears it, whichever length was chosen.
+- A pause lives in memory only. Restarting the server clears it, whichever length was chosen. So does a trigger held for usage: a restart comes back with nothing waiting.
 - The **Update available** badge reflects the last check, so it can lag a push by up to `updateCheckIntervalHours`. **Check for updates** on the Settings page refreshes it at once.
 - Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone.
 - Renaming a cron moves its log folder, so history follows the new name.

@@ -26,6 +26,10 @@ const TTL_MS = 5 * 60 * 1000;
 const ERROR_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_BACKOFF_MS = 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 10000;
+// A delayed cron asks for a reading outside the normal window when the limit it
+// is waiting on should have reset. This is the floor on how often that is
+// allowed, so a reset time that keeps reading as past cannot become a hot loop.
+const FORCED_FETCH_GAP_MS = 60 * 1000;
 
 /**
  * The last good reading, kept across restarts. Only the drawn numbers are
@@ -120,6 +124,10 @@ function readLimit(entry, index) {
   const label = known?.label ?? humanize(entry.kind);
   return {
     key: `${entry.kind ?? 'limit'}:${scope ?? index}`,
+    // Kept alongside the drawn label because the usage-delay categories match on
+    // what a limit *is*, not on how it happens to be worded in the header.
+    kind: entry.kind ?? null,
+    scope,
     label: scope ? `${label} · ${scope}` : label,
     detail: scope ? `${known?.detail ?? label} — ${scope}` : (known?.detail ?? label),
     usedPercent: used,
@@ -150,12 +158,108 @@ function readSpend(spend) {
   const cap = money(spend.limit);
   return {
     key: 'spend',
+    kind: 'spend',
+    scope: null,
     label: 'Credits',
     detail: spent && cap ? `${spent} of ${cap} extra usage credits` : 'Extra usage credits',
     usedPercent: used,
     severity: spend?.severity === 'critical' || spend?.severity === 'warning' ? spend.severity : 'normal',
     resetsAt: null,
   };
+}
+
+/**
+ * The kind of limit a window reports. Readings kept from an older build predate
+ * the `kind` field, so the key — which has always started with the kind — is the
+ * fallback rather than letting a restored cache match nothing.
+ */
+function kindOf(window) {
+  return window?.kind ?? String(window?.key ?? '').split(':')[0];
+}
+
+/** Local midnight on the first of next month. */
+function firstOfNextMonth(now = new Date()) {
+  return new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
+}
+
+/**
+ * The usage categories a cron can be told to wait on, each matched against what
+ * a limit *is* rather than how the header words it. `blocks` is the threshold
+ * that holds a trigger back: a rate limit has to be spent outright, while extra
+ * credits are a spending cap, so the cron is held before the money runs out.
+ *
+ * `matches` and `blocks` are functions, so JSON.stringify drops them and the
+ * same array can be handed to the page as the checkbox list.
+ */
+export const USAGE_DELAY_CATEGORIES = [
+  {
+    id: 'session',
+    label: 'Session',
+    hint: 'Hold the trigger while the 5-hour session limit is at 100%.',
+    matches: (window) => kindOf(window) === 'session',
+    blocks: (used) => used >= 100,
+  },
+  {
+    id: 'weekly',
+    label: 'Weekly',
+    hint: 'Hold the trigger while the rolling 7-day limit is at 100%.',
+    matches: (window) => kindOf(window) === 'weekly_all',
+    blocks: (used) => used >= 100,
+  },
+  {
+    id: 'fable',
+    label: 'Fable',
+    hint: 'Hold the trigger while the Fable weekly limit is at 100%.',
+    matches: (window) => kindOf(window) === 'weekly_scoped' && /fable/i.test(window?.scope ?? window?.label ?? ''),
+    blocks: (used) => used >= 100,
+  },
+  {
+    id: 'credits',
+    label: 'Monthly Credits 90%',
+    hint: 'Hold the trigger once more than 90% of the extra usage credits are spent. Credits are monthly, so they clear on the first.',
+    matches: (window) => kindOf(window) === 'spend',
+    blocks: (used) => used > 90,
+    // The endpoint reports no reset time for a spending cap; the cap is monthly.
+    resetsAt: () => firstOfNextMonth(),
+  },
+];
+
+/** Every category, always all four keys, so a cron file never carries a half set. */
+export function normalizeUsageDelay(input) {
+  const value = {};
+  for (const category of USAGE_DELAY_CATEGORIES) value[category.id] = Boolean(input?.[category.id]);
+  return value;
+}
+
+/** True when at least one category is ticked. */
+export function hasUsageDelay(delay) {
+  return USAGE_DELAY_CATEGORIES.some((category) => Boolean(delay?.[category.id]));
+}
+
+/**
+ * Which of a cron's ticked categories are over their threshold right now, and
+ * when each of them clears.
+ *
+ * An empty reading returns nothing on purpose. A signed-out CLI or a rate-limited
+ * lookup is not evidence that the account is out of usage, and holding every cron
+ * on a reading we do not have would be the worse failure.
+ */
+export function usageBlockers(reading, delay) {
+  const windows = reading?.windows ?? [];
+  if (!windows.length) return [];
+  const blockers = [];
+  for (const category of USAGE_DELAY_CATEGORIES) {
+    if (!delay?.[category.id]) continue;
+    const window = windows.find((candidate) => category.matches(candidate));
+    if (!window || !category.blocks(window.usedPercent)) continue;
+    blockers.push({
+      id: category.id,
+      label: category.label,
+      usedPercent: window.usedPercent,
+      resetsAt: category.resetsAt ? category.resetsAt() : (window.resetsAt ?? null),
+    });
+  }
+  return blockers;
 }
 
 /** `Retry-After` is either a count of seconds or an HTTP date; both appear. */
@@ -243,6 +347,8 @@ class UsageMonitor {
     this.reason = null;
     /** Earliest the endpoint may be asked again. */
     this.nextFetchAt = 0;
+    /** Earliest a delayed cron may ask outside that window. */
+    this.nextForcedFetchAt = 0;
     /** Consecutive failures, which is what the backoff doubles on. */
     this.failures = 0;
     /** Shared so concurrent polls make one request, not one each. @type {Promise|null} */
@@ -260,6 +366,23 @@ class UsageMonitor {
   async state() {
     await this.restore();
     if (Date.now() >= this.nextFetchAt) this.refresh();
+    return this.reading();
+  }
+
+  /**
+   * The current reading, waiting on a lookup rather than answering from the last
+   * one. This is what a delayed cron uses the moment the limit it is waiting on
+   * should have cleared: answering from a five-minute-old reading there would
+   * hold the run back for another five minutes for no reason.
+   */
+  async now() {
+    await this.restore();
+    if (Date.now() >= this.nextForcedFetchAt) {
+      this.nextForcedFetchAt = Date.now() + FORCED_FETCH_GAP_MS;
+      await this.refresh();
+    } else if (Date.now() >= this.nextFetchAt) {
+      await this.refresh();
+    }
     return this.reading();
   }
 

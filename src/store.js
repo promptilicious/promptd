@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CRONS_DIR, LOGS_DIR } from './paths.js';
+import { normalizeUsageDelay } from './usage.js';
 
 export const MAX_LOGS_PER_CRON = 50;
 
@@ -69,6 +70,7 @@ export async function createCron(input) {
     workingDirectory: input.workingDirectory ?? '',
     model: input.model ?? '',
     effort: input.effort ?? '',
+    usageDelay: normalizeUsageDelay(input.usageDelay),
     prompt: input.prompt ?? '',
     isActive: Boolean(input.isActive),
     createdAt: now,
@@ -93,6 +95,7 @@ export async function updateCron(id, input) {
     workingDirectory: input.workingDirectory ?? '',
     model: input.model ?? '',
     effort: input.effort ?? '',
+    usageDelay: normalizeUsageDelay(input.usageDelay),
     prompt: input.prompt ?? '',
     isActive: Boolean(input.isActive),
     updatedAt: new Date().toISOString(),

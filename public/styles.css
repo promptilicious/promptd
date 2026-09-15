@@ -452,6 +452,18 @@ tbody tr:hover {
   border-color: rgba(217, 119, 87, 0.4);
 }
 
+/* Waiting on a usage limit. Amber like a live run because something is pending,
+   dashed because nothing is actually executing yet. */
+.pill.delayed {
+  color: var(--amber);
+  border-style: dashed;
+  border-color: rgba(229, 185, 92, 0.5);
+}
+
+.pill.delayed .led {
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
 /* A finished-but-interrupted outcome: amber, and not pulsing like a live run. */
 .pill.warn {
   color: var(--amber);
@@ -750,6 +762,15 @@ input.narrow {
 
 .combo-item.active {
   box-shadow: inset 0 0 0 1px rgba(217, 119, 87, 0.45);
+}
+
+/* Delay for usage: the checkboxes wrap on a narrow window rather than forcing
+   the form wider. */
+.delay-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 22px;
+  padding: 2px 0;
 }
 
 .check {

@@ -19,7 +19,7 @@ import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
-import { usageMonitor } from './usage.js';
+import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -66,6 +66,9 @@ function readForm(body) {
       workingDirectory: String(body?.workingDirectory ?? '').trim(),
       model: String(body?.model ?? '').trim(),
       effort,
+      // Unknown keys are dropped and missing ones read as off, so the cron file
+      // always carries the full set whatever the client sent.
+      usageDelay: normalizeUsageDelay(body?.usageDelay),
       prompt: String(body?.prompt ?? ''),
       isActive: Boolean(body?.isActive),
     },
@@ -74,16 +77,31 @@ function readForm(body) {
 
 function decorate(cron) {
   const run = cronService.currentRun(cron.id);
+  const delayed = cronService.delayInfo(cron.id);
   return {
     ...cron,
+    // Always the full set, so a cron file written before this setting existed
+    // still answers every checkbox the form draws.
+    usageDelay: normalizeUsageDelay(cron.usageDelay),
     nextRunAt: cronService.nextRun(cron.id),
     isRunning: Boolean(run),
     currentRun: run,
+    isDelayed: Boolean(delayed),
+    delayed,
   };
 }
 
 app.get('/api/config', (_req, res) => {
-  res.json({ storageRoot: ROOT, cronsDir: CRONS_DIR, logsDir: LOGS_DIR, maxLogsPerCron: MAX_LOGS_PER_CRON, effortLevels: EFFORT_LEVELS });
+  // USAGE_DELAY_CATEGORIES carries its matcher functions; JSON.stringify drops
+  // them, so the page receives exactly the id, label and hint it draws.
+  res.json({
+    storageRoot: ROOT,
+    cronsDir: CRONS_DIR,
+    logsDir: LOGS_DIR,
+    maxLogsPerCron: MAX_LOGS_PER_CRON,
+    effortLevels: EFFORT_LEVELS,
+    usageDelayCategories: USAGE_DELAY_CATEGORIES,
+  });
 });
 
 /**
@@ -307,9 +325,15 @@ app.post('/api/crons/:id/run', async (req, res, next) => {
           : `all crons are paused ${cronService.pauseInfo().label}; cancel the pause to run one`,
       });
     }
-    const run = await cronService.trigger(cron.id, 'manual');
-    if (!run) return res.status(409).json({ error: 'this cron is already running' });
-    res.status(202).json(run);
+    if (cronService.isDelayed(cron.id)) {
+      return res.status(409).json({ error: 'a trigger for this cron is already waiting on usage' });
+    }
+    const result = await cronService.trigger(cron.id, 'manual');
+    if (!result) return res.status(409).json({ error: 'this cron is already running' });
+    // Run now does not override the usage delay setting: a blocked press becomes
+    // the waiting trigger rather than starting claude anyway.
+    if (result.delayed) return res.status(202).json({ delayed: result.delayed });
+    res.status(202).json(result);
   } catch (err) {
     next(err);
   }
@@ -319,6 +343,10 @@ app.post('/api/crons/:id/stop', async (req, res, next) => {
   try {
     const cron = await getCron(req.params.id);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
+    // Stop is what the Run now button becomes while a trigger waits on usage, so
+    // it has to end that wait as well as a live run.
+    const cancelled = cronService.cancelDelay(cron.id, 'user');
+    if (cancelled) return res.status(202).json({ cancelledDelay: cancelled, nextRunAt: cronService.nextRun(cron.id) });
     const run = await cronService.stop(cron.id, 'user');
     if (!run) return res.status(409).json({ error: 'this cron is not running' });
     // The schedule is untouched by a stop, so report when it next fires.
@@ -455,6 +483,7 @@ app.get('/api/health', async (_req, res) => {
     scheduled: cronService.jobs.size,
     commit: runningCommit,
     paused: cronService.isPaused(),
+    delayed: cronService.delayedCount(),
     usage,
     ...selfUpdater.availability(),
   });

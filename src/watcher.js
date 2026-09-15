@@ -8,7 +8,7 @@ const INTERVAL_MS = Number(process.env.WATCH_INTERVAL_MS ?? 3000);
 
 // Only these fields make a cron a different cron. Run bookkeeping (lastRunAt and
 // friends) is rewritten after every run, and must not read as an external edit.
-const CONFIG_FIELDS = ['name', 'description', 'cron', 'workingDirectory', 'model', 'prompt', 'isActive'];
+const CONFIG_FIELDS = ['name', 'description', 'cron', 'workingDirectory', 'model', 'effort', 'usageDelay', 'prompt', 'isActive'];
 
 function fingerprint(cron) {
   return JSON.stringify(CONFIG_FIELDS.map((field) => cron[field] ?? null));

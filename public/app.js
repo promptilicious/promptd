@@ -132,6 +132,9 @@ function toast(message, bad = false) {
  */
 function statusPill(cron, pause) {
   if (cron.isRunning) return el('span', { class: 'pill running' }, [el('span', { class: 'led' }), 'running']);
+  if (cron.isDelayed) {
+    return el('span', { class: 'pill delayed', title: delayTitle(cron.delayed) }, [el('span', { class: 'led' }), 'delayed']);
+  }
   if (!cron.isActive) return el('span', { class: 'pill paused' }, [el('span', { class: 'led' }), 'deactivated']);
   if (pause?.paused) {
     return el(
@@ -141,6 +144,33 @@ function statusPill(cron, pause) {
     );
   }
   return el('span', { class: 'pill active' }, [el('span', { class: 'led' }), 'armed']);
+}
+
+/** The limits a held trigger is waiting on, e.g. "Session, Weekly". */
+function delayNames(delayed) {
+  return (delayed?.reasons ?? []).map((reason) => reason.label).join(', ');
+}
+
+/**
+ * Hover text for a delayed badge: which limits are holding the trigger, what
+ * each is at, and the earliest the run can start.
+ */
+function delayTitle(delayed) {
+  if (!delayed) return '';
+  const lines = ['Trigger held — a usage limit this cron waits on is spent.'];
+  for (const reason of delayed.reasons ?? []) {
+    const resets = reason.resetsAt
+      ? `resets ${fmtRelative(reason.resetsAt)} (${fmtDateTime(reason.resetsAt)})`
+      : 'no reset time reported';
+    lines.push(`${reason.label} — ${Math.round(reason.usedPercent)}% used, ${resets}`);
+  }
+  lines.push(
+    delayed.resumeAt
+      ? `Estimated run: ${fmtRelative(delayed.resumeAt)} (${fmtDateTime(delayed.resumeAt)})`
+      : 'Estimated run: as soon as usage clears; checked every 30 seconds',
+  );
+  lines.push(`Waiting since ${fmtDateTime(delayed.delayedAt)}. Stop drops it.`);
+  return lines.join('\n');
 }
 
 /** Hover text for a paused badge: when it lifts, or why it cannot be lifted. */
@@ -243,6 +273,27 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
     });
   }
 
+  // A held trigger is a pending execution, so the button that would start one
+  // becomes the button that drops it. Never disabled by a pause, for the same
+  // reason Stop is not: you can always take back something that is queued.
+  if (cron.isDelayed) {
+    return el('button', {
+      class: `${size} danger`,
+      text: 'Stop',
+      title: delayTitle(cron.delayed),
+      onclick: async (event) => {
+        event.target.disabled = true;
+        try {
+          await api(`/api/crons/${cron.id}/stop`, { method: 'POST' });
+          toast(`Dropped the held trigger for "${cron.name}"`);
+        } catch (err) {
+          toast(err.message, true);
+          event.target.disabled = false;
+        }
+      },
+    });
+  }
+
   if (pause?.paused) {
     // The title sits on a wrapper, not the button: a disabled control does not
     // reliably receive hover, so the tooltip would never appear on some browsers.
@@ -271,9 +322,12 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
     onclick: async (event) => {
       event.target.disabled = true;
       try {
-        await api(`/api/crons/${cron.id}/run`, { method: 'POST' });
+        const result = await api(`/api/crons/${cron.id}/run`, { method: 'POST' });
         onStarted?.();
-        toast(`Started "${cron.name}"`);
+        // Run now does not override the usage delay setting; a blocked press
+        // becomes the waiting trigger instead of starting claude anyway.
+        if (result?.delayed) toast(`"${cron.name}" held for usage: ${delayNames(result.delayed)}`, true);
+        else toast(`Started "${cron.name}"`);
       } catch (err) {
         toast(err.message, true);
         event.target.disabled = false;
@@ -299,6 +353,9 @@ async function renderHome() {
       ? `${armed} armed of ${crons.length} — paused ${pause.label}, resumes ${fmtRelative(pause.until)}`
       : `${armed} armed of ${crons.length} — paused ${pause.label}`;
   } else sub = `${armed} armed of ${crons.length}`;
+
+  const held = crons.filter((c) => c.isDelayed).length;
+  if (held) sub += ` — ${held} held for usage`;
 
   const head = el('div', { class: 'page-head' }, [
     el('div', {}, [el('h1', { text: 'Crons' }), el('p', { class: 'sub', text: sub })]),
@@ -341,7 +398,17 @@ async function renderHome() {
         cron.isRunning ? runtimePill(cron.currentRun?.startedAt) : outcomePill(cron.lastRunStatus),
       ]),
       el('td', { class: 'hide-sm' }, [
-        cron.nextRunAt
+        cron.isDelayed
+          ? el('div', { title: delayTitle(cron.delayed) }, [
+              el('div', { text: cron.delayed.resumeAt ? fmtRelative(cron.delayed.resumeAt) : 'when usage clears' }),
+              el('div', {
+                class: 'cron-desc',
+                text: cron.delayed.resumeAt
+                  ? fmtDateTime(cron.delayed.resumeAt)
+                  : `held for ${delayNames(cron.delayed)}`,
+              }),
+            ])
+          : cron.nextRunAt
           ? el('div', {}, [
               el('div', { text: fmtRelative(cron.nextRunAt) }),
               el('div', { class: 'cron-desc', text: fmtDateTime(cron.nextRunAt) }),
@@ -706,6 +773,48 @@ function effortPicker(selected) {
   };
 }
 
+/**
+ * Delay for usage: the limits a trigger should wait out rather than run through.
+ * The categories come from the server, so the checkboxes here and the limits a
+ * held trigger is actually checked against stay one list.
+ */
+function usageDelayPicker(selected) {
+  const boxes = new Map();
+  const grid = el('div', { class: 'delay-grid' });
+  const note = el('div', {
+    class: 'hint',
+    text:
+      'Checked at every trigger, Run now included. While a ticked limit is spent the run waits, ' +
+      'then starts as soon as that limit resets. Only one trigger waits at a time — a second one ' +
+      'arriving meanwhile is dropped, not queued — and a restart clears whatever was waiting.',
+  });
+
+  const paint = (categories) => {
+    boxes.clear();
+    grid.replaceChildren(
+      ...categories.map((category) => {
+        const box = el('input', { type: 'checkbox' });
+        box.checked = Boolean(selected?.[category.id]);
+        boxes.set(category.id, box);
+        return el('label', { class: 'check', title: category.hint }, [box, category.label]);
+      }),
+    );
+  };
+
+  paint([]);
+  api('/api/config')
+    .then((config) => paint(config.usageDelayCategories ?? []))
+    .catch((err) => {
+      note.textContent = `Could not load the usage categories: ${err.message}`;
+      note.className = 'hint warn';
+    });
+
+  return {
+    read: () => Object.fromEntries([...boxes].map(([id, box]) => [id, box.checked])),
+    field: el('div', { class: 'field' }, [el('label', { text: 'Delay for usage' }), grid, note]),
+  };
+}
+
 async function renderForm(id) {
   const cron = id ? await api(`/api/crons/${id}`) : null;
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
@@ -735,6 +844,7 @@ async function renderForm(id) {
 
   const model = modelPicker(cron?.model ?? '');
   const effort = effortPicker(cron?.effort ?? '');
+  const usageDelay = usageDelayPicker(cron?.usageDelay ?? null);
 
   const showError = (message) => {
     errorBox.textContent = message;
@@ -752,6 +862,7 @@ async function renderForm(id) {
       workingDirectory: inputs.workingDirectory.value,
       model: model.read(),
       effort: effort.read(),
+      usageDelay: usageDelay.read(),
       prompt: inputs.prompt.value,
       isActive: inputs.isActive.checked,
     };
@@ -799,6 +910,7 @@ async function renderForm(id) {
       directoryPicker(inputs.workingDirectory),
       model.field,
       effort.field,
+      usageDelay.field,
       field('Prompt', inputs.prompt),
       el('label', { class: 'check' }, [inputs.isActive, 'Is Active']),
       el('div', { class: 'form-actions' }, [
@@ -1208,10 +1320,17 @@ function connectEvents() {
     checkHealth();
   });
 
-  for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping']) {
+  for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released']) {
     events.addEventListener(type, (event) => {
       const payload = JSON.parse(event.data);
       if (type === 'run:finished') toast(`"${payload.cronName}" ${payload.status} in ${payload.seconds}s`);
+      if (type === 'run:delayed') {
+        const when = payload.resumeAt ? `, estimated ${fmtRelative(payload.resumeAt)}` : '';
+        toast(`"${payload.cronName}" held for usage: ${delayNames(payload)}${when}`, true);
+      }
+      // Only the release that actually starts the run is worth a toast; a
+      // cancelled or dropped one already reported itself where it happened.
+      if (type === 'run:released' && payload.ran) toast(`"${payload.cronName}" usage cleared; starting now`);
       if (type === 'run:skipped') {
         toast(payload.reason ? `"${payload.cronName}" skipped: ${payload.reason}` : `"${payload.cronName}" was still running; trigger skipped`, true);
       }

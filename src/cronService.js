@@ -8,8 +8,14 @@ import { Cron } from 'croner';
 import { emit } from './events.js';
 import { resolveUserPath } from './paths.js';
 import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from './store.js';
+import { hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+
+// How often a trigger held for usage re-checks whether its limits have cleared.
+// Short, because the run is supposed to go the moment they do; the reading it
+// checks against is the cached one unless the reset time has passed.
+const DELAY_REVIEW_MS = 30 * 1000;
 
 /**
  * Streaming JSON gives us the assistant text as it is produced plus a final
@@ -123,6 +129,23 @@ export function previewNextRun(expression) {
   }
 }
 
+/**
+ * When a held trigger can go: every blocking limit has to clear, so it is the
+ * latest of their reset times. A blocker that reports no reset — extra credits
+ * on an account with no monthly boundary to read — returns null, and the review
+ * poll decides instead of a timer.
+ */
+function resumeTime(blockers) {
+  if (!blockers.length) return null;
+  if (blockers.some((blocker) => !blocker.resetsAt)) return null;
+  return blockers.map((blocker) => blocker.resetsAt).sort().at(-1);
+}
+
+/** "Session, Weekly" — the limits a trigger is waiting on, for a log or a badge. */
+function blockerNames(blockers) {
+  return blockers.map((blocker) => blocker.label).join(', ');
+}
+
 class CronService {
   constructor() {
     /** @type {Map<string, Cron>} cron id -> scheduled job */
@@ -138,6 +161,16 @@ class CronService {
      */
     this.pauseState = null;
     this.pauseTimer = null;
+    /**
+     * Triggers held because a usage limit the cron watches is spent. At most one
+     * per cron: a second trigger arriving while one waits is lost, not queued.
+     * Memory-only like the pause, so a restart comes back with nothing waiting
+     * and the next trigger checks usage fresh.
+     * @type {Map<string, object>} cron id -> waiting trigger
+     */
+    this.delayed = new Map();
+    this.delayTimer = null;
+    this.reviewing = false;
   }
 
   isPaused() {
@@ -214,7 +247,150 @@ class CronService {
     await this.reload();
     console.log(`[cron] resumed after "${previous.label}" pause (${reason})`);
     emit('pause:changed', { ...this.pauseInfo(), resumedFrom: previous.label, reason });
+    // A trigger whose usage cleared during the pause was held by the pause, not
+    // by usage. Do not make it wait out another review interval.
+    this.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
     return this.pauseInfo();
+  }
+
+  // ---- usage delays ---------------------------------------------------
+
+  /** The trigger waiting on usage for this cron, or null. JSON-safe. */
+  delayInfo(cronId) {
+    return this.delayed.get(cronId) ?? null;
+  }
+
+  isDelayed(cronId) {
+    return this.delayed.has(cronId);
+  }
+
+  /** How many triggers are waiting on usage. Never counted as running. */
+  delayedCount() {
+    return this.delayed.size;
+  }
+
+  /**
+   * Which of this cron's watched limits are over their threshold right now.
+   * `fresh` asks the endpoint rather than answering from the last reading, which
+   * is what a trigger wants: it is deciding whether to run at all.
+   */
+  async blockersFor(cron, { fresh = false } = {}) {
+    const delay = normalizeUsageDelay(cron.usageDelay);
+    if (!hasUsageDelay(delay)) return [];
+    const reading = fresh ? await usageMonitor.now() : await usageMonitor.state();
+    return usageBlockers(reading, delay);
+  }
+
+  /** Parks a trigger until the limits it named clear. */
+  hold(cron, source, blockers) {
+    const now = new Date().toISOString();
+    const entry = {
+      cronId: cron.id,
+      cronName: cron.name,
+      source,
+      delayedAt: now,
+      checkedAt: now,
+      reasons: blockers,
+      resumeAt: resumeTime(blockers),
+    };
+    this.delayed.set(cron.id, entry);
+    this.startDelayReview();
+    console.log(`[cron] "${cron.name}" ${source} trigger held for usage: ${blockerNames(blockers)}`);
+    emit('run:delayed', entry);
+    return entry;
+  }
+
+  /**
+   * Drops a waiting trigger without running it. This is what Stop does to a
+   * delayed cron: the schedule is untouched, so the next trigger checks usage
+   * again like any other.
+   */
+  cancelDelay(cronId, cancelledBy = 'user') {
+    const entry = this.delayed.get(cronId);
+    if (!entry) return null;
+    this.delayed.delete(cronId);
+    if (!this.delayed.size) this.stopDelayReview();
+    console.log(`[cron] "${entry.cronName}" held trigger cancelled by ${cancelledBy}`);
+    emit('run:released', { ...entry, ran: false, reason: `cancelled by ${cancelledBy}` });
+    return entry;
+  }
+
+  startDelayReview() {
+    if (this.delayTimer) return;
+    this.delayTimer = setInterval(() => {
+      this.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
+    }, DELAY_REVIEW_MS);
+    this.delayTimer.unref?.();
+  }
+
+  stopDelayReview() {
+    if (this.delayTimer) clearInterval(this.delayTimer);
+    this.delayTimer = null;
+  }
+
+  /**
+   * Re-checks every waiting trigger and starts the ones whose limits have
+   * cleared. The endpoint is only asked outside its normal window when a reset
+   * time has actually passed — the rest of the time this reads the same cached
+   * numbers the header meters draw.
+   */
+  async reviewDelays() {
+    if (this.reviewing) return;
+    if (!this.delayed.size) {
+      this.stopDelayReview();
+      return;
+    }
+    this.reviewing = true;
+    try {
+      const resetPassed = [...this.delayed.values()].some(
+        (entry) => entry.resumeAt && Date.parse(entry.resumeAt) <= Date.now(),
+      );
+      const reading = resetPassed ? await usageMonitor.now() : await usageMonitor.state();
+
+      for (const entry of [...this.delayed.values()]) {
+        const cron = await getCron(entry.cronId);
+        if (!cron) {
+          this.delayed.delete(entry.cronId);
+          emit('run:released', { ...entry, ran: false, reason: 'cron deleted' });
+          continue;
+        }
+        // Deactivating a cron withdraws its schedule, so a scheduled trigger
+        // still waiting has nothing left to belong to. A manual one is the
+        // user's own press and still runs.
+        if (!cron.isActive && entry.source === 'schedule') {
+          this.delayed.delete(entry.cronId);
+          console.log(`[cron] "${cron.name}" held trigger dropped: cron deactivated while waiting`);
+          emit('run:released', { ...entry, ran: false, reason: 'cron deactivated while waiting' });
+          continue;
+        }
+
+        const blockers = usageBlockers(reading, normalizeUsageDelay(cron.usageDelay));
+        entry.checkedAt = new Date().toISOString();
+        if (blockers.length) {
+          // Still spent. The reasons are refreshed because the set can change:
+          // a session limit resets while a weekly one is still holding it back.
+          entry.reasons = blockers;
+          entry.resumeAt = resumeTime(blockers);
+          continue;
+        }
+        // A pause outranks this. The trigger keeps waiting and goes when the
+        // pause lifts, which is also what resumeAll kicks off.
+        if (this.pauseState) continue;
+
+        this.delayed.delete(entry.cronId);
+        if (this.running.has(entry.cronId)) {
+          emit('run:skipped', { cronId: cron.id, cronName: cron.name, source: entry.source, reason: 'already running' });
+          continue;
+        }
+        const waited = Date.now() - Date.parse(entry.delayedAt);
+        console.log(`[cron] "${cron.name}" usage cleared after ${formatRuntime(waited)}; starting held ${entry.source} trigger`);
+        emit('run:released', { ...entry, ran: true, reason: 'usage cleared' });
+        await this.execute(cron, entry.source, { since: entry.delayedAt, reasons: entry.reasons });
+      }
+    } finally {
+      this.reviewing = false;
+      if (!this.delayed.size) this.stopDelayReview();
+    }
   }
 
   /** Rebuilds every schedule from disk. Called on boot and after any cron write. */
@@ -285,6 +461,28 @@ class CronService {
       emit('run:skipped', { cronId, cronName: cron.name, source });
       return null;
     }
+    // One waiting trigger per cron. A second one arriving while the first is
+    // held is lost rather than queued behind it, so a cron that sits out a long
+    // reset does not come back and fire a backlog.
+    if (this.delayed.has(cronId)) {
+      const waiting = this.delayed.get(cronId);
+      console.warn(`[cron] "${cron.name}" already has a trigger held for usage; dropping the ${source} one`);
+      emit('run:skipped', {
+        cronId,
+        cronName: cron.name,
+        source,
+        reason: `a trigger is already waiting on ${blockerNames(waiting.reasons)}`,
+      });
+      return null;
+    }
+
+    // Usage is read fresh here rather than from the cached meters: this is the
+    // moment the run is decided, and a five-minute-old reading can be on the
+    // wrong side of a reset. Run now goes through this too — it does not
+    // override the setting, it joins the queue of one.
+    const blockers = await this.blockersFor(cron, { fresh: true });
+    if (blockers.length) return { delayed: this.hold(cron, source, blockers) };
+
     return this.execute(cron, source);
   }
 
@@ -328,7 +526,7 @@ class CronService {
     return run;
   }
 
-  async execute(cron, source) {
+  async execute(cron, source, held = null) {
     const startedAt = new Date();
     const dir = logDir(cron.name);
     await fsp.mkdir(dir, { recursive: true });
@@ -351,6 +549,9 @@ class CronService {
       pid: null,
       stopping: false,
       stoppedBy: null,
+      // Set when this run is a trigger that sat out a usage limit, so the UI can
+      // say the run went as soon as usage cleared.
+      heldSince: held?.since ?? null,
     };
     this.running.set(cron.id, run);
 
@@ -367,6 +568,9 @@ class CronService {
           `directory  ${cwd}`,
           `model      ${cron.model?.trim() || '(CLI default)'}`,
           `effort     ${cron.effort?.trim() || '(CLI default)'}`,
+          ...(held
+            ? [`held       waited ${formatRuntime(startedAt - new Date(held.since))} for ${blockerNames(held.reasons ?? [])}`]
+            : []),
           `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs].join(' ')}`,
           '--- prompt ---',
           cron.prompt ?? '',
