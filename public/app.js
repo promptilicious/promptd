@@ -76,6 +76,37 @@ function fmtRelative(iso) {
   return past ? `${text} ago` : `in ${text}`;
 }
 
+/**
+ * A run length, always down to the second so a live clock ticks visibly.
+ * Minutes and hours are zero-padded so the digits do not jump around.
+ */
+function fmtDuration(ms) {
+  let seconds = Math.max(0, Math.round(ms / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  seconds %= 60;
+  const pad = (value) => String(value).padStart(2, '0');
+  if (hours) return `${hours}h ${pad(minutes)}m ${pad(seconds)}s`;
+  if (minutes) return `${minutes}m ${pad(seconds)}s`;
+  return `${seconds}s`;
+}
+
+/** How long a run that started at `iso` has been going. */
+function fmtElapsed(iso) {
+  return fmtDuration(Date.now() - new Date(iso).getTime());
+}
+
+/**
+ * One interval drives every live clock on the page. An element opts in by
+ * carrying data-runtime-start (the run's ISO start time); each tick rewrites
+ * its text. Nothing to update is a single empty query, so this stays cheap.
+ */
+function tickRuntimes() {
+  for (const node of document.querySelectorAll('[data-runtime-start]')) {
+    node.textContent = fmtElapsed(node.dataset.runtimeStart);
+  }
+}
+
 function fmtBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -163,6 +194,18 @@ function pauseControl(pause, options, onChanged) {
     }
   });
   return select;
+}
+
+/**
+ * Amber badge standing in for the outcome while a run is in flight: there is no
+ * outcome yet, so the cell carries how long this run has been going instead.
+ */
+function runtimePill(startedAt) {
+  if (!startedAt) return el('span', { class: 'pill running' }, [el('span', { class: 'led' }), 'running']);
+  return el('span', { class: 'pill runtime', title: `Running since ${fmtDateTime(startedAt)}` }, [
+    el('span', { class: 'led' }),
+    el('span', { 'data-runtime-start': startedAt, text: fmtElapsed(startedAt) }),
+  ]);
 }
 
 function outcomePill(status) {
@@ -294,7 +337,9 @@ async function renderHome() {
             ])
           : el('span', { class: 'muted', text: 'never' }),
       ]),
-      el('td', { class: 'hide-sm' }, [outcomePill(cron.lastRunStatus)]),
+      el('td', { class: 'hide-sm' }, [
+        cron.isRunning ? runtimePill(cron.currentRun?.startedAt) : outcomePill(cron.lastRunStatus),
+      ]),
       el('td', { class: 'hide-sm' }, [
         cron.nextRunAt
           ? el('div', {}, [
@@ -1014,11 +1059,22 @@ async function renderLogs(id) {
 
   const liveBadge = el('span', { class: 'pill', text: '' });
   const selectedLog = logs.find((log) => log.file === logsState.selected);
+  // Live runs tick from their start time; a finished run's total is read off the
+  // log's closing line once the stream has replayed it.
+  const runtimeEl = selectedLog?.isRunning
+    ? el('span', {
+        class: 'log-runtime',
+        title: `Running since ${fmtDateTime(selectedLog.startedAt)}`,
+        'data-runtime-start': selectedLog.startedAt,
+        text: fmtElapsed(selectedLog.startedAt),
+      })
+    : el('span', { class: 'log-runtime', text: '' });
 
   const panel = el('div', { class: 'log-panel' }, [
     el('div', { class: 'log-head' }, [
       el('span', { class: 'mono', text: selectedLog ? (fmtDateTime(selectedLog.startedAt) ?? selectedLog.file) : '—' }),
       liveBadge,
+      runtimeEl,
       el('div', { class: 'spacer' }),
       selectedLog
         ? el('a', {
@@ -1055,11 +1111,22 @@ async function renderLogs(id) {
     el('div', { class: 'logs-layout' }, [runList, panel]),
   );
 
-  if (logsState.selected) openLogStream(id, logsState.selected, body, liveBadge);
+  if (logsState.selected) openLogStream(id, logsState.selected, body, liveBadge, runtimeEl);
+}
+
+/**
+ * The run length a finished log reports on its own closing line, e.g.
+ * "--- succeeded after 12.3s ---". Null while the log has no closing line yet,
+ * which is every log that is still being written.
+ */
+function durationFromLog(text) {
+  const matches = [...text.matchAll(/^--- \w+ after ([\d.]+)s/gm)];
+  const last = matches.at(-1);
+  return last ? Number(last[1]) * 1000 : null;
 }
 
 /** Streams one log file into the pre element, appending chunks as they arrive. */
-function openLogStream(cronId, file, body, liveBadge) {
+function openLogStream(cronId, file, body, liveBadge, runtimeEl) {
   closeLogStream();
   body.textContent = '';
   liveBadge.textContent = 'streaming';
@@ -1076,6 +1143,12 @@ function openLogStream(cronId, file, body, liveBadge) {
   stream.addEventListener('done', () => {
     liveBadge.textContent = 'finished';
     liveBadge.className = 'pill';
+    if (runtimeEl) {
+      // The clock stops here: whatever the run took is now written in the log.
+      delete runtimeEl.dataset.runtimeStart;
+      const ms = durationFromLog(body.textContent);
+      runtimeEl.textContent = ms === null ? '' : fmtDuration(ms);
+    }
     if (!body.textContent) body.textContent = '(empty log)';
     closeLogStream();
   });
@@ -1293,6 +1366,8 @@ async function loadConfig() {
 }
 
 window.addEventListener('hashchange', route);
+// Live run clocks, wherever they are on the page.
+setInterval(tickRuntimes, 1000);
 // Cheap, and a restart is exactly when the running commit changes.
 setInterval(checkHealth, 20000);
 // Keeps "3m ago" / "in 20m" honest without hammering the API.
