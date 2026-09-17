@@ -150,6 +150,20 @@ function toast(message, bad = false, key = null) {
 }
 
 /**
+ * Which API a job lives behind. Crons and one-time executions answer the same
+ * run, stop and log routes under different prefixes, so every shared control
+ * asks this rather than hard-coding one of them.
+ */
+function apiBase(job) {
+  return job?.kind === 'execution' ? 'executions' : 'crons';
+}
+
+/** Where the page keeps a job: the crons tab and its pages, or the one-time ones. */
+function hashBase(job) {
+  return job?.kind === 'execution' ? '#/one-time' : '#';
+}
+
+/**
  * A live run keeps its running badge through a pause and picks up the paused
  * badge when it finishes. A deactivated cron stays deactivated: a pause does
  * not change it, and lifting the pause will not arm it.
@@ -168,6 +182,51 @@ function statusPill(cron, pause) {
     );
   }
   return el('span', { class: 'pill active' }, [el('span', { class: 'led' }), 'armed']);
+}
+
+/**
+ * What a one-time execution is doing, which is a life rather than a schedule:
+ * it is waiting for its date, running, or finished with whatever it finished as.
+ *
+ * `overdue` is the gap between a trigger being missed and the catch-up starting
+ * the run — after a restart, or while a pause is holding it.
+ */
+function executionPill(execution, pause) {
+  if (execution.isRunning) return el('span', { class: 'pill running' }, [el('span', { class: 'led' }), 'running']);
+  if (execution.isDelayed) {
+    return el('span', { class: 'pill delayed', title: delayTitle(execution.delayed) }, [el('span', { class: 'led' }), 'delayed']);
+  }
+  if (!execution.isActive) return el('span', { class: 'pill paused' }, [el('span', { class: 'led' }), 'deactivated']);
+  if (execution.status === 'cancelled') {
+    return el('span', { class: 'pill warn', title: `Dropped by ${execution.stoppedBy ?? 'the user'} before it ran.` }, [
+      el('span', { class: 'led' }),
+      'cancelled',
+    ]);
+  }
+  // Neutral on purpose: how the run ended is the Outcome column's job, and a
+  // row saying "succeeded" twice tells you nothing the second time.
+  if (execution.status === 'done') {
+    return el('span', { class: 'pill', title: `Ran ${fmtRelative(execution.lastRunAt)}.` }, [
+      el('span', { class: 'led' }),
+      'done',
+    ]);
+  }
+  if (execution.isOverdue) {
+    return el(
+      'span',
+      {
+        class: 'pill delayed',
+        title: pause?.paused
+          ? 'Its time has passed while everything is paused. It runs when the pause lifts.'
+          : 'Its time has passed and the run is being started now.',
+      },
+      [el('span', { class: 'led' }), pause?.paused ? 'held' : 'starting'],
+    );
+  }
+  if (pause?.paused) {
+    return el('span', { class: 'pill held', title: pauseTitle(pause) }, [el('span', { class: 'led' }), pause.badge]);
+  }
+  return el('span', { class: 'pill active' }, [el('span', { class: 'led' }), 'scheduled']);
 }
 
 /** The limits a held trigger is waiting on, e.g. "Session, Weekly". */
@@ -289,7 +348,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
       onclick: async (event) => {
         event.target.disabled = true;
         try {
-          await api(`/api/crons/${cron.id}/stop`, { method: 'POST' });
+          await api(`/api/${apiBase(cron)}/${cron.id}/stop`, { method: 'POST' });
           toast(`Stopping "${cron.name}"`);
         } catch (err) {
           toast(err.message, true);
@@ -310,7 +369,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
       onclick: async (event) => {
         event.target.disabled = true;
         try {
-          await api(`/api/crons/${cron.id}/stop`, { method: 'POST' });
+          await api(`/api/${apiBase(cron)}/${cron.id}/stop`, { method: 'POST' });
           toast(`"${cron.name}" is no longer waiting`);
         } catch (err) {
           toast(err.message, true);
@@ -330,7 +389,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
         title:
           pause.mode === 'update'
             ? 'Paused for update — an update is waiting for runs to finish, so nothing new can start.'
-            : `All crons are paused ${pause.label}. Cancel the pause to run one.`,
+            : `Everything is paused ${pause.label}. Cancel the pause to run one.`,
       },
       [
         el('button', {
@@ -348,7 +407,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
     onclick: async (event) => {
       event.target.disabled = true;
       try {
-        const result = await api(`/api/crons/${cron.id}/run`, { method: 'POST' });
+        const result = await api(`/api/${apiBase(cron)}/${cron.id}/run`, { method: 'POST' });
         onStarted?.();
         // Run now does not override the usage delay setting; a blocked press
         // becomes the waiting trigger instead of starting claude anyway.
@@ -364,39 +423,103 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
 
 // ---- home -------------------------------------------------------------
 
-async function renderHome() {
-  const [crons, pause] = await Promise.all([api('/api/crons'), api('/api/pause')]);
+/**
+ * How much of the one-time list is on screen.
+ *
+ * Kept outside the render so that a run event redrawing the page does not throw
+ * away the older pages the user has loaded: the redraw asks for the same number
+ * of rows again rather than starting back at ten.
+ */
+const executionsState = { limit: 10, pageSize: 10 };
 
-  const armed = crons.filter((c) => c.isActive).length;
-  let sub;
-  if (!crons.length) sub = 'Nothing scheduled yet';
-  else if (pause.paused && pause.mode === 'update') {
-    sub = pause.runningCount
+/** The two tabs, and which one the hash is asking for. */
+const TABS = [
+  { id: 'crons', label: 'Crons', hash: '#/' },
+  { id: 'executions', label: 'One-time Execution', hash: '#/one-time' },
+];
+
+function tabBar(current) {
+  return el(
+    'nav',
+    { class: 'tabs', role: 'tablist' },
+    TABS.map((tab) =>
+      el('a', {
+        class: `tab${tab.id === current ? ' selected' : ''}`,
+        href: tab.hash,
+        role: 'tab',
+        'aria-selected': tab.id === current ? 'true' : 'false',
+        text: tab.label,
+      }),
+    ),
+  );
+}
+
+/**
+ * The pause sentence both tabs share, since one pause holds both: crons stop
+ * firing and one-time executions stop starting.
+ */
+function pauseSummary(pause) {
+  if (!pause.paused) return null;
+  if (pause.mode === 'update') {
+    return pause.runningCount
       ? `Paused for update — waiting for ${pause.runningCount} run${pause.runningCount === 1 ? '' : 's'} to finish`
       : 'Paused for update — restarting';
-  } else if (pause.paused) {
-    sub = pause.until
-      ? `${armed} armed of ${crons.length} — paused ${pause.label}, resumes ${fmtRelative(pause.until)}`
-      : `${armed} armed of ${crons.length} — paused ${pause.label}`;
-  } else sub = `${armed} armed of ${crons.length}`;
-
-  const held = crons.filter((c) => c.isDelayed).length;
-  if (held) sub += ` · ${held} waiting on usage`;
-  if (pause.paused && pause.droppedCount) {
-    sub += ` · ${pause.droppedCount} trigger${pause.droppedCount === 1 ? '' : 's'} dropped`;
   }
+  return pause.until ? `paused ${pause.label}, resumes ${fmtRelative(pause.until)}` : `paused ${pause.label}`;
+}
+
+/**
+ * The home page: one header, one pause control, and two tabs under it.
+ *
+ * The pause sits outside the tabs on purpose. It is not a property of either
+ * list — it holds every cron and every one-time execution at once — so putting
+ * a copy inside each tab would have suggested there were two of them.
+ */
+async function renderHome(tab = 'crons') {
+  const pause = await api('/api/pause');
 
   const head = el('div', { class: 'page-head' }, [
-    el('div', {}, [el('h1', { text: 'Crons' }), el('p', { class: 'sub', text: sub })]),
+    el('div', {}, [el('h1', { text: 'Claude Conductor' }), el('p', { class: 'sub', id: 'home-sub', text: '' })]),
     el('div', { class: 'head-actions' }, [
-      pauseControl(pause, pause.options ?? [], () => renderHome().catch(() => {})),
-      el('a', { class: 'btn primary', href: '#/new', text: '+ New cron' }),
+      pauseControl(pause, pause.options ?? [], () => renderHome(tab).catch(() => {})),
+      tab === 'executions'
+        ? el('a', { class: 'btn primary', href: '#/one-time/new', text: '+ New one-time execution' })
+        : el('a', { class: 'btn primary', href: '#/new', text: '+ New cron' }),
     ]),
   ]);
 
+  const panel = el('div', { class: 'tab-panel', role: 'tabpanel' });
+  view.replaceChildren(head, tabBar(tab), panel);
+
+  const sub = (text) => {
+    const node = document.getElementById('home-sub');
+    if (node) node.textContent = text;
+  };
+
+  if (tab === 'executions') await paintExecutions(panel, pause, sub);
+  else await paintCrons(panel, pause, sub);
+}
+
+/** The Crons tab: everything the home page showed before the tabs existed. */
+async function paintCrons(panel, pause, sub) {
+  const crons = await api('/api/crons');
+  const armed = crons.filter((c) => c.isActive).length;
+
+  let line;
+  if (!crons.length) line = 'Nothing scheduled yet';
+  else if (pause.paused && pause.mode === 'update') line = pauseSummary(pause);
+  else if (pause.paused) line = `${armed} armed of ${crons.length} — ${pauseSummary(pause)}`;
+  else line = `${armed} armed of ${crons.length}`;
+
+  const held = crons.filter((c) => c.isDelayed).length;
+  if (held) line += ` · ${held} waiting on usage`;
+  if (pause.paused && pause.droppedCount) {
+    line += ` · ${pause.droppedCount} trigger${pause.droppedCount === 1 ? '' : 's'} dropped`;
+  }
+  sub(line);
+
   if (!crons.length) {
-    view.replaceChildren(
-      head,
+    panel.replaceChildren(
       el('div', { class: 'panel' }, [
         el('div', { class: 'empty' }, [
           el('p', { text: 'No crons yet.' }),
@@ -407,8 +530,8 @@ async function renderHome() {
     return;
   }
 
-  const rows = crons.map((cron) => {
-    return el('tr', {}, [
+  const rows = crons.map((cron) =>
+    el('tr', {}, [
       el('td', {}, [
         el('div', { class: 'cron-name', text: cron.name }),
         cron.description ? el('div', { class: 'cron-desc', text: cron.description }) : null,
@@ -426,37 +549,7 @@ async function renderHome() {
       el('td', { class: 'hide-sm' }, [
         cron.isRunning ? runtimePill(cron.currentRun?.startedAt) : outcomePill(cron.lastRunStatus),
       ]),
-      el('td', { class: 'hide-sm' }, [
-        cron.isDelayed
-          ? el('div', { title: delayTitle(cron.delayed) }, [
-              el('div', { text: cron.delayed.resumeAt ? fmtRelative(cron.delayed.resumeAt) : 'when usage clears' }),
-              el('div', {
-                class: 'cron-desc',
-                text: cron.delayed.resumeAt
-                  ? fmtDateTime(cron.delayed.resumeAt)
-                  : `held for ${delayNames(cron.delayed)}`,
-              }),
-            ])
-          : cron.nextRunAt
-          ? // A pause leaves the schedule registered, so this time is real — it
-            // is when the trigger arrives and is thrown away, not when it runs.
-            el(
-              'div',
-              {
-                title: pause.paused
-                  ? 'Every schedule is paused, so this trigger is dropped when it arrives. A pause misses runs, it does not queue them.'
-                  : null,
-              },
-              [
-                el('div', { text: fmtRelative(cron.nextRunAt) }),
-                el('div', {
-                  class: 'cron-desc',
-                  text: pause.paused ? `${fmtDateTime(cron.nextRunAt)} · dropped` : fmtDateTime(cron.nextRunAt),
-                }),
-              ],
-            )
-          : el('span', { class: 'muted', text: cron.isActive ? 'not scheduled' : 'deactivated' }),
-      ]),
+      el('td', { class: 'hide-sm' }, [nextRunCell(cron, pause)]),
       el('td', {}, [
         el('div', { class: 'row-actions' }, [
           runControl(cron, { small: true, pause }),
@@ -464,11 +557,10 @@ async function renderHome() {
           el('a', { class: 'btn small', href: `#/logs/${cron.id}`, text: 'View logs' }),
         ]),
       ]),
-    ]);
-  });
+    ]),
+  );
 
-  view.replaceChildren(
-    head,
+  panel.replaceChildren(
     el('div', { class: 'panel' }, [
       el('table', {}, [
         el('thead', {}, [
@@ -485,6 +577,206 @@ async function renderHome() {
       ]),
     ]),
   );
+}
+
+/** The Next run cell: a held trigger, a real schedule, or nothing to say. */
+function nextRunCell(cron, pause) {
+  if (cron.isDelayed) {
+    return el('div', { title: delayTitle(cron.delayed) }, [
+      el('div', { text: cron.delayed.resumeAt ? fmtRelative(cron.delayed.resumeAt) : 'when usage clears' }),
+      el('div', {
+        class: 'cron-desc',
+        text: cron.delayed.resumeAt ? fmtDateTime(cron.delayed.resumeAt) : `held for ${delayNames(cron.delayed)}`,
+      }),
+    ]);
+  }
+  if (!cron.nextRunAt) return el('span', { class: 'muted', text: cron.isActive ? 'not scheduled' : 'deactivated' });
+  // A pause leaves the schedule registered, so this time is real — it is when
+  // the trigger arrives and is thrown away, not when it runs.
+  return el(
+    'div',
+    {
+      title: pause.paused
+        ? 'Every schedule is paused, so this trigger is dropped when it arrives. A pause misses runs, it does not queue them.'
+        : null,
+    },
+    [
+      el('div', { text: fmtRelative(cron.nextRunAt) }),
+      el('div', {
+        class: 'cron-desc',
+        text: pause.paused ? `${fmtDateTime(cron.nextRunAt)} · dropped` : fmtDateTime(cron.nextRunAt),
+      }),
+    ],
+  );
+}
+
+/**
+ * The One-time Execution tab: the ten most recent, newest first, and a button
+ * that loads ten more.
+ *
+ * A one-time execution that has run stays here as history. It can be run again
+ * by hand, and a save that moves its date arms it afresh; nothing re-fires it
+ * on its own.
+ */
+async function paintExecutions(panel, pause, sub) {
+  const page = await api(`/api/executions?limit=${executionsState.limit}`);
+  const executions = page.items;
+
+  let line;
+  if (!page.total) line = 'Nothing scheduled yet';
+  else if (pause.paused && pause.mode === 'update') line = pauseSummary(pause);
+  else if (pause.paused) line = `${page.scheduled} scheduled of ${page.total} — ${pauseSummary(pause)}`;
+  else line = `${page.scheduled} scheduled of ${page.total}`;
+
+  const held = executions.filter((execution) => execution.isDelayed).length;
+  if (held) line += ` · ${held} waiting on usage`;
+  sub(line);
+
+  if (!page.total) {
+    panel.replaceChildren(
+      el('div', { class: 'panel' }, [
+        el('div', { class: 'empty' }, [
+          el('p', { text: 'No one-time executions yet.' }),
+          el('p', {
+            class: 'cron-desc',
+            text: 'A one-time execution is a prompt with a date instead of a schedule. It runs once, then stays here as history.',
+          }),
+          el('a', { class: 'btn primary', href: '#/one-time/new', text: 'Schedule your first one' }),
+        ]),
+      ]),
+    );
+    return;
+  }
+
+  const rows = executions.map((execution) =>
+    el('tr', {}, [
+      el('td', {}, [
+        el('div', { class: 'cron-name', text: execution.name }),
+        execution.description ? el('div', { class: 'cron-desc', text: execution.description }) : null,
+        el('div', { class: 'cron-desc mono', text: 'one-time' }),
+      ]),
+      el('td', {}, [executionPill(execution, pause)]),
+      el('td', { class: 'hide-sm' }, [
+        execution.lastRunAt
+          ? el('div', {}, [
+              el('div', { text: fmtRelative(execution.lastRunAt) }),
+              el('div', { class: 'cron-desc', text: fmtDateTime(execution.lastRunAt) }),
+            ])
+          : el('span', { class: 'muted', text: 'never' }),
+      ]),
+      el('td', { class: 'hide-sm' }, [
+        execution.isRunning ? runtimePill(execution.currentRun?.startedAt) : outcomePill(execution.lastRunStatus),
+      ]),
+      el('td', { class: 'hide-sm' }, [scheduledCell(execution, pause)]),
+      el('td', {}, [
+        el('div', { class: 'row-actions' }, [
+          runControl(execution, { small: true, pause }),
+          rearmControl(execution),
+          el('a', { class: 'btn small', href: `#/one-time/edit/${execution.id}`, text: 'Edit' }),
+          el('a', { class: 'btn small', href: `#/one-time/logs/${execution.id}`, text: 'View logs' }),
+        ]),
+      ]),
+    ]),
+  );
+
+  const more = page.nextBefore
+    ? el('div', { class: 'load-more' }, [
+        el('button', {
+          class: 'btn',
+          text: `Load ${executionsState.pageSize} older`,
+          onclick: (event) => {
+            event.target.disabled = true;
+            event.target.textContent = 'Loading…';
+            executionsState.limit += executionsState.pageSize;
+            renderHome('executions').catch(() => {});
+          },
+        }),
+        el('span', { class: 'cron-desc', text: `Showing ${executions.length} of ${page.total}` }),
+      ])
+    : executions.length > executionsState.pageSize
+      ? el('div', { class: 'load-more' }, [el('span', { class: 'cron-desc', text: `All ${page.total} shown` })])
+      : null;
+
+  panel.replaceChildren(
+    el('div', { class: 'panel' }, [
+      el('table', {}, [
+        el('thead', {}, [
+          el('tr', {}, [
+            el('th', { text: 'Name' }),
+            el('th', { text: 'Status' }),
+            el('th', { class: 'hide-sm', text: 'Last ran' }),
+            el('th', { class: 'hide-sm', text: 'Outcome' }),
+            el('th', { class: 'hide-sm', text: 'Scheduled for' }),
+            el('th', {}, ''),
+          ]),
+        ]),
+        el('tbody', {}, rows),
+      ]),
+      more,
+    ]),
+  );
+}
+
+/** When a one-time execution goes, or when it went and what became of it. */
+function scheduledCell(execution, pause) {
+  if (execution.isDelayed) {
+    return el('div', { title: delayTitle(execution.delayed) }, [
+      el('div', { text: execution.delayed.resumeAt ? fmtRelative(execution.delayed.resumeAt) : 'when usage clears' }),
+      el('div', {
+        class: 'cron-desc',
+        text: execution.delayed.resumeAt ? fmtDateTime(execution.delayed.resumeAt) : `held for ${delayNames(execution.delayed)}`,
+      }),
+    ]);
+  }
+  const when = el('div', { text: fmtDateTime(execution.scheduledAt) ?? '—' });
+  if (execution.status !== 'scheduled' || !execution.isActive) {
+    const note =
+      !execution.isActive
+        ? 'deactivated'
+        : execution.status === 'cancelled'
+          ? `dropped by ${execution.stoppedBy ?? 'the user'}`
+          : execution.status === 'running'
+            ? 'running now'
+            : 'already run';
+    return el('div', {}, [when, el('div', { class: 'cron-desc', text: note })]);
+  }
+  return el(
+    'div',
+    {
+      title: pause.paused
+        ? 'Everything is paused. This one waits, and runs when the pause lifts.'
+        : null,
+    },
+    [
+      el('div', { text: execution.isOverdue ? 'overdue' : fmtRelative(execution.scheduledAt) }),
+      el('div', { class: 'cron-desc', text: fmtDateTime(execution.scheduledAt) }),
+    ],
+  );
+}
+
+/**
+ * Puts a finished or cancelled execution back on its own date, when that date
+ * has not passed yet. Anything else is an edit, which the form already does.
+ */
+function rearmControl(execution) {
+  if (execution.isRunning || execution.isDelayed) return null;
+  if (execution.status === 'scheduled') return null;
+  if (Date.parse(execution.scheduledAt ?? '') <= Date.now()) return null;
+  return el('button', {
+    class: 'btn small',
+    text: 'Reschedule',
+    title: `Arm it again for ${fmtDateTime(execution.scheduledAt)}.`,
+    onclick: async (event) => {
+      event.target.disabled = true;
+      try {
+        await api(`/api/executions/${execution.id}/rearm`, { method: 'POST' });
+        toast(`"${execution.name}" is scheduled again`);
+      } catch (err) {
+        toast(err.message, true);
+        event.target.disabled = false;
+      }
+    },
+  });
 }
 
 // ---- edit / create ---------------------------------------------------
@@ -822,7 +1114,7 @@ function usageDelayPicker(selected) {
     class: 'hint',
     text:
       'A ticked limit that is spent makes the run wait instead of starting, Run now included. ' +
-      'It starts when usage clears, within about 5 minutes. Only one run waits per cron; any ' +
+      'It starts when usage clears, within about 5 minutes. Only one run waits at a time; any ' +
       'trigger that arrives while it waits is dropped.',
   });
 
@@ -850,6 +1142,91 @@ function usageDelayPicker(selected) {
     read: () => Object.fromEntries([...boxes].map(([id, box]) => [id, box.checked])),
     field: el('div', { class: 'field' }, [el('label', { text: 'Delay for usage' }), grid, note]),
   };
+}
+
+/**
+ * Wraps the date field in the same live feedback the Cron field gets: presets
+ * for the times you actually pick, and a line saying how far off it is.
+ *
+ * The field is a plain datetime-local, so what you type is your own clock. The
+ * server stores it as UTC, which is why the note under it reads the time back.
+ */
+function scheduledAtPicker(input) {
+  const preview = el('div', { class: 'hint' });
+
+  const update = () => {
+    const raw = input.value.trim();
+    if (!raw) {
+      preview.textContent = '';
+      preview.className = 'hint';
+      return;
+    }
+    const at = new Date(raw);
+    if (Number.isNaN(at.getTime())) {
+      preview.textContent = 'That is not a date this browser understands.';
+      preview.className = 'hint warn';
+      return;
+    }
+    if (at.getTime() <= Date.now()) {
+      // Allowed on purpose: the same rule that runs a trigger missed over a
+      // restart runs this one the moment it is saved.
+      preview.textContent = `That time has passed — saving this runs it now (${fmtDateTime(at.toISOString())}).`;
+      preview.className = 'hint warn';
+      return;
+    }
+    preview.textContent = `Runs ${fmtRelative(at.toISOString())} · ${fmtDateTime(at.toISOString())}`;
+    preview.className = 'hint ok';
+  };
+
+  input.addEventListener('input', update);
+  input.addEventListener('change', update);
+
+  /** Local time in the shape datetime-local wants, which is not toISOString. */
+  const asFieldValue = (date) => {
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  };
+
+  const inMinutes = (label, minutes, title) =>
+    el('button', {
+      type: 'button',
+      class: 'btn small',
+      text: label,
+      title,
+      onclick: () => {
+        input.value = asFieldValue(new Date(Date.now() + minutes * 60000));
+        update();
+      },
+    });
+
+  const tomorrowAt = el('input', { type: 'time', class: 'time-entry', value: '09:00' });
+  const applyTomorrow = () => {
+    const [hours, minutes] = tomorrowAt.value.split(':');
+    if (hours === undefined || minutes === undefined) return;
+    const date = new Date();
+    date.setDate(date.getDate() + 1);
+    date.setHours(Number(hours), Number(minutes), 0, 0);
+    input.value = asFieldValue(date);
+    update();
+  };
+  tomorrowAt.addEventListener('change', applyTomorrow);
+
+  update();
+
+  return el('div', { class: 'field' }, [
+    el('label', { text: 'Runs at' }),
+    input,
+    el('div', { class: 'preset-row' }, [
+      inMinutes('+1hr', 60, 'One hour from now'),
+      inMinutes('+4hr', 240, 'Four hours from now'),
+      el('span', { class: 'preset-sep' }),
+      el('span', { class: 'preset-label', text: 'Tomorrow at' }),
+      tomorrowAt,
+      el('button', { type: 'button', class: 'btn small', text: 'Set', onclick: applyTomorrow }),
+    ]),
+    el('div', { class: 'hint', text: 'Your local time. It runs once, then stays in the list as history.' }),
+    preview,
+  ]);
 }
 
 /**
@@ -965,6 +1342,143 @@ async function renderForm(id, duplicateOf) {
         el('button', { class: 'btn primary', type: 'submit', text: 'Save' }),
         el('a', { class: 'btn', href: '#/', text: 'Cancel' }),
         id ? el('a', { class: 'btn', href: `#/new/${id}`, text: 'Duplicate' }) : null,
+        el('div', { class: 'spacer' }),
+        id ? el('button', { class: 'btn danger', type: 'button', text: 'Delete', onclick: remove }) : null,
+      ]),
+    ]),
+  );
+}
+
+/**
+ * The one-time execution form: the cron form with a date where the schedule
+ * was, and everything else identical — working directory, model, effort, the
+ * usage delay, the prompt.
+ */
+async function renderExecutionForm(id, duplicateOf) {
+  const sourceId = id ?? duplicateOf;
+  const execution = sourceId ? await api(`/api/executions/${sourceId}`) : null;
+  const errorBox = el('div', { class: 'error', hidden: 'hidden' });
+
+  /** An ISO time in the shape the datetime-local field wants: local, no zone. */
+  const asFieldValue = (iso) => {
+    const date = iso ? new Date(iso) : new Date(Date.now() + 3600000);
+    if (Number.isNaN(date.getTime())) return '';
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  };
+
+  const inputs = {
+    name: el('input', {
+      type: 'text',
+      value: duplicateOf ? `${execution.name} - Duplicate` : (execution?.name ?? ''),
+      placeholder: 'Backfill the September invoices',
+      maxlength: '120',
+    }),
+    description: el('input', {
+      type: 'text',
+      value: execution?.description ?? '',
+      placeholder: 'What this run is for',
+    }),
+    scheduledAt: el('input', {
+      type: 'datetime-local',
+      class: 'mono',
+      // A duplicate of something already run gets a fresh default rather than
+      // the source's date, which is in the past and would fire on save.
+      value: asFieldValue(duplicateOf ? null : execution?.scheduledAt),
+    }),
+    workingDirectory: el('input', {
+      type: 'text',
+      class: 'mono',
+      value: execution ? (execution.workingDirectory ?? '') : '~/',
+      placeholder: '~/code/project',
+      autocomplete: 'off',
+      spellcheck: 'false',
+    }),
+    prompt: el('textarea', { placeholder: 'The prompt passed to claude -p' }),
+    isActive: el('input', { type: 'checkbox' }),
+  };
+  inputs.prompt.value = execution?.prompt ?? '';
+  inputs.isActive.checked = execution ? Boolean(execution.isActive) : true;
+
+  const model = modelPicker(execution?.model ?? '');
+  const effort = effortPicker(execution?.effort ?? '');
+  const usageDelay = usageDelayPicker(execution?.usageDelay ?? null);
+
+  const showError = (message) => {
+    errorBox.textContent = message;
+    errorBox.hidden = false;
+    errorBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  const save = async (event) => {
+    event.preventDefault();
+    errorBox.hidden = true;
+    const typed = inputs.scheduledAt.value.trim();
+    const payload = {
+      name: inputs.name.value,
+      description: inputs.description.value,
+      // Sent as a full instant rather than the field's bare local string, so
+      // the server is not left guessing which clock it was typed on.
+      scheduledAt: typed ? new Date(typed).toISOString() : '',
+      workingDirectory: inputs.workingDirectory.value,
+      model: model.read(),
+      effort: effort.read(),
+      usageDelay: usageDelay.read(),
+      prompt: inputs.prompt.value,
+      isActive: inputs.isActive.checked,
+    };
+    if (typed && Number.isNaN(new Date(typed).getTime())) return showError('Date and time is not a valid date.');
+    try {
+      if (id) await api(`/api/executions/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+      else await api('/api/executions', { method: 'POST', body: JSON.stringify(payload) });
+      toast(id ? 'Saved' : 'One-time execution created');
+      location.hash = '#/one-time';
+    } catch (err) {
+      showError(err.message);
+    }
+  };
+
+  const remove = async () => {
+    if (!confirm(`Delete "${execution.name}"? Its log history is kept on disk.`)) return;
+    try {
+      await api(`/api/executions/${id}`, { method: 'DELETE' });
+      toast('One-time execution deleted');
+      location.hash = '#/one-time';
+    } catch (err) {
+      showError(err.message);
+    }
+  };
+
+  const field = (label, input, hint) =>
+    el('div', { class: 'field' }, [
+      el('label', { text: label }),
+      input,
+      hint ? el('div', { class: 'hint', text: hint }) : null,
+    ]);
+
+  view.replaceChildren(
+    el('div', { class: 'breadcrumb' }, [el('a', { href: '#/one-time', text: '← All one-time executions' })]),
+    el('div', { class: 'page-head' }, [
+      el('div', {}, [
+        el('h1', { text: id ? 'Edit one-time execution' : duplicateOf ? 'Duplicate one-time execution' : 'New one-time execution' }),
+        el('p', { class: 'sub', text: 'Runs claude -p with the prompt below, once, at the time you set.' }),
+      ]),
+    ]),
+    el('form', { class: 'card', onsubmit: save }, [
+      errorBox,
+      field('Name', inputs.name),
+      field('Description', inputs.description),
+      scheduledAtPicker(inputs.scheduledAt),
+      directoryPicker(inputs.workingDirectory),
+      model.field,
+      effort.field,
+      usageDelay.field,
+      field('Prompt', inputs.prompt),
+      el('label', { class: 'check' }, [inputs.isActive, 'Is Active']),
+      el('div', { class: 'form-actions' }, [
+        el('button', { class: 'btn primary', type: 'submit', text: 'Save' }),
+        el('a', { class: 'btn', href: '#/one-time', text: 'Cancel' }),
+        id ? el('a', { class: 'btn', href: `#/one-time/new/${id}`, text: 'Duplicate' }) : null,
         el('div', { class: 'spacer' }),
         id ? el('button', { class: 'btn danger', type: 'button', text: 'Delete', onclick: remove }) : null,
       ]),
@@ -1178,6 +1692,7 @@ async function renderSettings() {
       el('h2', { text: 'Storage' }),
       readOnly('Storage root', config.storageRoot),
       readOnly('Crons', config.cronsDir),
+      readOnly('One-time executions', config.executionsDir),
       readOnly('Logs', `${config.logsDir} (newest ${config.maxLogsPerCron} runs kept per cron)`),
       readOnly(
         'Notifications',
@@ -1198,7 +1713,7 @@ async function renderSettings() {
 
 // ---- logs -------------------------------------------------------------
 
-const logsState = { cronId: null, selected: null, atBottom: true };
+const logsState = { cronId: null, kind: 'cron', selected: null, atBottom: true };
 
 /**
  * Lifetime totals for one cron, drawn under its name on the logs page.
@@ -1243,9 +1758,16 @@ function statStrip(stats) {
   ]);
 }
 
-async function renderLogs(id) {
-  const [{ cron, logs, stats }, pause] = await Promise.all([api(`/api/crons/${id}/logs`), api('/api/pause')]);
+/**
+ * The run history of one job, cron or one-time execution. Both write into the
+ * same logs folder under their own id, so this page is the same page; only the
+ * route it reads and the crumb it goes back to differ.
+ */
+async function renderLogs(id, kind = 'cron') {
+  const base = kind === 'execution' ? 'executions' : 'crons';
+  const [{ cron, logs, stats }, pause] = await Promise.all([api(`/api/${base}/${id}/logs`), api('/api/pause')]);
   logsState.cronId = id;
+  logsState.kind = kind;
 
   // Default to the live run if there is one, else the newest run.
   if (!logsState.selected || !logs.some((log) => log.file === logsState.selected)) {
@@ -1264,7 +1786,7 @@ async function renderLogs(id) {
               onclick: () => {
                 logsState.selected = log.file;
                 logsState.atBottom = true;
-                renderLogs(id);
+                renderLogs(id, kind);
               },
             },
             [
@@ -1308,7 +1830,7 @@ async function renderLogs(id) {
       selectedLog
         ? el('a', {
             class: 'btn small',
-            href: `/api/crons/${id}/logs/${encodeURIComponent(selectedLog.file)}`,
+            href: `/api/${base}/${id}/logs/${encodeURIComponent(selectedLog.file)}`,
             target: '_blank',
             text: 'Raw',
           })
@@ -1317,19 +1839,30 @@ async function renderLogs(id) {
     body,
   ]);
 
+  const scheduleLine =
+    kind === 'execution'
+      ? `Scheduled for ${fmtDateTime(cron.scheduledAt) ?? 'an unreadable date'}.`
+      : '';
+
   view.replaceChildren(
-    el('div', { class: 'breadcrumb' }, [el('a', { href: '#/', text: '← All crons' })]),
+    el('div', { class: 'breadcrumb' }, [
+      kind === 'execution'
+        ? el('a', { href: '#/one-time', text: '← All one-time executions' })
+        : el('a', { href: '#/', text: '← All crons' }),
+    ]),
     el('div', { class: 'page-head' }, [
       el('div', {}, [
         el('h1', { text: `Logs · ${cron.name}` }),
         el('p', {
           class: 'sub',
-          text: `${logs.length} run${logs.length === 1 ? '' : 's'} kept, newest first. Oldest are pruned past 50.`,
+          text: `${scheduleLine}${scheduleLine ? ' ' : ''}${logs.length} run${logs.length === 1 ? '' : 's'} kept, newest first. Oldest are pruned past 50.`,
         }),
         statStrip(stats),
       ]),
       el('div', { class: 'row-actions' }, [
-        el('a', { class: 'btn', href: `#/edit/${cron.id}`, text: 'Edit cron' }),
+        kind === 'execution'
+          ? el('a', { class: 'btn', href: `#/one-time/edit/${cron.id}`, text: 'Edit execution' })
+          : el('a', { class: 'btn', href: `#/edit/${cron.id}`, text: 'Edit cron' }),
         runControl(cron, {
           pause,
           onStarted: () => {
@@ -1341,7 +1874,7 @@ async function renderLogs(id) {
     el('div', { class: 'logs-layout' }, [runList, panel]),
   );
 
-  if (logsState.selected) openLogStream(id, logsState.selected, body, liveBadge, runtimeEl);
+  if (logsState.selected) openLogStream(id, logsState.selected, body, liveBadge, runtimeEl, base);
 }
 
 /**
@@ -1356,13 +1889,13 @@ function durationFromLog(text) {
 }
 
 /** Streams one log file into the pre element, appending chunks as they arrive. */
-function openLogStream(cronId, file, body, liveBadge, runtimeEl) {
+function openLogStream(cronId, file, body, liveBadge, runtimeEl, base = 'crons') {
   closeLogStream();
   body.textContent = '';
   liveBadge.textContent = 'streaming';
   liveBadge.className = 'pill running';
 
-  const stream = new EventSource(`/api/crons/${cronId}/logs/${encodeURIComponent(file)}/stream`);
+  const stream = new EventSource(`/api/${base}/${cronId}/logs/${encodeURIComponent(file)}/stream`);
   logStream = stream;
 
   stream.addEventListener('chunk', (event) => {
@@ -1397,19 +1930,35 @@ function closeLogStream() {
 
 // ---- routing ----------------------------------------------------------
 
+/**
+ * The hash, split into what it is asking for.
+ *
+ * One-time executions hang off a `one-time` prefix — `#/one-time/edit/:id` —
+ * so the two kinds have parallel URLs and every page of either is linkable.
+ */
+function parseHash() {
+  const parts = (location.hash.replace(/^#/, '') || '/').split('/').filter(Boolean);
+  if (parts[0] === 'one-time') return { kind: 'execution', section: parts[1] ?? 'list', id: parts[2] ?? null };
+  return { kind: 'cron', section: parts[0] ?? 'list', id: parts[1] ?? null };
+}
+
 async function route() {
-  const hash = location.hash.replace(/^#/, '') || '/';
   closeLogStream();
   clearTimeout(modelPollTimer);
   clearTimeout(reloadTimer);
   clearTimeout(updateWatchTimer);
-  const [, section, id] = hash.split('/');
+  const { kind, section, id } = parseHash();
   try {
     if (section === 'settings') await renderSettings();
-    else if (section === 'new') await renderForm(null, id || null);
+    else if (kind === 'execution') {
+      if (section === 'new') await renderExecutionForm(null, id || null);
+      else if (section === 'edit' && id) await renderExecutionForm(id);
+      else if (section === 'logs' && id) await renderLogs(id, 'execution');
+      else await renderHome('executions');
+    } else if (section === 'new') await renderForm(null, id || null);
     else if (section === 'edit' && id) await renderForm(id);
     else if (section === 'logs' && id) await renderLogs(id);
-    else await renderHome();
+    else await renderHome('crons');
   } catch (err) {
     view.replaceChildren(
       el('div', { class: 'breadcrumb' }, [el('a', { href: '#/', text: '← All crons' })]),
@@ -1420,13 +1969,12 @@ async function route() {
 
 /** Re-renders the current view when the server reports activity. */
 function refreshCurrentView() {
-  const hash = location.hash.replace(/^#/, '') || '/';
-  const [, section, id] = hash.split('/');
+  const { kind, section, id } = parseHash();
   if (section === 'logs' && id) {
     // Keep the open stream; only the run list and header need refreshing.
-    renderLogs(id).catch(() => {});
-  } else if (!section || section === '') {
-    renderHome().catch(() => {});
+    renderLogs(id, kind).catch(() => {});
+  } else if (section === 'list') {
+    renderHome(kind === 'execution' ? 'executions' : 'crons').catch(() => {});
   }
 }
 
@@ -1461,22 +2009,31 @@ function connectEvents() {
   for (const type of ['crons:changed', 'run:started', 'run:finished', 'run:skipped', 'run:stopping', 'run:delayed', 'run:released', 'run:dropped']) {
     events.addEventListener(type, (event) => {
       const payload = JSON.parse(event.data);
-      if (type === 'run:finished') toast(`"${payload.cronName}" ${payload.status} in ${payload.seconds}s`);
+      // Matches the wording the server writes into the notification drawer.
+      const named = payload.kind === 'execution' ? `one-time "${payload.cronName}"` : `"${payload.cronName}"`;
+      // Matches the drawer: a run with no footer has no duration to report.
+      if (type === 'run:finished') {
+        toast(
+          Number.isFinite(payload.seconds)
+            ? `${named} ${payload.status} in ${payload.seconds}s`
+            : `${named} ${payload.status}`,
+        );
+      }
       if (type === 'run:delayed') {
         const when = payload.resumeAt ? ` Starts ${fmtRelative(payload.resumeAt)}.` : '';
-        toast(`"${payload.cronName}" is waiting on ${delayNames(payload)}.${when}`, true);
+        toast(`${named} is waiting on ${delayNames(payload)}.${when}`, true);
       }
       // Only the release that actually starts the run is worth a toast; a
       // cancelled or dropped one already reported itself where it happened.
-      if (type === 'run:released' && payload.ran) toast(`"${payload.cronName}" usage cleared, starting now`);
+      if (type === 'run:released' && payload.ran) toast(`${named} usage cleared, starting now`);
       if (type === 'run:dropped') {
         // A pause is missed time, not queued time, so the count says how many
         // runs this cron has now lost rather than how many are waiting.
         const sofar = payload.droppedCount > 1 ? ` (${payload.droppedCount} missed so far)` : '';
-        toast(`"${payload.cronName}" trigger dropped: ${payload.reason}${sofar}`, true, `dropped:${payload.cronId}`);
+        toast(`${named} trigger dropped: ${payload.reason}${sofar}`, true, `dropped:${payload.cronId}`);
       }
       if (type === 'run:skipped') {
-        toast(payload.reason ? `"${payload.cronName}" skipped: ${payload.reason}` : `"${payload.cronName}" was still running; trigger skipped`, true);
+        toast(payload.reason ? `${named} skipped: ${payload.reason}` : `${named} was still running; trigger skipped`, true);
       }
       refreshCurrentView();
     });
@@ -1502,6 +2059,14 @@ function connectEvents() {
   });
 
   // Cron files changed on disk outside the app: one toast per file, then redraw.
+  // A one-time execution whose trigger was missed: the catch-up is starting it
+  // now, which is worth saying out loud since nobody asked for it just then.
+  events.addEventListener('execution:overdue', (event) => {
+    const payload = JSON.parse(event.data);
+    toast(`One-time "${payload.cronName}" missed its trigger by ${payload.lateBy}; running now`);
+    refreshCurrentView();
+  });
+
   events.addEventListener('crons:files-changed', (event) => {
     const { added = [], updated = [], removed = [], broken = [], repaired = [] } = JSON.parse(event.data);
     for (const name of added) toast(`Cron file added: "${name}", now scheduled`);
@@ -1585,12 +2150,13 @@ function renderNotification(record) {
       el('div', { class: 'note-meta', text: meta }),
     ]),
   ]);
-  // A notification about a cron is a shortcut to that cron's runs.
+  // A notification about a job is a shortcut to that job's runs, on whichever
+  // of the two logs pages it belongs to.
   if (record.cronId) {
     node.classList.add('linked');
     node.addEventListener('click', () => {
       closeDrawer();
-      location.hash = `#/logs/${record.cronId}`;
+      location.hash = record.jobKind === 'execution' ? `#/one-time/logs/${record.cronId}` : `#/logs/${record.cronId}`;
     });
   }
   return node;
@@ -2090,9 +2656,11 @@ setInterval(tickRuntimes, 1000);
 // Cheap, and a restart is exactly when the running commit changes.
 setInterval(checkHealth, 20000);
 // Keeps "3m ago" / "in 20m" honest without hammering the API.
+// Keeps "in 20m" honest on whichever list is open. Both tabs are a `list`
+// section, so this has to read the hash the way the router does rather than
+// assume the home page is the one with nothing after the slash.
 setInterval(() => {
-  const [, section] = (location.hash.replace(/^#/, '') || '/').split('/');
-  if (!section) renderHome().catch(() => {});
+  if (parseHash().section === 'list') refreshCurrentView();
 }, 15000);
 
 checkHealth();

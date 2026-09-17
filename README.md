@@ -1,11 +1,13 @@
 # Claude Conductor
 
-Schedule Claude prompts and watch them run. A small Node.js server holds a set of crons, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/claude-conductor`.
+Schedule Claude prompts and watch them run. A small Node.js server holds a set of crons and one-time executions, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/claude-conductor`.
 
+- Two tabs on the home page: **Crons**, which run on a schedule, and **One-time Execution**, which run once at a date you pick.
 - Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
 - Follow a run's output as it is produced, or read back any of the last 50 runs per cron.
 - Stop a run in progress. The schedule stays armed for its next trigger.
-- Pause every schedule for 15 minutes, an hour, 6 hours, or until the next restart.
+- Pause everything for 15 minutes, an hour, 6 hours, or until the next restart — crons and one-time executions together.
+- A one-time execution survives a restart. If its moment passed while the server was down, it runs as soon as the server is back.
 - Hold a cron until your Claude usage resets, per limit, instead of firing it into a spent quota.
 - Choose the model per cron, from whatever the installed CLI recognises.
 - Every finished run records the model, runtime, tokens and cost that the CLI reported.
@@ -160,9 +162,36 @@ Model discovery is slower on the first run after login, around 14 seconds agains
 - **`brew services`** manages Homebrew formulae, not arbitrary projects.
 - Running `npm start` in a terminal remains fine for occasional use; it stops when the terminal closes.
 
+## One-time executions
+
+The **One-time Execution** tab holds prompts that run once, at a date and time you pick, instead of on a repeating schedule. Everything else about them is a cron: the same working directory, model, effort, usage delay, prompt, `Is Active` checkbox, prompt preamble, log, statistics block and Stop button.
+
+The form is the cron form with **Runs at** where the Cron field was: a date and time in your local clock, with `+1hr`, `+4hr` and a *Tomorrow at* shortcut. The server stores it as UTC.
+
+The list shows the ten most recent, newest first, and **Load 10 older** goes back through the rest. A finished one stays in the list as history, so the tab is both what is coming and what has already gone.
+
+### Its life
+
+| Status      | What it means                                                                 |
+| ----------- | ----------------------------------------------------------------------------- |
+| `scheduled` | Armed, waiting for its date                                                   |
+| `running`   | Its run is in flight                                                          |
+| `done`      | It has had its run. The Outcome column says how that run ended                |
+| `cancelled` | Its trigger was waiting on usage and you dropped it with **Stop**             |
+
+`done` and `cancelled` are ends: nothing re-fires on its own. Two things arm one again — **Run now**, which runs it on the spot, and a save that moves its date, which puts it back to `scheduled`. **Reschedule** appears on a finished one whose date is still in the future and arms it again without opening the form.
+
+### A trigger that was missed
+
+A one-time execution has no second chance the way a cron does, so a missed trigger is made up rather than lost. On boot, and whenever a pause lifts, anything still `scheduled` whose time has passed is run immediately. It goes through the same door as any other trigger: the pause, the usage delay and the already-running check all apply, and several due at once are run one after another rather than all at once.
+
+Saving one with a time already in the past is allowed for the same reason, and the form says so before you save: *That time has passed — saving this runs it now.*
+
+A run the server was restarted out from under is a different thing. On boot it is closed as `interrupted` rather than started again — the work may have been half done, and re-running something because the machine rebooted is worse than leaving it for the **Run now** button.
+
 ## Pausing every cron
 
-**Pause for…** sits to the left of **+ New cron** on the home page. Pick a length and every schedule is held at once:
+**Pause for…** sits above the tabs on the home page, because it is not a property of either list: one pause holds every cron and every one-time execution at once. Pick a length:
 
 | Option        | Held until                                     |
 | ------------- | ---------------------------------------------- |
@@ -181,8 +210,9 @@ What a pause does and does not do:
 4. **Nothing new starts, by hand either.** **Run now** is disabled on the home page and the logs page, and says why on hover; `POST /api/crons/:id/run` answers 409. **Stop** is never disabled, so a run already going can always be ended.
 5. **Deactivated crons stay `deactivated`.** A pause is not the cron's own `isActive` setting, and lifting the pause will not arm something you turned off.
 6. **It is never written to disk.** A restart always comes back unpaused, with every active cron armed again — which is why `Until restart` means what it says.
+7. **A one-time execution waits rather than losing its turn.** A cron dropped during a pause has another trigger coming; a one-time execution does not. So one whose moment passes while paused stays `scheduled`, reads `held`, and runs as soon as the pause lifts.
 
-When the time is up, or you cancel, the crons are re-read from disk and re-armed, so any edit made during the pause takes effect.
+When the time is up, or you cancel, the crons and one-time executions are re-read from disk and re-armed, so any edit made during the pause takes effect.
 
 ## Delaying a cron for usage
 
@@ -315,8 +345,10 @@ The paths in use are listed on the Settings page, under **Storage**.
 ~/.claude/claude-conductor/
 ├── crons/
 │   └── <uuid>.json                 # one file per cron
+├── executions/
+│   └── <uuid>.json                 # one file per one-time execution
 ├── logs/
-│   ├── <Cron Name>/
+│   ├── <uuid>/
 │   │   └── 2026-09-10T06-11-12.789Z.txt   # one file per run, newest 50 kept
 │   └── update.log                  # appended by the self updater
 ├── notifications/
@@ -350,7 +382,35 @@ A cron file:
 }
 ```
 
-Files are safe to edit or delete by hand — the server polls the folder and picks changes up within a few seconds. See [Editing files by hand](#editing-files-by-hand).
+A one-time execution file is the same shape with `scheduledAt` where `cron` was, plus the state it is in:
+
+```json
+{
+  "id": "b1a72c6c-f9fd-4341-b723-56630c3bf00e",
+  "name": "Backfill September invoices",
+  "description": "",
+  "scheduledAt": "2026-09-20T13:00:00.000Z",
+  "workingDirectory": "/Users/you/code/project",
+  "model": "",
+  "effort": "",
+  "usageDelay": { "session": true, "weekly": false, "fable": false, "credits": false },
+  "prompt": "Backfill the September invoices and write a summary.",
+  "isActive": true,
+  "status": "done",
+  "createdAt": "2026-09-16T23:49:09.652Z",
+  "updatedAt": "2026-09-16T23:49:09.652Z",
+  "firedAt": "2026-09-20T13:00:01.204Z",
+  "lastRunAt": "2026-09-20T13:00:01.204Z",
+  "lastRunStatus": "succeeded",
+  "lastRunLog": "2026-09-20T13-00-01.204Z.txt",
+  "lastRunDurationSeconds": 12.0,
+  "stoppedBy": null
+}
+```
+
+Both kinds write their logs into `logs/` under their own id, so the folder serves the two without a prefix.
+
+Cron files are safe to edit or delete by hand — the server polls that folder and picks changes up within a few seconds. See [Editing files by hand](#editing-files-by-hand). The `executions` folder is **not** polled: it exists partly to keep the watcher's job small, so a one-time execution edited on disk is picked up at the next restart rather than within seconds.
 
 ## Editing files by hand
 
@@ -375,13 +435,15 @@ A file caught mid-write is treated as unchanged rather than deleted, so a save f
 
 ## How a run works
 
-1. The schedule fires, or you press **Run now**.
-2. If the cron has [Delay for usage](#delaying-a-cron-for-usage) boxes ticked, usage is read; the run waits here while any ticked limit is spent.
+This is one path, walked by crons and one-time executions alike.
+
+1. The schedule fires, a one-time execution reaches its date, or you press **Run now**.
+2. If it has [Delay for usage](#delaying-a-cron-for-usage) boxes ticked, usage is read; the run waits here while any ticked limit is spent.
 3. The server spawns `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages` in the cron's working directory.
-4. The assistant's text is pulled out of the event stream and written to `logs/<name>/<start time>.txt` as it arrives, so the log reads as plain output and can be tailed mid-run. stderr goes in verbatim, as does any stdout line that is not JSON (a CLI warning, say).
+4. The assistant's text is pulled out of the event stream and written to `logs/<id>/<start time>.txt` as it arrives, so the log reads as plain output and can be tailed mid-run. stderr goes in verbatim, as does any stdout line that is not JSON (a CLI warning, say).
 5. On exit, the run's statistics block is written, then a footer records the outcome (`succeeded` / `failed` / `stopped`, duration, exit code). Logs beyond the newest 50 for that cron are deleted.
 
-A cron never runs twice at once. If a schedule fires while the previous run is still going, that trigger is skipped and the UI says so.
+Nothing runs twice at once. If a trigger arrives while the previous run is still going, it is skipped and the UI says so.
 
 ## Stopping a run
 
@@ -394,6 +456,8 @@ While a run is in flight, that cron's **Run now** button becomes **Stop**. Stopp
 ```
 
 The run's outcome is recorded as `stopped`, distinct from `succeeded` and `failed`. The schedule is left alone: an active cron stays armed and fires again at its next trigger, so stopping one run never disables the cron. Use the Is Active checkbox for that.
+
+Stopping a one-time execution works the same way and is documented in two places rather than one: the log carries the `stop requested by user` line and the `killed by user` footer, and the record itself keeps `stoppedBy` alongside a `stopped` outcome. The log is pruned eventually; the record is what the list reads. A stopped one-time execution is `done` — it has had its run — and **Run now** will run it again.
 
 **Stop** is also what the button becomes while a trigger is [held for usage](#delaying-a-cron-for-usage). Nothing is running in that case, so there is no process to signal and nothing to log — pressing it throws the waiting trigger away and the cron goes back to `armed`.
 
@@ -632,13 +696,21 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/next-run?cron=`              | Whether an expression parses, and when it next fires                                                                                                                           |
 | GET              | `/api/models`                      | Discovered models, plus whether discovery is running                                                                                                                           |
 | POST             | `/api/models/refresh`              | Re-run discovery                                                                                                                                                               |
+| GET              | `/api/executions?before=&limit=`   | One page of one-time executions, newest first, plus the total, how many are still scheduled, and the cursor for the next page                                                   |
+| POST             | `/api/executions`                  | Create. A `scheduledAt` already in the past is accepted and runs at once                                                                                                       |
+| GET, PUT, DELETE | `/api/executions/:id`              | Read, update, delete. A PUT that moves `scheduledAt` arms it again                                                                                                             |
+| POST             | `/api/executions/:id/rearm`        | Put a finished or cancelled one back to `scheduled` on its own date (409 while it is running)                                                                                   |
+| POST             | `/api/executions/:id/run`          | Same contract as `/api/crons/:id/run`                                                                                                                                          |
+| POST             | `/api/executions/:id/stop`         | Same contract as `/api/crons/:id/stop`                                                                                                                                         |
+| GET              | `/api/executions/:id/logs[/:file[/stream]]` | Same three log routes as a cron's                                                                                                                                     |
 
 ## Notes
 
 - The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
-- A pause lives in memory only. Restarting the server clears it, whichever length was chosen. So does a trigger held for usage: a restart comes back with nothing waiting.
+- A pause lives in memory only. Restarting the server clears it, whichever length was chosen. So does a trigger held for usage: a restart comes back with nothing waiting. A one-time execution is the exception that proves the rule — it is on disk, so a restart finds it and, if its moment has passed, runs it.
+- The `executions` folder is not watched. Hand-edit a one-time execution and it takes effect at the next restart, not within seconds; the crons folder is the polled one.
 - The **Update available** badge reflects the last check, so it can lag a push by up to `updateCheckIntervalHours`. **Check for updates** on the Settings page refreshes it at once.
-- Deleting a cron leaves its logs on disk. Remove `logs/<name>/` by hand if you want them gone — and with the cron file gone, its lifetime totals go with it.
+- Deleting a cron or a one-time execution leaves its logs on disk. Remove `logs/<id>/` by hand if you want them gone — and with the cron file gone, its lifetime totals go with it.
 - Renaming a cron carries its lifetime totals, because they live on the cron file rather than being recounted from the logs.
-- Renaming a cron moves its log folder, so history follows the new name.
+- Renaming a cron moves no logs: the log folder is named for the cron's id, which never changes, so history follows the rename by staying put.

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { bus, sseInit, sseSend } from './events.js';
-import { CRONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
+import { CRONS_DIR, EXECUTIONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
 import { SETTINGS_FILE as SETTINGS_PATH } from './settings.js';
 import {
   EFFORT_LEVELS,
@@ -15,6 +15,16 @@ import {
   previewNextRun,
   validateCronExpression,
 } from './cronService.js';
+import {
+  PAGE_SIZE as EXECUTIONS_PAGE_SIZE,
+  createExecution,
+  deleteExecution,
+  getExecution,
+  pageExecutions,
+  parseScheduledAt,
+  patchExecution,
+  updateExecution,
+} from './executions.js';
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
@@ -82,6 +92,45 @@ function readForm(body) {
   };
 }
 
+/**
+ * Validates and normalizes the one-time execution form payload.
+ *
+ * The same fields as a cron, with a date where the expression was. A date
+ * already in the past is accepted rather than rejected: the same rule that runs
+ * a trigger missed over a restart runs this one as soon as it is saved, and a
+ * form that refused it would be arguing with a clock the user can see.
+ */
+function readExecutionForm(body) {
+  const name = String(body?.name ?? '').trim();
+  const errors = [];
+  if (!name) errors.push('Name is required.');
+  if (name.length > 120) errors.push('Name must be 120 characters or fewer.');
+  const scheduledAt = parseScheduledAt(body?.scheduledAt);
+  if (!String(body?.scheduledAt ?? '').trim()) errors.push('Date and time are required.');
+  else if (!scheduledAt) errors.push('Date and time is not a valid date.');
+  if (!String(body?.prompt ?? '').trim()) errors.push('Prompt is required.');
+  const effort = String(body?.effort ?? '').trim();
+  if (effort && !isEffortLevel(effort)) {
+    errors.push(`Effort must be one of ${EFFORT_LEVELS.map((level) => level.id).join(', ')}.`);
+  }
+  return {
+    errors,
+    value: {
+      name,
+      description: String(body?.description ?? '').trim(),
+      // Stored as UTC ISO, whatever the browser sent, so the record reads the
+      // same wherever it is opened from.
+      scheduledAt: scheduledAt ? scheduledAt.toISOString() : null,
+      workingDirectory: String(body?.workingDirectory ?? '').trim(),
+      model: String(body?.model ?? '').trim(),
+      effort,
+      usageDelay: normalizeUsageDelay(body?.usageDelay),
+      prompt: String(body?.prompt ?? ''),
+      isActive: Boolean(body?.isActive),
+    },
+  };
+}
+
 function decorate(cron) {
   const run = cronService.currentRun(cron.id);
   const delayed = cronService.delayInfo(cron.id);
@@ -98,6 +147,44 @@ function decorate(cron) {
   };
 }
 
+/**
+ * One execution, as the page draws it. `nextRunAt` is the schedule it is still
+ * waiting on, so a record that has already run — or been cancelled — reports
+ * none, whatever its date says.
+ */
+function decorateExecution(execution) {
+  const run = cronService.currentRun(execution.id);
+  const delayed = cronService.delayInfo(execution.id);
+  const armed = execution.isActive && execution.status === 'scheduled';
+  return {
+    ...execution,
+    kind: 'execution',
+    usageDelay: normalizeUsageDelay(execution.usageDelay),
+    nextRunAt: armed ? execution.scheduledAt : null,
+    // Its time has passed and nothing has run it. On the page that is the gap
+    // between the trigger being missed and the catch-up starting the run.
+    isOverdue: armed && Date.parse(execution.scheduledAt ?? '') <= Date.now(),
+    isRunning: Boolean(run),
+    currentRun: run,
+    isDelayed: Boolean(delayed),
+    delayed,
+  };
+}
+
+/** What the route was asked about, for an error message a person reads. */
+function noun(req) {
+  return req.params.kind === 'executions' ? 'execution' : 'cron';
+}
+
+/** Either kind by id, with the routes and helpers each one needs. */
+async function findRecord(id) {
+  const cron = await getCron(id);
+  if (cron) return { record: cron, kind: 'cron', view: decorate };
+  const execution = await getExecution(id);
+  if (execution) return { record: execution, kind: 'execution', view: decorateExecution };
+  return null;
+}
+
 app.get('/api/config', (_req, res) => {
   // USAGE_DELAY_CATEGORIES carries its matcher functions; JSON.stringify drops
   // them, so the page receives exactly the id, label and hint it draws.
@@ -108,6 +195,7 @@ app.get('/api/config', (_req, res) => {
     maxLogsPerCron: MAX_LOGS_PER_CRON,
     notificationsDir: NOTIFICATIONS_DIR,
     maxNotifications: MAX_NOTIFICATIONS,
+    executionsDir: EXECUTIONS_DIR,
     effortLevels: EFFORT_LEVELS,
     usageDelayCategories: USAGE_DELAY_CATEGORIES,
   });
@@ -356,24 +444,106 @@ app.delete('/api/crons/:id', async (req, res, next) => {
   }
 });
 
-app.post('/api/crons/:id/run', async (req, res, next) => {
+/**
+ * One page of one-time executions, newest first, with the same cursor the
+ * notification drawer uses.
+ */
+app.get('/api/executions', async (req, res, next) => {
   try {
-    const cron = await getCron(req.params.id);
-    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const before = String(req.query.before ?? '').trim() || null;
+    const page = await pageExecutions({ before, limit: req.query.limit ?? EXECUTIONS_PAGE_SIZE });
+    res.json({ ...page, items: page.items.map(decorateExecution) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/executions/:id', async (req, res, next) => {
+  try {
+    const execution = await getExecution(req.params.id);
+    if (!execution) return res.status(404).json({ error: 'execution not found' });
+    res.json(decorateExecution(execution));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/executions', async (req, res, next) => {
+  try {
+    const { errors, value } = readExecutionForm(req.body);
+    if (errors.length) return res.status(400).json({ error: errors.join(' ') });
+    const execution = await createExecution(value);
+    // A date already past is armed and run by the same reload that arms the
+    // rest, so saving one is how you say "run this now, behind the queue".
+    await cronService.reload();
+    res.status(201).json(decorateExecution(execution));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.put('/api/executions/:id', async (req, res, next) => {
+  try {
+    const { errors, value } = readExecutionForm(req.body);
+    if (errors.length) return res.status(400).json({ error: errors.join(' ') });
+    const execution = await updateExecution(req.params.id, value);
+    if (!execution) return res.status(404).json({ error: 'execution not found' });
+    await cronService.reload();
+    res.json(decorateExecution(execution));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/api/executions/:id', async (req, res, next) => {
+  try {
+    const removed = await deleteExecution(req.params.id);
+    if (!removed) return res.status(404).json({ error: 'execution not found' });
+    await cronService.reload();
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Re-arms a one-time execution that has run, been cancelled, or was closed as
+ * interrupted, without changing its date. What the list's "Reschedule" offers
+ * when the date is still in the future.
+ */
+app.post('/api/executions/:id/rearm', async (req, res, next) => {
+  try {
+    const execution = await getExecution(req.params.id);
+    if (!execution) return res.status(404).json({ error: 'execution not found' });
+    if (execution.status === 'running') return res.status(409).json({ error: 'this execution is running' });
+    const rearmed = await patchExecution(req.params.id, { status: 'scheduled', firedAt: null, stoppedBy: null });
+    await cronService.reload();
+    res.json(decorateExecution(rearmed));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/:kind(crons|executions)/:id/run', async (req, res, next) => {
+  try {
+    const found = await findRecord(req.params.id);
+    if (!found) return res.status(404).json({ error: `${noun(req)} not found` });
+    const cron = found.record;
     // Paused means nothing new starts, by hand or on a schedule — the same rule
-    // the disabled Run now buttons show.
+    // the disabled Run now buttons show. The pause covers one-time executions
+    // too: it holds everything this server would otherwise start.
     if (cronService.isPaused()) {
       return res.status(409).json({
         error: cronService.isPausedForUpdate()
           ? 'an update is waiting for runs to finish; nothing new can start'
-          : `all crons are paused ${cronService.pauseInfo().label}; cancel the pause to run one`,
+          : `everything is paused ${cronService.pauseInfo().label}; cancel the pause to run one`,
       });
     }
     if (cronService.isDelayed(cron.id)) {
-      return res.status(409).json({ error: 'a trigger for this cron is already waiting on usage' });
+      return res.status(409).json({ error: `a trigger for this ${noun(req)} is already waiting on usage` });
     }
     const result = await cronService.trigger(cron.id, 'manual');
-    if (!result) return res.status(409).json({ error: 'this cron is already running' });
+    if (!result) return res.status(409).json({ error: `this ${noun(req)} is already running` });
     // Run now does not override the usage delay setting: a blocked press becomes
     // the waiting trigger rather than starting claude anyway.
     if (result.delayed) return res.status(202).json({ delayed: result.delayed });
@@ -383,16 +553,17 @@ app.post('/api/crons/:id/run', async (req, res, next) => {
   }
 });
 
-app.post('/api/crons/:id/stop', async (req, res, next) => {
+app.post('/api/:kind(crons|executions)/:id/stop', async (req, res, next) => {
   try {
-    const cron = await getCron(req.params.id);
-    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const found = await findRecord(req.params.id);
+    if (!found) return res.status(404).json({ error: `${noun(req)} not found` });
+    const cron = found.record;
     // Stop is what the Run now button becomes while a trigger waits on usage, so
     // it has to end that wait as well as a live run.
-    const cancelled = cronService.cancelDelay(cron.id, 'user');
+    const cancelled = await cronService.cancelDelay(cron.id, 'user');
     if (cancelled) return res.status(202).json({ cancelledDelay: cancelled, nextRunAt: cronService.nextRun(cron.id) });
     const run = await cronService.stop(cron.id, 'user');
-    if (!run) return res.status(409).json({ error: 'this cron is not running' });
+    if (!run) return res.status(409).json({ error: `this ${noun(req)} is not running` });
     // The schedule is untouched by a stop, so report when it next fires.
     res.status(202).json({ ...run, nextRunAt: cronService.nextRun(cron.id) });
   } catch (err) {
@@ -400,16 +571,22 @@ app.post('/api/crons/:id/stop', async (req, res, next) => {
   }
 });
 
-app.get('/api/crons/:id/logs', async (req, res, next) => {
+/**
+ * The run history of one job. Crons and one-time executions write into the same
+ * logs folder, each under its own id, so this route serves both — only where the
+ * lifetime totals are written back differs.
+ */
+app.get('/api/:kind(crons|executions)/:id/logs', async (req, res, next) => {
   try {
-    const cron = await getCron(req.params.id);
-    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const found = await findRecord(req.params.id);
+    if (!found) return res.status(404).json({ error: `${noun(req)} not found` });
+    const cron = found.record;
     const logs = await listLogs(cron.id);
     // Read here rather than on the cron list: the first read scans the log
     // folder, and this is the one page that draws the result.
-    const stats = await lifetimeStats(cron);
+    const stats = await lifetimeStats(cron, found.kind === 'execution' ? patchExecution : undefined);
     res.json({
-      cron: decorate(cron),
+      cron: found.view(cron),
       stats,
       logs: logs.map((log) => ({ ...log, isRunning: cronService.isRunningLog(cron.id, log.file) })),
     });
@@ -418,10 +595,10 @@ app.get('/api/crons/:id/logs', async (req, res, next) => {
   }
 });
 
-app.get('/api/crons/:id/logs/:file', async (req, res, next) => {
+app.get('/api/:kind(crons|executions)/:id/logs/:file', async (req, res, next) => {
   try {
-    const cron = await getCron(req.params.id);
-    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    const cron = await findRecord(req.params.id).then((found) => found?.record ?? null);
+    if (!cron) return res.status(404).json({ error: `${noun(req)} not found` });
     const text = await readLog(cron.id, req.params.file);
     res.json({ file: req.params.file, text, isRunning: cronService.isRunningLog(cron.id, req.params.file) });
   } catch (err) {
@@ -435,12 +612,12 @@ app.get('/api/crons/:id/logs/:file', async (req, res, next) => {
  * Streams one log file: everything written so far, then each new chunk as it lands.
  * Polls the file size rather than using fs.watch, which is unreliable on macOS.
  */
-app.get('/api/crons/:id/logs/:file/stream', async (req, res, next) => {
+app.get('/api/:kind(crons|executions)/:id/logs/:file/stream', async (req, res, next) => {
   let target;
   let cron;
   try {
-    cron = await getCron(req.params.id);
-    if (!cron) return res.status(404).json({ error: 'cron not found' });
+    cron = await findRecord(req.params.id).then((found) => found?.record ?? null);
+    if (!cron) return res.status(404).json({ error: `${noun(req)} not found` });
     target = logPath(cron.id, req.params.file);
     await fsp.access(target);
   } catch (err) {
@@ -532,6 +709,7 @@ app.get('/api/health', async (_req, res) => {
   res.json({
     ok: true,
     scheduled: cronService.jobs.size,
+    running: cronService.runningCount(),
     commit: runningCommit,
     startedAt: STARTED_AT,
     paused: cronService.isPaused(),
@@ -555,6 +733,11 @@ await loadSettings(); // writes settings.json with defaults on first run
 // Before any schedule can write a log: after this the folders are cron ids.
 await migrateLogDirs().catch((err) => console.error(`[logs] migration failed: ${err.message}`));
 runningCommit = await currentCommit();
+// Before anything is armed: a one-time execution left mid-run by a restart is
+// closed as interrupted, so it is not mistaken for a run still in flight.
+await cronService.reconcileInterrupted().catch((err) => console.error(`[cron] reconcile failed: ${err.message}`));
+// Arms both kinds, and runs any one-time execution whose trigger was missed
+// while the server was down.
 await cronService.reload();
 await cronFileWatcher.start();
 // Discovery spawns a probe per candidate model, so let it run behind the server

@@ -111,15 +111,17 @@ export async function countRun(cron, { status, seconds, costUsd }) {
  * The cron's lifetime figures, with the per-run averages the page draws.
  *
  * Counters missing from the cron file are read out of the logs here and written
- * back, so the scan happens once rather than on every visit. Averages are over
+ * back, so the scan happens once rather than on every visit. `patch` is how they
+ * are written back, which is the one thing a one-time execution does differently:
+ * its record lives in another folder. Averages are over
  * completed runs, and are null when there have been none — a cron that has never
  * finished a run has no average cost, and 0 would be a different claim.
  */
-export async function lifetimeStats(cron) {
+export async function lifetimeStats(cron, patch = patchCron) {
   let totals = cron;
   if (!hasLifetimeStats(cron)) {
     totals = await backfillStats(cron.id);
-    await patchCron(cron.id, totals).catch((err) =>
+    await patch(cron.id, totals).catch((err) =>
       console.error(`[stats] could not record lifetime totals for "${cron.name}": ${err.message}`),
     );
   }

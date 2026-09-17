@@ -8,6 +8,7 @@ import { Cron } from 'croner';
 import { emit } from './events.js';
 import { resolveUserPath } from './paths.js';
 import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from './store.js';
+import { getExecution, listExecutions, patchExecution } from './executions.js';
 import { hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 import { countRun } from './stats.js';
 
@@ -39,10 +40,32 @@ const PROMPT_PREFIX =
   'the turn with a blocking command. Never use ScheduleWakeup, run_in_background, or /loop to carry ' +
   'remaining work forward.';
 
-/** The prompt as the CLI receives it: the preamble, then what the cron says. */
-function promptFor(cron) {
-  const prompt = cron.prompt ?? '';
+/** The prompt as the CLI receives it: the preamble, then what the job says. */
+function promptFor(job) {
+  const prompt = job.prompt ?? '';
   return prompt.trim() ? `${PROMPT_PREFIX}\n\n${prompt}` : PROMPT_PREFIX;
+}
+
+/**
+ * The two kinds of thing this service runs, and where each is read and written.
+ *
+ * A cron and a one-time execution differ in when they fire and in nothing else:
+ * the same prompt prefix, working directory, model, effort, usage delay, pause,
+ * stop and statistics block apply to both. Everything below therefore works on
+ * a "job" — a record carrying `kind` — rather than on a cron.
+ */
+const KINDS = {
+  cron: { get: getCron, patch: patchCron },
+  execution: { get: getExecution, patch: patchExecution },
+};
+
+/** Reads one job by id, whichever folder it lives in. Ids are unique across both. */
+export async function findJob(id) {
+  const cron = await getCron(id);
+  if (cron) return { ...cron, kind: 'cron' };
+  const execution = await getExecution(id);
+  if (execution) return { ...execution, kind: 'execution' };
+  return null;
 }
 
 /**
@@ -180,6 +203,33 @@ class CronService {
      * @type {Map<string, number>} cron id -> triggers dropped this pause
      */
     this.droppedDuringPause = new Map();
+    /**
+     * Ids between "this trigger was accepted" and "the child is spawned".
+     *
+     * `running` is only set once the process exists, and getting there means
+     * reading the record and the usage numbers, so two triggers arriving in
+     * that window would both pass the already-running check. A cron cannot do
+     * that to itself — croner fires it once — but two writes in quick
+     * succession each reload the schedules, and each reload starts whatever
+     * one-time execution is overdue.
+     * @type {Set<string>}
+     */
+    this.starting = new Set();
+    /**
+     * The rebuild queue. Rebuilds are chained rather than run concurrently,
+     * because croner will not construct a job whose name is still taken.
+     * @type {Promise|null}
+     */
+    this.reloading = null;
+    /** Set while a catch-up pass is walking the overdue one-time executions. */
+    this.catchingUp = false;
+    /**
+     * id -> a promise that settles when that run's log is closed. `execute`
+     * resolves as soon as the child is spawned, so this is the only way to wait
+     * for a run rather than for its process to exist.
+     * @type {Map<string, Promise>}
+     */
+    this.completions = new Map();
   }
 
   isPaused() {
@@ -309,6 +359,7 @@ class CronService {
     const entry = {
       cronId: cron.id,
       cronName: cron.name,
+      kind: cron.kind ?? 'cron',
       source,
       delayedAt: now,
       checkedAt: now,
@@ -327,12 +378,26 @@ class CronService {
    * delayed cron: the schedule is untouched, so the next trigger checks usage
    * again like any other.
    */
-  cancelDelay(cronId, cancelledBy = 'user') {
+  async cancelDelay(cronId, cancelledBy = 'user') {
     const entry = this.delayed.get(cronId);
     if (!entry) return null;
     this.delayed.delete(cronId);
     if (!this.delayed.size) this.stopDelayReview();
     console.log(`[cron] "${entry.cronName}" held trigger cancelled by ${cancelledBy}`);
+    // A cron's schedule fires again on its own, so dropping one trigger changes
+    // nothing lasting. A one-time execution has no second trigger: leaving it
+    // "scheduled" past its date would have the next rebuild treat it as overdue
+    // and start the very run the user just cancelled. So this write is waited
+    // on and its failure reported — answering "cancelled" over a write that
+    // silently failed is how the cancel gets undone a few seconds later.
+    if (entry.kind === 'execution') {
+      const written = await patchExecution(cronId, { status: 'cancelled', stoppedBy: cancelledBy }).catch((err) => {
+        console.error(`[cron] could not cancel "${entry.cronName}": ${err.message}`);
+        return null;
+      });
+      if (!written) throw new Error('the waiting trigger was dropped, but the execution could not be marked cancelled; it may run again');
+      emit('crons:changed');
+    }
     emit('run:released', { ...entry, ran: false, reason: `cancelled by ${cancelledBy}` });
     return entry;
   }
@@ -372,7 +437,7 @@ class CronService {
       const reading = await usageMonitor.state();
 
       for (const entry of [...this.delayed.values()]) {
-        const cron = await getCron(entry.cronId);
+        const cron = await findJob(entry.cronId);
         if (!cron) {
           this.delayed.delete(entry.cronId);
           emit('run:released', { ...entry, ran: false, reason: 'cron deleted' });
@@ -381,7 +446,7 @@ class CronService {
         // Deactivating a cron withdraws its schedule, so a scheduled trigger
         // still waiting has nothing left to belong to. A manual one is the
         // user's own press and still runs.
-        if (!cron.isActive && entry.source === 'schedule') {
+        if (!cron.isActive && entry.source !== 'manual') {
           this.delayed.delete(entry.cronId);
           console.log(`[cron] "${cron.name}" held trigger dropped: cron deactivated while waiting`);
           emit('run:released', { ...entry, ran: false, reason: 'cron deactivated while waiting' });
@@ -403,7 +468,7 @@ class CronService {
 
         this.delayed.delete(entry.cronId);
         if (this.running.has(entry.cronId)) {
-          emit('run:skipped', { cronId: cron.id, cronName: cron.name, source: entry.source, reason: 'already running' });
+          emit('run:skipped', { cronId: cron.id, cronName: cron.name, kind: cron.kind, source: entry.source, reason: 'already running' });
           continue;
         }
         const waited = Date.now() - Date.parse(entry.delayedAt);
@@ -417,8 +482,26 @@ class CronService {
     }
   }
 
-  /** Rebuilds every schedule from disk. Called on boot and after any cron write. */
-  async reload() {
+  /**
+   * Rebuilds every schedule from disk — cron expressions and one-time
+   * executions both. Called on boot and after any write to either folder.
+   *
+   * Runs one at a time. croner refuses to construct a job whose name is already
+   * taken, and a rebuild yields three times while reading the two folders, so
+   * two overlapping rebuilds would have the second one throw on the first name
+   * the first had already claimed — leaving whatever it was called for
+   * unscheduled. A run finishing now triggers one of these too, which is an
+   * arbitrary moment and can land inside an API-driven one.
+   */
+  reload() {
+    this.reloading = (this.reloading ?? Promise.resolve())
+      // One rebuild failing must not poison the queue behind it.
+      .catch(() => {})
+      .then(() => this.rebuild());
+    return this.reloading;
+  }
+
+  async rebuild() {
     for (const job of this.jobs.values()) job.stop();
     this.jobs.clear();
 
@@ -437,17 +520,161 @@ class CronService {
       });
       this.jobs.set(cron.id, job);
     }
+
+    const executions = await listExecutions();
+    const overdue = this.armExecutions(executions);
+
     // Schedules stay registered through a pause, and every trigger they produce
     // is dropped on arrival by `trigger`. Nothing runs either way; the
     // difference is that a dropped trigger can be reported, and an unregistered
     // job cannot report the run it never started.
     console.log(
       this.pauseState
-        ? `[cron] scheduled ${this.jobs.size} of ${crons.length} cron(s); paused ${this.pauseState.label}, so their triggers will be dropped`
-        : `[cron] scheduled ${this.jobs.size} of ${crons.length} cron(s)`,
+        ? `[cron] scheduled ${this.jobs.size} of ${crons.length + executions.length} job(s); paused ${this.pauseState.label}, so their triggers will be dropped`
+        : `[cron] scheduled ${this.jobs.size} of ${crons.length + executions.length} job(s)`,
     );
     emit('crons:changed');
+    if (overdue.length) {
+      // Left to a microtask so this rebuild — and the pause or boot step that
+      // asked for it — finishes before anything starts writing logs.
+      queueMicrotask(() => {
+        this.runOverdue().catch((err) => console.error(`[cron] overdue catch-up failed: ${err.message}`));
+      });
+    }
     return this.jobs.size;
+  }
+
+  /**
+   * Arms the one-time executions that are still waiting, and answers with the
+   * ones whose time has already passed.
+   *
+   * A timer is only for a future date; a date already gone gets no timer,
+   * because croner would never fire it. Those come back as overdue and are run
+   * on the spot — which is what makes a missed trigger survive a restart, and
+   * what makes a pause that swallowed a trigger run it when the pause lifts.
+   */
+  armExecutions(executions) {
+    const overdue = [];
+    for (const execution of executions) {
+      if (!execution.isActive || execution.status !== 'scheduled') continue;
+      const at = Date.parse(execution.scheduledAt ?? '');
+      if (!Number.isFinite(at)) {
+        console.error(`[cron] one-time "${execution.name}" has an unreadable date (${execution.scheduledAt})`);
+        continue;
+      }
+      if (at <= Date.now()) {
+        overdue.push(execution);
+        continue;
+      }
+      const job = new Cron(new Date(at), { name: execution.id }, () => {
+        this.trigger(execution.id, 'schedule').catch((err) =>
+          console.error(`[cron] one-time "${execution.name}" failed to start: ${err.message}`),
+        );
+      });
+      this.jobs.set(execution.id, job);
+    }
+    return overdue;
+  }
+
+  /**
+   * Runs the one-time executions whose trigger was missed, one at a time.
+   *
+   * One pass at a time, and one run at a time within it. Waiting on `trigger`
+   * alone would not give that — it resolves once the child exists — so each run
+   * is waited out to its closing line. And a run finishing rebuilds the
+   * schedules, which asks for a catch-up of its own; without the single-flight
+   * guard those passes interleave and the "one at a time" is only true of the
+   * first two.
+   *
+   * The pass re-reads the folder each time round rather than walking a list
+   * captured at the start, so a record that became overdue mid-pass is picked
+   * up by the pass already running instead of needing one of its own. Each id
+   * is attempted once, so a trigger that declines to start — parked on usage,
+   * already running — ends the pass for that record rather than looping on it.
+   *
+   * Every run still goes through `trigger`, so the pause, the usage delay and
+   * the already-running check all apply.
+   */
+  async runOverdue() {
+    if (this.catchingUp) return 0;
+    this.catchingUp = true;
+    const attempted = new Set();
+    let ran = 0;
+    try {
+      for (;;) {
+        // The pause drops these on arrival, and lifting it rebuilds the
+        // schedules — which finds them still overdue and runs them then.
+        if (this.pauseState) return ran;
+        const now = Date.now();
+        const due = (await listExecutions()).filter((execution) => {
+          if (attempted.has(execution.id)) return false;
+          if (!execution.isActive || execution.status !== 'scheduled') return false;
+          const at = Date.parse(execution.scheduledAt ?? '');
+          return Number.isFinite(at) && at <= now;
+        });
+        if (!due.length) return ran;
+        // Oldest miss first: the list comes back newest first.
+        const execution = due.at(-1);
+        attempted.add(execution.id);
+
+        const late = formatRuntime(now - Date.parse(execution.scheduledAt));
+        const result = await this.trigger(execution.id, 'missed').catch((err) => {
+          console.error(`[cron] one-time "${execution.name}" catch-up failed: ${err.message}`);
+          return null;
+        });
+        // Announced only once something is actually going. A catch-up parked on
+        // a spent usage limit leaves the record `scheduled` with a past date, so
+        // every later rebuild lists it as overdue again; announcing on sight
+        // would write one unread "running now" notice per rebuild for a run that
+        // has not started.
+        if (!result || result.delayed) continue;
+        ran += 1;
+        console.log(`[cron] one-time "${execution.name}" missed its trigger by ${late}; running now`);
+        emit('execution:overdue', {
+          cronId: execution.id,
+          cronName: execution.name,
+          kind: 'execution',
+          scheduledAt: execution.scheduledAt,
+          lateBy: late,
+        });
+        await this.completions.get(execution.id)?.catch(() => {});
+      }
+    } finally {
+      this.catchingUp = false;
+    }
+  }
+
+  /**
+   * A run the server was restarted out from under: the process died with the
+   * child, so the record is left claiming to be running forever.
+   *
+   * Closed rather than restarted. The work may have been half done, and re-running
+   * something destructive because the machine rebooted is worse than leaving it
+   * for the Run now button. Called once at boot, before anything is armed.
+   */
+  async reconcileInterrupted() {
+    const stranded = (await listExecutions()).filter((execution) => execution.status === 'running');
+    for (const execution of stranded) {
+      console.warn(`[cron] one-time "${execution.name}" was running when the server stopped; marking it interrupted`);
+      await patchExecution(execution.id, {
+        status: 'done',
+        lastRunStatus: 'interrupted',
+        // Dated by the run that was cut short, not left on the one before it:
+        // a row reading "interrupted" beside "last ran: never" is a puzzle.
+        lastRunAt: execution.firedAt ?? execution.lastRunAt ?? null,
+        stoppedBy: 'server restart',
+      }).catch((err) => console.error(`[cron] could not close "${execution.name}": ${err.message}`));
+      emit('run:finished', {
+        cronId: execution.id,
+        cronName: execution.name,
+        kind: 'execution',
+        logFile: execution.lastRunLog ?? null,
+        status: 'interrupted',
+        // No footer was ever written, so there is no duration to report.
+        seconds: null,
+      });
+    }
+    return stranded.length;
   }
 
   nextRun(cronId) {
@@ -471,7 +698,7 @@ class CronService {
    * half an answer, and this is the other half.
    */
   runningCrons() {
-    return [...this.running.values()].map((run) => ({ name: run.cronName, startedAt: run.startedAt }));
+    return [...this.running.values()].map((run) => ({ name: run.cronName, kind: run.kind, startedAt: run.startedAt }));
   }
 
   /** True while a specific log file is being written by a live run. */
@@ -479,10 +706,40 @@ class CronService {
     return this.running.get(cronId)?.logFile === file;
   }
 
-  /** Reads the cron fresh from disk, then runs it unless it is already in flight. */
+  /** Reads the job fresh from disk, then runs it unless it is already in flight. */
   async trigger(cronId, source = 'manual') {
-    const cron = await getCron(cronId);
+    if (this.starting.has(cronId)) {
+      console.warn(`[cron] ${cronId} is already starting; dropping the ${source} trigger`);
+      return null;
+    }
+    this.starting.add(cronId);
+    try {
+      return await this.startTrigger(cronId, source);
+    } finally {
+      this.starting.delete(cronId);
+    }
+  }
+
+  /** The body of `trigger`, run once per id at a time. */
+  async startTrigger(cronId, source) {
+    const cron = await findJob(cronId);
     if (!cron) throw new Error('cron not found');
+    // A one-time execution fires once. Its timer can outlive its run — Run now
+    // starts the run without rebuilding the schedules — so the record, not the
+    // timer, is what says whether it still has a turn coming. A manual press is
+    // the user asking again and always counts.
+    if (cron.kind === 'execution' && source !== 'manual' && (!cron.isActive || cron.status !== 'scheduled')) {
+      const why = cron.isActive ? cron.status : 'deactivated';
+      console.warn(`[cron] one-time "${cron.name}" is ${why}; dropping the ${source} trigger`);
+      emit('run:skipped', {
+        cronId,
+        cronName: cron.name,
+        kind: cron.kind,
+        source,
+        reason: `it is ${why}, so it has no run left to make`,
+      });
+      return null;
+    }
     // Schedules are stopped while paused, so this only catches a job that fired
     // in the moment before it was stopped. An update pause also blocks manual
     // runs, because the update is waiting for the last run to finish.
@@ -495,6 +752,7 @@ class CronService {
       emit('run:dropped', {
         cronId,
         cronName: cron.name,
+        kind: cron.kind,
         source,
         reason:
           this.pauseState.mode === 'update'
@@ -509,7 +767,7 @@ class CronService {
     }
     if (this.running.has(cronId)) {
       console.warn(`[cron] "${cron.name}" is still running; skipping ${source} trigger`);
-      emit('run:skipped', { cronId, cronName: cron.name, source });
+      emit('run:skipped', { cronId, cronName: cron.name, kind: cron.kind, source });
       return null;
     }
     // One waiting trigger per cron. A second one arriving while the first is
@@ -521,6 +779,7 @@ class CronService {
       emit('run:skipped', {
         cronId,
         cronName: cron.name,
+        kind: cron.kind,
         source,
         reason: `a trigger is already waiting on ${blockerNames(waiting.reasons)}`,
       });
@@ -547,7 +806,14 @@ class CronService {
 
     run.stopping = true;
     run.stoppedBy = stoppedBy;
+    // The log says who aborted it, and for a one-time execution the record says
+    // so too — the log is pruned eventually, the record is what the list reads.
     handle.stream.write(`\n--- stop requested by ${stoppedBy} at ${new Date().toISOString()} ---\n`);
+    if (run.kind === 'execution') {
+      await patchExecution(cronId, { stoppedBy }).catch((err) =>
+        console.error(`[cron] could not record the abort of "${run.cronName}": ${err.message}`),
+      );
+    }
 
     // claude may have children of its own, so signal the whole process group.
     const { pid } = handle.child;
@@ -571,11 +837,13 @@ class CronService {
     }, 5000);
 
     console.log(`[cron] "${run.cronName}" stop requested by ${stoppedBy} (pid ${pid})`);
-    emit('run:stopping', { cronId, cronName: run.cronName, logFile: run.logFile });
+    emit('run:stopping', { cronId, cronName: run.cronName, kind: run.kind, logFile: run.logFile });
     return run;
   }
 
   async execute(cron, source, held = null) {
+    const kind = cron.kind ?? 'cron';
+    const { get, patch } = KINDS[kind];
     const startedAt = new Date();
     const dir = logDir(cron.id);
     await fsp.mkdir(dir, { recursive: true });
@@ -592,6 +860,7 @@ class CronService {
       runId: randomUUID(),
       cronId: cron.id,
       cronName: cron.name,
+      kind,
       logFile: file,
       startedAt: startedAt.toISOString(),
       source,
@@ -603,6 +872,17 @@ class CronService {
       heldSince: held?.since ?? null,
     };
     this.running.set(cron.id, run);
+    // Settled by `finish`, once the log is closed and the record written. What
+    // the overdue catch-up waits on so it starts one run at a time.
+    let settle;
+    this.completions.set(cron.id, new Promise((resolve) => {
+      settle = resolve;
+    }));
+    if (kind === 'execution') {
+      await patch(cron.id, { status: 'running', firedAt: startedAt.toISOString(), stoppedBy: null }).catch((err) =>
+        console.error(`[cron] could not mark "${cron.name}" running: ${err.message}`),
+      );
+    }
 
     const stream = fs.createWriteStream(fullPath, { flags: 'a' });
     // Written once the child exists, so the header can carry its pid.
@@ -613,7 +893,7 @@ class CronService {
           `started    ${startedAt.toISOString()}`,
           `pid        ${pid ?? '(not started)'}`,
           `trigger    ${source}`,
-          `schedule   ${cron.cron}`,
+          kind === 'execution' ? `scheduled  ${cron.scheduledAt} (one-time)` : `schedule   ${cron.cron}`,
           `directory  ${cwd}`,
           `model      ${cron.model?.trim() || '(CLI default)'}`,
           `effort     ${cron.effort?.trim() || '(CLI default)'}`,
@@ -645,7 +925,7 @@ class CronService {
       this.running.delete(cron.id);
       // Read fresh rather than trusting the copy this run started with: a long
       // run can outlive the page visit that initialized these counters.
-      const current = (await getCron(cron.id).catch(() => null)) ?? cron;
+      const current = (await get(cron.id).catch(() => null)) ?? cron;
       const lifetime = await countRun(current, {
         status,
         seconds: Number(seconds),
@@ -654,11 +934,19 @@ class CronService {
         console.error(`[cron] could not total lifetime stats: ${err.message}`);
         return {};
       });
-      await patchCron(cron.id, {
+      // A one-time execution has now had its one run. It stays in the list as
+      // history and Run now still works, but nothing re-arms it — except a save
+      // that moved its date while this run was going, which already put the
+      // record back to `scheduled` and must not be written over here.
+      const rescheduledMidRun = kind === 'execution' && current.status !== 'running';
+      await patch(cron.id, {
         lastRunAt: startedAt.toISOString(),
         lastRunStatus: status,
         lastRunLog: file,
         lastRunDurationSeconds: Number(seconds),
+        ...(kind === 'execution' && !rescheduledMidRun
+          ? { status: 'done', stoppedBy: run.stopping ? run.stoppedBy : null }
+          : {}),
         ...lifetime,
       }).catch((err) => console.error(`[cron] could not record last run: ${err.message}`));
       const pruned = await pruneLogs(cron.id).catch((err) => {
@@ -667,7 +955,16 @@ class CronService {
       });
       if (pruned) console.log(`[cron] pruned ${pruned} old log(s) for "${cron.name}"`);
       console.log(`[cron] "${cron.name}" ${status} in ${seconds}s -> ${file}`);
-      emit('run:finished', { cronId: cron.id, cronName: cron.name, logFile: file, status, seconds: Number(seconds) });
+      emit('run:finished', { cronId: cron.id, cronName: cron.name, kind, logFile: file, status, seconds: Number(seconds) });
+      // The execution has had its run, so the one-shot timer it was armed with
+      // is spent. Rebuild the schedules to drop it rather than leave something
+      // counted as scheduled that the guard above would only refuse later — and
+      // to arm the new date if the record was rescheduled while it ran.
+      if (kind === 'execution') {
+        await this.reload().catch((err) => console.error(`[cron] reload after run failed: ${err.message}`));
+      }
+      this.completions.delete(cron.id);
+      settle(status);
     };
 
     const dirOk = await fsp

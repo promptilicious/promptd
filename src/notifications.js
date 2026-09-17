@@ -69,28 +69,36 @@ function blockerNames(event) {
  * hand; a difference in wording is a bug, not a feature.
  */
 function describe(event) {
-  const cron = { cronId: event.cronId ?? null, cronName: event.cronName ?? null };
-  const name = event.cronName;
+  // jobKind, not kind: `kind` on a notification is what sort of notice it is,
+  // and this is what sort of thing it happened to.
+  const cron = { cronId: event.cronId ?? null, cronName: event.cronName ?? null, jobKind: event.kind ?? 'cron' };
+  // A one-time execution names itself as one, so a line in the drawer is not
+  // read as a cron that has started misbehaving.
+  const name = event.kind === 'execution' ? `one-time "${event.cronName}"` : `"${event.cronName}"`;
   switch (event.type) {
     case 'run:started':
-      return { kind: 'run', read: true, message: `"${name}" started`, ...cron };
+      return { kind: 'run', read: true, message: `${name} started`, ...cron };
     case 'run:finished': {
       const succeeded = event.status === 'succeeded';
       return {
         kind: succeeded ? 'run' : 'run-failed',
         // A run that did not succeed is the one run event worth finding later.
         read: succeeded,
-        message: `"${name}" ${event.status} in ${event.seconds}s`,
+        // An interrupted run never wrote a footer, so it has no duration to
+        // report and must not claim one.
+        message: Number.isFinite(event.seconds)
+          ? `${name} ${event.status} in ${event.seconds}s`
+          : `${name} ${event.status}`,
         ...cron,
       };
     }
     case 'run:stopping':
-      return { kind: 'run', read: true, message: `"${name}" is stopping`, ...cron };
+      return { kind: 'run', read: true, message: `${name} is stopping`, ...cron };
     case 'run:skipped':
       return {
         kind: 'run',
         read: true,
-        message: event.reason ? `"${name}" skipped: ${event.reason}` : `"${name}" was still running; trigger skipped`,
+        message: event.reason ? `${name} skipped: ${event.reason}` : `${name} was still running; trigger skipped`,
         ...cron,
       };
     case 'run:dropped':
@@ -99,26 +107,35 @@ function describe(event) {
         // The pause that dropped it was asked for, so this is a consequence
         // rather than a surprise.
         read: true,
-        message: `"${name}" trigger dropped: ${event.reason}`,
+        message: `${name} trigger dropped: ${event.reason}`,
         ...cron,
       };
     case 'run:delayed':
       return {
         kind: 'delayed',
         read: false,
-        message: `"${name}" is waiting on ${blockerNames(event)}`,
+        message: `${name} is waiting on ${blockerNames(event)}`,
         ...cron,
       };
     case 'run:released':
       return {
         kind: 'delayed',
         read: true,
-        message: event.ran ? `"${name}" usage cleared, starting now` : `"${name}" waiting trigger dropped: ${event.reason}`,
+        message: event.ran ? `${name} usage cleared, starting now` : `${name} waiting trigger dropped: ${event.reason}`,
+        ...cron,
+      };
+    case 'execution:overdue':
+      return {
+        kind: 'delayed',
+        // A trigger that was missed and is being made up is exactly the kind of
+        // thing you want to find in the morning.
+        read: false,
+        message: `${name} missed its trigger by ${event.lateBy}; running now`,
         ...cron,
       };
     case 'pause:changed':
       return event.paused
-        ? { kind: 'pause', read: true, message: `All crons paused ${event.label}` }
+        ? { kind: 'pause', read: true, message: `Everything paused ${event.label}` }
         : {
             kind: 'pause',
             read: true,
@@ -252,7 +269,7 @@ class NotificationCenter {
    * on: a notification that cannot be written is still worth showing, and the
    * event that produced it must not be held up by a filesystem.
    */
-  add({ kind, message, read = true, cronId = null, cronName = null }) {
+  add({ kind, message, read = true, cronId = null, cronName = null, jobKind = 'cron' }) {
     const record = {
       id: randomUUID(),
       at: new Date().toISOString(),
@@ -261,6 +278,8 @@ class NotificationCenter {
       read: Boolean(read),
       cronId,
       cronName,
+      // Which page the drawer's link should open: a cron's logs or an execution's.
+      jobKind,
     };
     record.file = fileName(record);
     this.items.unshift(record);

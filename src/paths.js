@@ -9,6 +9,12 @@ export const ROOT = process.env.CONDUCTOR_HOME
 
 // One folder per model.
 export const CRONS_DIR = path.join(ROOT, 'crons');
+// One-time executions are kept apart from the crons so the cron folder watcher
+// has less to poll, and so a folder listing stays readable once there are
+// hundreds of one-off runs behind you.
+export const EXECUTIONS_DIR = path.join(ROOT, 'executions');
+// Both kinds write here, each under its own id: ids are unique across the two,
+// so one folder serves both without a prefix.
 export const LOGS_DIR = path.join(ROOT, 'logs');
 
 /**
@@ -28,5 +34,6 @@ export function resolveUserPath(input) {
 
 export async function ensureDirs() {
   await fs.mkdir(CRONS_DIR, { recursive: true });
+  await fs.mkdir(EXECUTIONS_DIR, { recursive: true });
   await fs.mkdir(LOGS_DIR, { recursive: true });
 }
