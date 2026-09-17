@@ -104,6 +104,8 @@ class SelfUpdater {
     this.draining = false;
     this.drainTimer = null;
     this.drainStartedAt = null;
+    /** The run count in the last "still waiting" announcement; null before the first. */
+    this.waitingCount = null;
     /**
      * The last answer to "is main behind?", whoever asked. Checking happens on
      * the interval whether or not selfUpdate is on, so the header badge can
@@ -213,10 +215,17 @@ class SelfUpdater {
         cronService.resumeAll('update gave up waiting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
         return;
       }
-      console.log(`[update] waiting for ${running} run(s) to finish before restarting`);
-      emit('update:waiting', { ...this.state(), runningCount: running });
+      // The news is how many runs are left, so it is only news when that number
+      // moves. Announcing every tick meant a notification every 10 seconds for
+      // as long as a run held the update up.
+      if (running !== this.waitingCount) {
+        this.waitingCount = running;
+        console.log(`[update] waiting for ${running} run(s) to finish before restarting`);
+        emit('update:waiting', { ...this.state(), runningCount: running });
+      }
     };
 
+    this.waitingCount = null;
     this.drainTimer = setInterval(tick, DRAIN_INTERVAL_MS);
     this.drainTimer.unref?.();
     tick(); // check straight away rather than waiting out the first interval
@@ -227,6 +236,7 @@ class SelfUpdater {
     if (this.drainTimer) clearInterval(this.drainTimer);
     this.drainTimer = null;
     this.draining = false;
+    this.waitingCount = null;
   }
 
   /**
