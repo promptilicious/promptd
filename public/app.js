@@ -852,12 +852,23 @@ function usageDelayPicker(selected) {
   };
 }
 
-async function renderForm(id) {
-  const cron = id ? await api(`/api/crons/${id}`) : null;
+/**
+ * One form serves three jobs. Duplicating loads the source cron exactly as
+ * editing does, so every field arrives filled in; only the name carries a
+ * suffix, and Save creates a new cron instead of writing back to the source.
+ */
+async function renderForm(id, duplicateOf) {
+  const sourceId = id ?? duplicateOf;
+  const cron = sourceId ? await api(`/api/crons/${sourceId}`) : null;
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   const inputs = {
-    name: el('input', { type: 'text', value: cron?.name ?? '', placeholder: 'Nightly changelog', maxlength: '120' }),
+    name: el('input', {
+      type: 'text',
+      value: duplicateOf ? `${cron.name} - Duplicate` : (cron?.name ?? ''),
+      placeholder: 'Nightly changelog',
+      maxlength: '120',
+    }),
     description: el('input', {
       type: 'text',
       value: cron?.description ?? '',
@@ -935,7 +946,7 @@ async function renderForm(id) {
     el('div', { class: 'breadcrumb' }, [el('a', { href: '#/', text: '← All crons' })]),
     el('div', { class: 'page-head' }, [
       el('div', {}, [
-        el('h1', { text: id ? 'Edit cron' : 'New cron' }),
+        el('h1', { text: id ? 'Edit cron' : duplicateOf ? 'Duplicate cron' : 'New cron' }),
         el('p', { class: 'sub', text: 'Runs claude -p with the prompt below on the schedule you set.' }),
       ]),
     ]),
@@ -953,6 +964,7 @@ async function renderForm(id) {
       el('div', { class: 'form-actions' }, [
         el('button', { class: 'btn primary', type: 'submit', text: 'Save' }),
         el('a', { class: 'btn', href: '#/', text: 'Cancel' }),
+        id ? el('a', { class: 'btn', href: `#/new/${id}`, text: 'Duplicate' }) : null,
         el('div', { class: 'spacer' }),
         id ? el('button', { class: 'btn danger', type: 'button', text: 'Delete', onclick: remove }) : null,
       ]),
@@ -1394,7 +1406,7 @@ async function route() {
   const [, section, id] = hash.split('/');
   try {
     if (section === 'settings') await renderSettings();
-    else if (section === 'new') await renderForm(null);
+    else if (section === 'new') await renderForm(null, id || null);
     else if (section === 'edit' && id) await renderForm(id);
     else if (section === 'logs' && id) await renderLogs(id);
     else await renderHome();
