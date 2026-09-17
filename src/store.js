@@ -86,7 +86,6 @@ export async function createCron(input) {
 export async function updateCron(id, input) {
   const existing = await getCron(id);
   if (!existing) return null;
-  const renamedFrom = existing.name !== input.name ? existing.name : null;
   const cron = {
     ...existing,
     name: input.name,
@@ -100,8 +99,8 @@ export async function updateCron(id, input) {
     isActive: Boolean(input.isActive),
     updatedAt: new Date().toISOString(),
   };
+  // A rename moves no logs: the folder is the cron's id.
   await writeCron(cron);
-  if (renamedFrom) await moveLogDir(renamedFrom, cron.name);
   return cron;
 }
 
@@ -126,14 +125,20 @@ export async function deleteCron(id) {
 
 // ---- logs -------------------------------------------------------------
 
-export function logDir(cronName) {
-  return path.join(LOGS_DIR, safeName(cronName));
+/**
+ * Logs live under the cron's id, not its name: two crons may share a name, and
+ * an id never moves. `safeName` still runs over it so a hand-edited id cannot
+ * escape the logs folder. Folders written by older versions are renamed on boot
+ * by migrateLogDirs.
+ */
+export function logDir(cronId) {
+  return path.join(LOGS_DIR, safeName(cronId));
 }
 
-export function logPath(cronName, file) {
+export function logPath(cronId, file) {
   const base = path.basename(file);
   if (base !== file || !/^[\w.:+-]+\.txt$/.test(base)) throw new Error('invalid log file name');
-  return path.join(logDir(cronName), base);
+  return path.join(logDir(cronId), base);
 }
 
 /** Log file names sort lexicographically in start-time order. */
@@ -149,16 +154,16 @@ export function startedAtFromLogFile(file) {
 }
 
 /** Newest first. */
-export async function listLogs(cronName) {
+export async function listLogs(cronId) {
   let names = [];
   try {
-    names = await fs.readdir(logDir(cronName));
+    names = await fs.readdir(logDir(cronId));
   } catch {
     return [];
   }
   const logs = [];
   for (const name of names.filter((n) => n.endsWith('.txt'))) {
-    const stat = await fs.stat(path.join(logDir(cronName), name)).catch(() => null);
+    const stat = await fs.stat(path.join(logDir(cronId), name)).catch(() => null);
     if (!stat) continue;
     logs.push({
       file: name,
@@ -170,41 +175,16 @@ export async function listLogs(cronName) {
   return logs.sort((a, b) => b.file.localeCompare(a.file));
 }
 
-export async function readLog(cronName, file) {
-  return fs.readFile(logPath(cronName, file), 'utf8');
+export async function readLog(cronId, file) {
+  return fs.readFile(logPath(cronId, file), 'utf8');
 }
 
 /** Keeps the newest MAX_LOGS_PER_CRON runs for one cron, deleting the rest. */
-export async function pruneLogs(cronName, keep = MAX_LOGS_PER_CRON) {
-  const logs = await listLogs(cronName);
+export async function pruneLogs(cronId, keep = MAX_LOGS_PER_CRON) {
+  const logs = await listLogs(cronId);
   const stale = logs.slice(keep);
   for (const log of stale) {
-    await fs.unlink(path.join(logDir(cronName), log.file)).catch(() => {});
+    await fs.unlink(path.join(logDir(cronId), log.file)).catch(() => {});
   }
   return stale.length;
-}
-
-/** Carries log history across a rename so old runs stay visible. */
-async function moveLogDir(fromName, toName) {
-  const from = logDir(fromName);
-  const to = logDir(toName);
-  if (from === to) return;
-  try {
-    await fs.access(from);
-  } catch {
-    return;
-  }
-  const destExists = await fs
-    .access(to)
-    .then(() => true)
-    .catch(() => false);
-  if (!destExists) {
-    await fs.rename(from, to).catch(() => {});
-    return;
-  }
-  // Destination already has history; merge the files in rather than clobbering.
-  for (const name of await fs.readdir(from)) {
-    await fs.rename(path.join(from, name), path.join(to, name)).catch(() => {});
-  }
-  await fs.rmdir(from).catch(() => {});
 }

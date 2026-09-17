@@ -18,6 +18,7 @@ import {
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
 import { loadSettings, patchSettings } from './settings.js';
+import { migrateLogDirs } from './logsMigration.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
 import { lifetimeStats } from './stats.js';
@@ -403,7 +404,7 @@ app.get('/api/crons/:id/logs', async (req, res, next) => {
   try {
     const cron = await getCron(req.params.id);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
-    const logs = await listLogs(cron.name);
+    const logs = await listLogs(cron.id);
     // Read here rather than on the cron list: the first read scans the log
     // folder, and this is the one page that draws the result.
     const stats = await lifetimeStats(cron);
@@ -421,7 +422,7 @@ app.get('/api/crons/:id/logs/:file', async (req, res, next) => {
   try {
     const cron = await getCron(req.params.id);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
-    const text = await readLog(cron.name, req.params.file);
+    const text = await readLog(cron.id, req.params.file);
     res.json({ file: req.params.file, text, isRunning: cronService.isRunningLog(cron.id, req.params.file) });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'log not found' });
@@ -440,7 +441,7 @@ app.get('/api/crons/:id/logs/:file/stream', async (req, res, next) => {
   try {
     cron = await getCron(req.params.id);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
-    target = logPath(cron.name, req.params.file);
+    target = logPath(cron.id, req.params.file);
     await fsp.access(target);
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'log not found' });
@@ -551,6 +552,8 @@ await ensureDirs();
 // behind the server coming up: 5000 small files are not worth a slow start.
 notificationCenter.start();
 await loadSettings(); // writes settings.json with defaults on first run
+// Before any schedule can write a log: after this the folders are cron ids.
+await migrateLogDirs().catch((err) => console.error(`[logs] migration failed: ${err.message}`));
 runningCommit = await currentCommit();
 await cronService.reload();
 await cronFileWatcher.start();

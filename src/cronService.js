@@ -577,7 +577,7 @@ class CronService {
 
   async execute(cron, source, held = null) {
     const startedAt = new Date();
-    const dir = logDir(cron.name);
+    const dir = logDir(cron.id);
     await fsp.mkdir(dir, { recursive: true });
 
     const file = logFileName(startedAt);
@@ -661,7 +661,7 @@ class CronService {
         lastRunDurationSeconds: Number(seconds),
         ...lifetime,
       }).catch((err) => console.error(`[cron] could not record last run: ${err.message}`));
-      const pruned = await pruneLogs(cron.name).catch((err) => {
+      const pruned = await pruneLogs(cron.id).catch((err) => {
         console.error(`[cron] log cleanup failed for "${cron.name}": ${err.message}`);
         return 0;
       });

@@ -75,10 +75,10 @@ export function readLogStats(tail) {
  * thing. A run still being written has no footer and is skipped: it is counted
  * by its own finish instead, which is what keeps it from landing twice.
  */
-export async function backfillStats(cronName) {
+export async function backfillStats(cronId) {
   const totals = { lifetimeRuns: 0, lifetimeCostUsd: 0, lifetimeRuntimeSeconds: 0 };
-  for (const log of await listLogs(cronName)) {
-    const stats = readLogStats(await readTail(path.join(logDir(cronName), log.file)));
+  for (const log of await listLogs(cronId)) {
+    const stats = readLogStats(await readTail(path.join(logDir(cronId), log.file)));
     if (stats.status !== 'succeeded') continue;
     totals.lifetimeRuns += 1;
     totals.lifetimeCostUsd += stats.costUsd ?? 0;
@@ -98,7 +98,7 @@ export async function backfillStats(cronName) {
  * one changes nothing.
  */
 export async function countRun(cron, { status, seconds, costUsd }) {
-  if (!hasLifetimeStats(cron)) return backfillStats(cron.name);
+  if (!hasLifetimeStats(cron)) return backfillStats(cron.id);
   if (status !== 'succeeded') return {};
   return {
     lifetimeRuns: cron.lifetimeRuns + 1,
@@ -118,7 +118,7 @@ export async function countRun(cron, { status, seconds, costUsd }) {
 export async function lifetimeStats(cron) {
   let totals = cron;
   if (!hasLifetimeStats(cron)) {
-    totals = await backfillStats(cron.name);
+    totals = await backfillStats(cron.id);
     await patchCron(cron.id, totals).catch((err) =>
       console.error(`[stats] could not record lifetime totals for "${cron.name}": ${err.message}`),
     );

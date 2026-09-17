@@ -13,6 +13,8 @@ export const DEFAULT_SETTINGS = {
   lastUpdateCheckAt: null,
   lastUpdateLaunchedAt: null,
   lastUpdateFromCommit: null,
+  // Set once the log folders have been renamed from cron names to cron ids.
+  logsMigrated: false,
 };
 
 /** Reads settings, writing the defaults file the first time. Unknown keys are kept. */
