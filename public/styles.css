@@ -1072,6 +1072,11 @@ textarea {
   line-height: 1.55;
 }
 
+/* A short list of patterns rather than a prompt. */
+textarea.compact {
+  min-height: 110px;
+}
+
 input:focus,
 textarea:focus {
   outline: none;

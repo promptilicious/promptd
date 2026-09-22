@@ -339,6 +339,10 @@ app.put('/api/settings', async (req, res, next) => {
       }
       patch.usageDelayThresholds = thresholds;
     }
+    if ('defaultWorktreeInclude' in (req.body ?? {})) {
+      if (typeof req.body.defaultWorktreeInclude !== 'string') return res.status(400).json({ error: 'defaultWorktreeInclude must be a string' });
+      patch.defaultWorktreeInclude = req.body.defaultWorktreeInclude;
+    }
     const saved = await patchSettings(patch);
     // Written first, applied second: the service reads its limit from memory, so
     // a save that did not reach the disk must not change what is running.

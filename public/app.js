@@ -1845,6 +1845,21 @@ async function renderSettings() {
     await save({ usageDelayThresholds: defaults }, 'Usage delays back to their defaults');
   });
 
+  // ---- worktrees ----
+  const worktreeInclude = el('textarea', {
+    class: 'compact',
+    placeholder: '.env\napps/*/.env.local',
+    'aria-label': 'Default .worktreeinclude',
+    text: typeof settings.defaultWorktreeInclude === 'string' ? settings.defaultWorktreeInclude : '',
+  });
+  // `change` fires on blur, and only when the text differs from what it held on focus.
+  worktreeInclude.addEventListener('change', () =>
+    save(
+      { defaultWorktreeInclude: worktreeInclude.value },
+      worktreeInclude.value.trim() ? 'Default .worktreeinclude saved' : 'Default .worktreeinclude cleared',
+    ),
+  );
+
   const stat = (value, label, sub) =>
     el('div', { class: 'stat' }, [
       value.nodeType ? value : el('div', { class: 'stat-value', text: value }),
@@ -2073,6 +2088,25 @@ async function renderSettings() {
         'A cron or one-time execution with a limit ticked under Delay for usage waits while that limit is at or above its percentage here. ',
         'The same percentage applies to every job that ticks it, and a change reaches the next trigger. ',
         `The defaults are ${thresholdDefaults}.`,
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
+      el('h2', { text: 'Worktrees' }),
+      el('div', { class: 'field' }, [el('label', { text: 'Default .worktreeinclude' }), worktreeInclude]),
+      el('div', { class: 'hint' }, [
+        'Written to a job\'s working directory as ',
+        el('span', { class: 'mono', text: '.worktreeinclude' }),
+        ', and only for jobs with worktrees turned on. ',
+        'Claude Code copies the files it lists into each new worktree: one pattern per line, written like ',
+        el('span', { class: 'mono', text: '.gitignore' }),
+        ', matching only files git ignores, such as ',
+        el('span', { class: 'mono', text: '.env' }),
+        ' files. The copies are made when a worktree is created, so a reused worktree keeps the ones it started with.',
+      ]),
+      el('div', { class: 'hint warn' }, [
+        'Any ',
+        el('span', { class: 'mono', text: '.worktreeinclude' }),
+        ' already in that folder is overwritten with this text, including one the repo has committed.',
       ]),
     ]),
     el('div', { class: 'card' }, [

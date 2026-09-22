@@ -302,11 +302,12 @@ The **⚙** button at the right of the header opens a page for everything below.
   "lastUpdateLaunchedAt": null,
   "lastUpdateFromCommit": null,
   "maxConcurrentJobs": 8,
-  "usageDelayThresholds": { "session": 90, "weekly": 95, "fable": 95, "credits": 90 }
+  "usageDelayThresholds": { "session": 90, "weekly": 95, "fable": 95, "credits": 90 },
+  "defaultWorktreeInclude": ""
 }
 ```
 
-`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
+`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. `defaultWorktreeInclude` is the text written to a job's working directory as `.worktreeinclude` when that job runs in a worktree, overwriting any file already there; Claude Code copies the ignored files it lists, such as `.env`, into each new worktree. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
 
 The check runs on the interval either way. `selfUpdate` decides only whether what it finds gets applied: with it off, the server still fetches and compares, and an available update shows as an amber **Update available** badge in the header that links to this page. Nothing is pulled and no cron is paused until you press **Update now**.
 
@@ -726,7 +727,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/notifications?before=&limit=` | One page of notifications, newest first, plus the unread count and the cursor for the next page                                                                                 |
 | POST             | `/api/notifications/read`          | Mark notifications read. Body `{"ids":[...]}`; answers with what is still unread                                                                                               |
 | GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are waiting and how many of those are queued for a slot, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
-| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs` and `usageDelayThresholds`                                                                  |
+| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs`, `usageDelayThresholds` and `defaultWorktreeInclude`                                        |
 | GET              | `/api/queue`                       | The concurrent job limit, what is running under it with each job's average run length, and what is queued behind it with each one's position and estimated start                |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"30m"\|"1h"\|"3h"\|"restart"}`                                                                                                            |
