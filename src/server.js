@@ -88,6 +88,8 @@ function readForm(body) {
       description: String(body?.description ?? '').trim(),
       cron: expression,
       workingDirectory: String(body?.workingDirectory ?? '').trim(),
+      useWorktree: Boolean(body?.useWorktree),
+      cleanupWorktree: Boolean(body?.cleanupWorktree),
       model: String(body?.model ?? '').trim(),
       effort,
       // Unknown keys are dropped and missing ones read as off, so the cron file
@@ -129,6 +131,9 @@ function readExecutionForm(body) {
       // same wherever it is opened from.
       scheduledAt: scheduledAt ? scheduledAt.toISOString() : null,
       workingDirectory: String(body?.workingDirectory ?? '').trim(),
+      useWorktree: Boolean(body?.useWorktree),
+      // Whatever was sent: a job that runs once would only leave its worktree behind.
+      cleanupWorktree: true,
       model: String(body?.model ?? '').trim(),
       effort,
       usageDelay: normalizeUsageDelay(body?.usageDelay),

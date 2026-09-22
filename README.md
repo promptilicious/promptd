@@ -406,6 +406,8 @@ A cron file:
   "description": "Summarize the day",
   "cron": "0 9 * * *",
   "workingDirectory": "/Users/you/code/project",
+  "useWorktree": false,
+  "cleanupWorktree": false,
   "model": "claude-sonnet-4-5",
   "effort": "",
   "usageDelay": { "session": true, "weekly": false, "fable": false, "credits": true },
@@ -432,6 +434,8 @@ A one-time execution file is the same shape with `scheduledAt` where `cron` was,
   "description": "",
   "scheduledAt": "2026-09-20T13:00:00.000Z",
   "workingDirectory": "/Users/you/code/project",
+  "useWorktree": false,
+  "cleanupWorktree": true,
   "model": "",
   "effort": "",
   "usageDelay": { "session": true, "weekly": false, "fable": false, "credits": false },
@@ -448,6 +452,8 @@ A one-time execution file is the same shape with `scheduledAt` where `cron` was,
   "stoppedBy": null
 }
 ```
+
+`useWorktree` and `cleanupWorktree` are the two boxes in the form's Worktree section. A one-time execution is always saved with `cleanupWorktree: true`, whatever the request sent.
 
 Both kinds write their logs into `logs/` under their own id, so the folder serves the two without a prefix.
 

@@ -1302,6 +1302,51 @@ function usageDelayPicker(selected) {
 }
 
 /**
+ * The Worktree section both job forms share. `id` is the saved job's, so a new
+ * or duplicated job, which has none yet, is described without one.
+ *
+ * A one-time execution runs once, so its worktree would only ever be left
+ * behind: the clean up box is ticked and locked, and the server forces it too.
+ */
+function worktreePicker(job, { id = null, oneTime = false } = {}) {
+  const useWorktree = el('input', { type: 'checkbox' });
+  useWorktree.checked = Boolean(job?.useWorktree);
+  const cleanup = el('input', { type: 'checkbox' });
+  cleanup.checked = oneTime || Boolean(job?.cleanupWorktree);
+  cleanup.disabled = oneTime;
+
+  const code = (text) => el('span', { class: 'mono', text });
+
+  return {
+    read: () => ({ useWorktree: useWorktree.checked, cleanupWorktree: cleanup.checked }),
+    field: el('div', { class: 'field' }, [
+      el('label', { text: 'Worktree' }),
+      el('label', { class: 'check' }, [useWorktree, 'Use worktree']),
+      el('label', { class: 'check', title: oneTime ? 'One-time executions always clean up' : null }, [
+        cleanup,
+        'Clean up worktree after execution',
+      ]),
+      el('div', { class: 'hint' }, [
+        'With Use worktree on, each run starts Claude in a git worktree named after this job\'s ID',
+        id ? [' (', code(id), ')'] : ', given when it is first saved',
+        '. The name stays the same between executions, so without clean up every execution reuses one worktree. ',
+        'Using a worktree adds a little spin-up time to each execution, and cleaning up adds tear-down time. ',
+        'One-time executions always clean up.',
+      ].flat()),
+      el('div', { class: 'hint warn', text: 'Clean up force-removes the worktree after each execution. Uncommitted files in it are not kept.' }),
+      el('div', { class: 'hint' }, [
+        'The default ',
+        code('.worktreeinclude'),
+        ', which lists the files copied into new worktrees, is set on the ',
+        // A new tab, so following it does not throw away what is typed in the form.
+        el('a', { href: '#/settings', target: '_blank', rel: 'noopener', text: 'Settings page' }),
+        '.',
+      ]),
+    ]),
+  };
+}
+
+/**
  * Wraps the date field in the same live feedback the Cron field gets: presets
  * for the times you actually pick, and a line saying how far off it is.
  *
@@ -1434,6 +1479,7 @@ async function renderForm(id, duplicateOf) {
   inputs.prompt.value = cron?.prompt ?? '';
   inputs.isActive.checked = cron ? Boolean(cron.isActive) : true;
 
+  const worktree = worktreePicker(cron, { id });
   const model = modelPicker(cron?.model ?? '');
   const effort = effortPicker(cron?.effort ?? '');
   const usageDelay = usageDelayPicker(cron?.usageDelay ?? null);
@@ -1452,6 +1498,7 @@ async function renderForm(id, duplicateOf) {
       description: inputs.description.value,
       cron: inputs.cron.value,
       workingDirectory: inputs.workingDirectory.value,
+      ...worktree.read(),
       model: model.read(),
       effort: effort.read(),
       usageDelay: usageDelay.read(),
@@ -1500,6 +1547,7 @@ async function renderForm(id, duplicateOf) {
       field('Description', inputs.description),
       cronPicker(inputs.cron),
       directoryPicker(inputs.workingDirectory),
+      worktree.field,
       model.field,
       effort.field,
       usageDelay.field,
@@ -1579,6 +1627,7 @@ async function renderExecutionForm(id, duplicateOf) {
   inputs.prompt.value = execution?.prompt ?? '';
   inputs.isActive.checked = execution ? Boolean(execution.isActive) : true;
 
+  const worktree = worktreePicker(execution, { id, oneTime: true });
   const model = modelPicker(execution?.model ?? '');
   const effort = effortPicker(execution?.effort ?? '');
   const usageDelay = usageDelayPicker(execution?.usageDelay ?? null);
@@ -1600,6 +1649,7 @@ async function renderExecutionForm(id, duplicateOf) {
       // the server is not left guessing which clock it was typed on.
       scheduledAt: typed ? new Date(typed).toISOString() : '',
       workingDirectory: inputs.workingDirectory.value,
+      ...worktree.read(),
       model: model.read(),
       effort: effort.read(),
       usageDelay: usageDelay.read(),
@@ -1649,6 +1699,7 @@ async function renderExecutionForm(id, duplicateOf) {
       field('Description', inputs.description),
       scheduledAtPicker(inputs.scheduledAt),
       directoryPicker(inputs.workingDirectory),
+      worktree.field,
       model.field,
       effort.field,
       usageDelay.field,
