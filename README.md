@@ -6,7 +6,7 @@ Schedule Claude prompts and watch them run. A small Node.js server holds a set o
 - Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
 - Follow a run's output as it is produced, or read back any of the last 50 runs per cron.
 - Stop a run in progress. The schedule stays armed for its next trigger.
-- Pause everything for 15 minutes, an hour, 6 hours, or until the next restart — crons and one-time executions together.
+- Pause everything for 30 minutes, an hour, 3 hours, or until the next restart — crons and one-time executions together.
 - A one-time execution survives a restart. If its moment passed while the server was down, it runs as soon as the server is back.
 - Hold a cron until your Claude usage resets, per limit, instead of firing it into a spent quota.
 - Choose the model per cron, from whatever the installed CLI recognises.
@@ -191,20 +191,20 @@ A run the server was restarted out from under is a different thing. On boot it i
 
 ## Pausing every cron
 
-**Pause for…** sits above the tabs on the home page, because it is not a property of either list: one pause holds every cron and every one-time execution at once. Pick a length:
+**Pause triggers for…** sits above the tabs on the home page, because it is not a property of either list: one pause holds every cron and every one-time execution at once. Pick a length:
 
 | Option        | Held until                                     |
 | ------------- | ---------------------------------------------- |
-| 15 minutes    | 15 minutes from now                            |
+| 30 minutes    | 30 minutes from now                            |
 | 1 hour        | an hour from now                               |
-| 6 hours       | six hours from now                             |
+| 3 hours       | three hours from now                           |
 | Until restart | the pause is cancelled, or the server restarts |
 
-While paused, the dropdown is replaced by **Cancel pause**, which resumes immediately. Every status reads `Paused 15 minutes` (or whichever length you chose), and hovering one says when it lifts.
+While paused, the dropdown is replaced by **Cancel pause**, which resumes immediately. Every status reads `Paused 30 minutes` (or whichever length you chose), and hovering one says when it lifts.
 
 What a pause does and does not do:
 
-1. **Every trigger is dropped, and says so.** The schedules stay registered, so a cron whose time comes round during the pause still produces a trigger, which is thrown away rather than run. Each one raises a toast naming the cron and the pause (`"Ticker" trigger dropped: all crons are paused 15 minutes`), and repeats add a count in brackets, and the header line counts them. A cron that fires often reuses its own toast and updates the count rather than stacking hundreds of them. The Next run column shows when the next trigger arrives and marks it `dropped`.
+1. **Every trigger is dropped, and says so.** The schedules stay registered, so a cron whose time comes round during the pause still produces a trigger, which is thrown away rather than run. Each one raises a toast naming the cron and the pause (`"Ticker" trigger dropped: all crons are paused 30 minutes`), and repeats add a count in brackets, and the header line counts them. A cron that fires often reuses its own toast and updates the count rather than stacking hundreds of them. The Next run column shows when the next trigger arrives and marks it `dropped`.
 2. **A run already in flight is left alone.** It keeps its `running` badge and finishes normally; it picks up the paused badge once it is done.
 3. **A drop is missed time, not queued time.** The count says how many runs this cron has now lost, not how many are waiting. Nothing is replayed when the pause lifts; the cron simply runs at its next trigger. Each pause counts from zero.
 4. **Nothing new starts, by hand either.** **Run now** is disabled on the home page and the logs page, and says why on hover; `POST /api/crons/:id/run` answers 409. **Stop** is never disabled, so a run already going can always be ended.
@@ -726,7 +726,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours` and `maxConcurrentJobs`                                                                                          |
 | GET              | `/api/queue`                       | The concurrent job limit, what is running under it with each job's average run length, and what is queued behind it with each one's position and estimated start                |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
-| POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |
+| POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"30m"\|"1h"\|"3h"\|"restart"}`                                                                                                            |
 | DELETE           | `/api/pause`                       | Resume (409 if not paused, or if the pause belongs to an update)                                                                                                               |
 | GET              | `/api/update/check`                | Whether `main` is behind. Read-only, never pulls                                                                                                                               |
 | POST             | `/api/update/run`                  | Apply a pending update now. 202 with the updater's pid, or `waiting: true` and a null pid while runs drain. 409 and the reason if there is nothing to do. Ignores `selfUpdate` |

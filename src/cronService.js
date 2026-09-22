@@ -70,14 +70,14 @@ export async function findJob(id) {
 }
 
 /**
- * The durations the Pause for control offers. `ms: null` means "no timer" — the
+ * The durations the Pause triggers for control offers. `ms: null` means "no timer" — the
  * pause is only lifted by cancelling it or by the process restarting, since the
  * pause is never written to disk.
  */
 export const PAUSE_OPTIONS = [
-  { id: '15m', label: '15 minutes', ms: 15 * 60 * 1000 },
+  { id: '30m', label: '30 minutes', ms: 30 * 60 * 1000 },
   { id: '1h', label: '1 hour', ms: 60 * 60 * 1000 },
-  { id: '6h', label: '6 hours', ms: 6 * 60 * 60 * 1000 },
+  { id: '3h', label: '3 hours', ms: 3 * 60 * 60 * 1000 },
   { id: 'restart', label: 'until restart', ms: null },
 ];
 

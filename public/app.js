@@ -352,7 +352,7 @@ function pauseTitle(pause) {
 }
 
 /**
- * Pause for… while running normally, Cancel pause while the user paused, and
+ * Pause triggers for… while running normally, Cancel pause while the user paused, and
  * neither during an update — that pause is not the user's to lift.
  */
 function pauseControl(pause, options, onChanged) {
@@ -377,7 +377,7 @@ function pauseControl(pause, options, onChanged) {
   }
 
   const select = el('select', { class: 'select pause-select', 'aria-label': 'Pause all crons' }, [
-    el('option', { value: '', selected: 'selected' }, 'Pause for…'),
+    el('option', { value: '', selected: 'selected' }, 'Pause triggers for…'),
     ...options.map((option) => el('option', { value: option.id }, option.label)),
   ]);
   select.addEventListener('change', async () => {
