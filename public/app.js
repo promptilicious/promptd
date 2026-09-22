@@ -57,6 +57,20 @@ function fmtDateTime(iso) {
   });
 }
 
+/**
+ * The same stamp with the weekday in front, for the schedule previews on the
+ * two forms. "Sep 29" does not say whether the cron you just typed fires on a
+ * working day; "Mon Sep 29" does.
+ */
+function fmtDateTimeWeekday(iso) {
+  if (!iso) return null;
+  // Formatted apart from the rest and joined with a space: asking for the
+  // weekday inside the stamp gets a comma after it in most locales, and
+  // "Tue, Sep 22, 8:00:00 PM" is one comma too many to read at a glance.
+  const day = new Date(iso).toLocaleString(undefined, { weekday: 'short' });
+  return `${day} ${fmtDateTime(iso)}`;
+}
+
 function fmtRelative(iso) {
   if (!iso) return '';
   const deltaMs = new Date(iso).getTime() - Date.now();
@@ -888,7 +902,7 @@ function cronPicker(input) {
           preview.className = 'hint warn';
           return;
         }
-        preview.textContent = `Next run: ${fmtRelative(result.nextRunAt)} · ${fmtDateTime(result.nextRunAt)}`;
+        preview.textContent = `Next run: ${fmtRelative(result.nextRunAt)} · ${fmtDateTimeWeekday(result.nextRunAt)}`;
         preview.className = 'hint ok';
       })
       .catch(() => {});
@@ -1231,11 +1245,12 @@ function scheduledAtPicker(input) {
     if (at.getTime() <= Date.now()) {
       // Allowed on purpose: the same rule that runs a trigger missed over a
       // restart runs this one the moment it is saved.
-      preview.textContent = `That time has passed — saving this runs it now (${fmtDateTime(at.toISOString())}).`;
+      preview.textContent = `That time has passed — saving this runs it now (${fmtDateTimeWeekday(at.toISOString())}).`;
       preview.className = 'hint warn';
       return;
     }
-    preview.textContent = `Runs ${fmtRelative(at.toISOString())} · ${fmtDateTime(at.toISOString())}`;
+    // Word for word what the cron form says, so the two green lines read alike.
+    preview.textContent = `Next run: ${fmtRelative(at.toISOString())} · ${fmtDateTimeWeekday(at.toISOString())}`;
     preview.className = 'hint ok';
   };
 
