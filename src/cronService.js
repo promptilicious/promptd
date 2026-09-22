@@ -12,7 +12,7 @@ import { getExecution, listExecutions, patchExecution } from './executions.js';
 import { TTL_MS as USAGE_CHECK_MS, hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 import { countRun } from './stats.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings } from './settings.js';
-import { WORKTREE_INCLUDE_FILE, writeWorktreeInclude } from './worktree.js';
+import { WORKTREE_INCLUDE_FILE, removeWorktree, writeWorktreeInclude } from './worktree.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -116,7 +116,7 @@ function formatRuntime(ms) {
 }
 
 /** Builds the run's statistics block from the CLI's result event. */
-function statsBlock(result) {
+function statsBlock(result, afterCost = []) {
   const usage = result?.usage ?? {};
   const input = usage.input_tokens ?? 0;
   const output = usage.output_tokens ?? 0;
@@ -133,9 +133,28 @@ function statsBlock(result) {
     `Runtime: ${formatRuntime(result?.duration_ms)}`,
     `Tokens: ${count(total)} (in ${count(input)} / out ${count(output)} / cache ${count(cache)})`,
     `Cost: ${cost}`,
+    ...afterCost,
     '=-----------------------------------=',
     '',
   ].join('\n');
+}
+
+/**
+ * Removes the job's worktree when it asks to be cleaned up, and says what
+ * happened in a line for the log. Never throws: a failed clean up is reported,
+ * and the run's own outcome stands.
+ */
+async function cleanUpWorktree(job, cwd) {
+  if (!job.cleanupWorktree) return 'not cleaned up: Clean up worktree after execution is off';
+  const started = Date.now();
+  try {
+    const result = await removeWorktree(cwd, job.id);
+    if (!result.cleaned) return `not cleaned up: ${result.skipped}`;
+    return `cleaned up in ${((Date.now() - started) / 1000).toFixed(1)}s: ${result.cleaned}`;
+  } catch (err) {
+    console.error(`[cron] worktree clean up failed for "${job.name}": ${err.message}`);
+    return `error: ${err.message}`;
+  }
 }
 
 export function validateCronExpression(expression) {
@@ -1301,8 +1320,6 @@ class CronService {
     }
 
     const stream = fs.createWriteStream(fullPath, { flags: 'a' });
-    // A one-time execution cleans up whatever its record says: it never runs again.
-    const cleanupWorktree = kind === 'execution' || Boolean(cron.cleanupWorktree);
     // What happened to .worktreeinclude, for the header. Replaced once the file
     // is written; a run that fails before then keeps this.
     let worktreeIncludeNote = cron.useWorktree ? 'not written' : 'not written: Use worktree is off';
@@ -1326,7 +1343,7 @@ class CronService {
               `${(wait.kind === 'usage' ? 'held' : 'queued').padEnd(11)}waited ${formatRuntime(startedAt - new Date(wait.since))} for ${wait.detail}`,
           ),
           `Use worktree      ${Boolean(cron.useWorktree)}`,
-          `Cleanup worktree  ${cleanupWorktree}`,
+          `Cleanup worktree  ${Boolean(cron.cleanupWorktree)}`,
           `.worktreeinclude  ${worktreeIncludeNote}`,
           `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs].join(' ')}`,
           ...(worktreeIncludeText === null ? [] : ['--- .worktreeinclude ---', worktreeIncludeText.replace(/\n$/, '')]),
@@ -1344,7 +1361,11 @@ class CronService {
     const finish = async (status, detail) => {
       const endedAt = new Date();
       const seconds = ((endedAt - startedAt) / 1000).toFixed(1);
-      if (resultEvent) stream.write(statsBlock(resultEvent));
+      // Every way a run ends comes through here once the child has exited, so
+      // nothing is still writing in the folder being removed. The run keeps its
+      // slot until this is done, so its next trigger cannot race the removal.
+      const cleanupLine = `Worktree cleanup: ${await cleanUpWorktree(cron, cwd)}`;
+      stream.write(resultEvent ? statsBlock(resultEvent, [cleanupLine]) : `\n${cleanupLine}\n`);
       await new Promise((resolve) => {
         stream.end(`\n--- ${status} after ${seconds}s${detail ? ` (${detail})` : ''} ---\n`, resolve);
       });
