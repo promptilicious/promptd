@@ -1287,6 +1287,9 @@ class CronService {
     const modelArgs = cron.model?.trim() ? ['--model', cron.model.trim()] : [];
     // Same for effort: left off unless the cron names a level.
     const effortArgs = cron.effort?.trim() ? ['--effort', cron.effort.trim()] : [];
+    // Named after the job so every run finds the same worktree, and clean up
+    // knows which one to remove.
+    const worktreeArgs = cron.useWorktree ? ['--worktree', cron.id] : [];
 
     const run = {
       runId: randomUUID(),
@@ -1345,7 +1348,7 @@ class CronService {
           `Use worktree      ${Boolean(cron.useWorktree)}`,
           `Cleanup worktree  ${Boolean(cron.cleanupWorktree)}`,
           `.worktreeinclude  ${worktreeIncludeNote}`,
-          `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs].join(' ')}`,
+          `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs, ...worktreeArgs].join(' ')}`,
           ...(worktreeIncludeText === null ? [] : ['--- .worktreeinclude ---', worktreeIncludeText.replace(/\n$/, '')]),
           '--- prompt ---',
           cron.prompt ?? '',
@@ -1451,7 +1454,7 @@ class CronService {
 
     let child;
     try {
-      child = spawn(CLAUDE_BIN, ['-p', promptFor(cron), ...CLAUDE_ARGS, ...modelArgs, ...effortArgs], {
+      child = spawn(CLAUDE_BIN, ['-p', promptFor(cron), ...CLAUDE_ARGS, ...modelArgs, ...effortArgs, ...worktreeArgs], {
         cwd,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
