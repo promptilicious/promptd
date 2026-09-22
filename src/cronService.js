@@ -196,6 +196,9 @@ class CronService {
   constructor() {
     /** @type {Map<string, Cron>} cron id -> scheduled job */
     this.jobs = new Map();
+    /** Crons with a live schedule, and one-time executions still waiting for theirs. */
+    this.armedCrons = 0;
+    this.armedExecutions = 0;
     /** @type {Map<string, object>} cron id -> in-flight run, JSON-safe for the API */
     this.running = new Map();
     /** @type {Map<string, object>} cron id -> child process and log stream, kept out of responses */
@@ -636,6 +639,9 @@ class CronService {
       defaultLimit: DEFAULT_MAX_CONCURRENT_JOBS,
       runningCount: this.running.size,
       queuedCount: this.queuedCount(),
+      // What is armed behind the queue: the header's jobs tooltip shows both.
+      armedCrons: this.armedCrons,
+      armedExecutions: this.armedExecutions,
       nextSlotAt: this.nextSlotAt(),
       running: [...this.running.values()].map((run) => ({
         cronId: run.cronId,
@@ -796,6 +802,8 @@ class CronService {
   async rebuild() {
     for (const job of this.jobs.values()) job.stop();
     this.jobs.clear();
+    this.armedCrons = 0;
+    this.armedExecutions = 0;
 
     const crons = await listCrons();
     for (const cron of crons) {
@@ -811,6 +819,7 @@ class CronService {
         );
       });
       this.jobs.set(cron.id, job);
+      this.armedCrons += 1;
     }
 
     const executions = await listExecutions();
@@ -864,6 +873,7 @@ class CronService {
         );
       });
       this.jobs.set(execution.id, job);
+      this.armedExecutions += 1;
     }
     return overdue;
   }

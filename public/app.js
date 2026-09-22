@@ -2661,15 +2661,38 @@ function jobsScale({ limit, defaultLimit }) {
   return Number.isFinite(ceiling) && ceiling > 0 ? ceiling : 1;
 }
 
+/** One "label   number" line in the panel under the meter. */
+function jobsPopRow(label) {
+  const value = el('span', { class: 'jobs-pop-value', text: '0' });
+  return { row: el('div', { class: 'jobs-pop-row' }, [el('span', { text: label }), value]), value };
+}
+
 function buildJobsMeter() {
   const value = el('span', { class: 'usage-pct', text: '0' });
   const fill = el('div', { class: 'usage-fill' });
+  // A panel rather than the text tooltip the other meters use: the rule under
+  // Queued separates what is happening now from what is merely armed, and a
+  // tooltip made of one string cannot draw a line.
+  const running = jobsPopRow('Running');
+  const limit = jobsPopRow('Limit');
+  const queued = jobsPopRow('Queued');
+  const crons = jobsPopRow('Crons Armed');
+  const executions = jobsPopRow('OTE Scheduled');
+  const pop = el('div', { class: 'jobs-pop' }, [
+    running.row,
+    limit.row,
+    queued.row,
+    el('div', { class: 'jobs-pop-rule' }),
+    crons.row,
+    executions.row,
+  ]);
   const root = el('div', { class: 'usage-meter jobs-meter' }, [
     el('div', { class: 'usage-head' }, [el('span', { text: 'Running Jobs' }), value]),
     el('div', { class: 'usage-track' }, [fill]),
+    pop,
   ]);
   jobsEl.replaceChildren(root);
-  jobsNodes = { root, value, fill };
+  jobsNodes = { root, value, fill, running, limit, queued, crons, executions };
   return jobsNodes;
 }
 
@@ -2691,16 +2714,13 @@ function setJobs(state) {
   // Only a real limit can be full; unlimited never colours, however busy it is.
   const severity = limit > 0 && running >= limit ? 'critical' : limit > 0 && running >= scale * 0.75 ? 'warning' : '';
   nodes.root.className = `usage-meter jobs-meter ${severity}`.trim();
-  nodes.root.setAttribute(
-    'data-tip',
-    [
-      `Running ${running}`,
-      // No limit is still a label and a number: the bar has to fill against
-      // something, and that something is the processor count.
-      limit > 0 ? `Limit ${limit}` : `Limit none (bar fills against ${scale})`,
-      `Queued ${queued}`,
-    ].join('\n'),
-  );
+  nodes.running.value.textContent = String(running);
+  // No limit is still a label and a number: the bar has to fill against
+  // something, and that something is the processor count.
+  nodes.limit.value.textContent = limit > 0 ? String(limit) : `none (of ${scale})`;
+  nodes.queued.value.textContent = String(queued);
+  nodes.crons.value.textContent = String(Number(state.armedCrons) || 0);
+  nodes.executions.value.textContent = String(Number(state.armedExecutions) || 0);
 }
 
 /**
@@ -3056,6 +3076,8 @@ async function checkHealth() {
       queuedCount: health.queued,
       limit: health.concurrencyLimit,
       defaultLimit: health.defaultConcurrencyLimit,
+      armedCrons: health.armedCrons,
+      armedExecutions: health.armedExecutions,
     });
     if (!health.commit) return; // not a git checkout, nothing to compare
     if (!loadedCommit) loadedCommit = health.commit;

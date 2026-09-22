@@ -450,6 +450,58 @@ a {
   background: var(--accent);
 }
 
+/* The text tooltip is for the usage meters; this one carries a panel instead. */
+.jobs-meter::after {
+  display: none;
+}
+
+/*
+ * The panel under the jobs meter. Width follows the longest row so the numbers
+ * sit against the right edge whatever they read.
+ */
+.jobs-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  width: max-content;
+  min-width: 150px;
+  background: #0b0d12;
+  border: 1px solid #3a4152;
+  border-radius: 8px;
+  padding: 8px 10px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 90ms ease;
+  z-index: 20;
+  cursor: default;
+}
+
+.jobs-meter:hover .jobs-pop {
+  opacity: 1;
+}
+
+.jobs-pop-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.jobs-pop-value {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* What is running now, above; what is merely armed, below. */
+.jobs-pop-rule {
+  margin: 6px 0;
+  border-top: 1px solid var(--border);
+}
+
 /*
  * Machine stats: the same meter as above, drawn from this computer rather than
  * the account, and separated from the subscription ones by a rule so the two

@@ -754,6 +754,8 @@ app.get('/api/health', async (_req, res) => {
     // What the limit means when it is 0: the header's jobs meter fills against
     // this rather than against "unlimited", which no bar can draw.
     defaultConcurrencyLimit: DEFAULT_MAX_CONCURRENT_JOBS,
+    armedCrons: cronService.armedCrons,
+    armedExecutions: cronService.armedExecutions,
     unreadNotifications: notificationCenter.unreadCount(),
     usage,
     ...selfUpdater.availability(),
