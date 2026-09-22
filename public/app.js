@@ -585,6 +585,9 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
  */
 const executionsState = { limit: 10, pageSize: 10 };
 
+/** Counts home renders, so a slow one cannot paint over the one after it. */
+let homeRenderId = 0;
+
 /** The two tabs, and which one the hash is asking for. */
 const TABS = [
   { id: 'crons', label: 'Crons', hash: '#/' },
@@ -629,10 +632,13 @@ function pauseSummary(pause) {
  * a copy inside each tab would have suggested there were two of them.
  */
 async function renderHome(tab = 'crons') {
+  const renderId = ++homeRenderId;
+  const hash = location.hash;
   const pause = await api('/api/pause');
 
+  const subEl = el('p', { class: 'sub', text: '' });
   const head = el('div', { class: 'page-head' }, [
-    el('div', {}, [el('h1', { text: 'Claude Conductor' }), el('p', { class: 'sub', id: 'home-sub', text: '' })]),
+    el('div', {}, [el('h1', { text: 'Claude Conductor' }), subEl]),
     el('div', { class: 'head-actions' }, [
       pauseControl(pause, pause.options ?? [], () => renderHome(tab).catch(() => {})),
       tab === 'executions'
@@ -641,16 +647,20 @@ async function renderHome(tab = 'crons') {
     ]),
   ]);
 
+  // Filled while detached and swapped in at once. Clearing the page first and
+  // filling it after the fetch left it one header tall for a moment, which
+  // threw the scroll back to the top on every refresh.
   const panel = el('div', { class: 'tab-panel', role: 'tabpanel' });
-  view.replaceChildren(head, tabBar(tab), panel);
-
   const sub = (text) => {
-    const node = document.getElementById('home-sub');
-    if (node) node.textContent = text;
+    subEl.textContent = text;
   };
 
   if (tab === 'executions') await paintExecutions(panel, pause, sub);
   else await paintCrons(panel, pause, sub);
+
+  // A newer render, or a move to another page, landed while this one waited.
+  if (renderId !== homeRenderId || location.hash !== hash) return;
+  view.replaceChildren(head, tabBar(tab), panel);
 }
 
 /** The Crons tab: everything the home page showed before the tabs existed. */
