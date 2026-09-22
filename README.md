@@ -486,9 +486,10 @@ This is one path, walked by crons and one-time executions alike.
 
 1. The schedule fires, a one-time execution reaches its date, or you press **Run now**.
 2. If it has [Delay for usage](#delaying-a-cron-for-usage) boxes ticked, usage is read; the run waits here while any ticked limit is spent.
-3. The server spawns `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages` in the cron's working directory.
-4. The assistant's text is pulled out of the event stream and written to `logs/<id>/<start time>.txt` as it arrives, so the log reads as plain output and can be tailed mid-run. stderr goes in verbatim, as does any stdout line that is not JSON (a CLI warning, say).
-5. On exit, the run's statistics block is written, then a footer records the outcome (`succeeded` / `failed` / `stopped`, duration, exit code). Logs beyond the newest 50 for that cron are deleted.
+3. If it has **Use worktree** ticked, the default `.worktreeinclude` from the Settings page is written to the root of the git repository the working directory is in, replacing any file already there. Claude Code reads it from the repository root even when the session starts in a subfolder. Nothing is written when the default is empty or the folder is not in a git repository. Every log header carries `Use worktree`, `Cleanup worktree` and `.worktreeinclude` lines just above `command`; the last says where the file was written, why it was not, or the error. When the file is written, its full text follows the header in a `--- .worktreeinclude ---` section, above the prompt.
+4. The server spawns `claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages` in the cron's working directory.
+5. The assistant's text is pulled out of the event stream and written to `logs/<id>/<start time>.txt` as it arrives, so the log reads as plain output and can be tailed mid-run. stderr goes in verbatim, as does any stdout line that is not JSON (a CLI warning, say).
+6. On exit, the run's statistics block is written, then a footer records the outcome (`succeeded` / `failed` / `stopped`, duration, exit code). Logs beyond the newest 50 for that cron are deleted.
 
 Nothing runs twice at once. If a trigger arrives while the previous run is still going, it is skipped and the UI says so.
 

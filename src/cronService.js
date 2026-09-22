@@ -11,7 +11,8 @@ import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from '.
 import { getExecution, listExecutions, patchExecution } from './executions.js';
 import { TTL_MS as USAGE_CHECK_MS, hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 import { countRun } from './stats.js';
-import { DEFAULT_MAX_CONCURRENT_JOBS } from './settings.js';
+import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings } from './settings.js';
+import { WORKTREE_INCLUDE_FILE, writeWorktreeInclude } from './worktree.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -1300,6 +1301,14 @@ class CronService {
     }
 
     const stream = fs.createWriteStream(fullPath, { flags: 'a' });
+    // A one-time execution cleans up whatever its record says: it never runs again.
+    const cleanupWorktree = kind === 'execution' || Boolean(cron.cleanupWorktree);
+    // What happened to .worktreeinclude, for the header. Replaced once the file
+    // is written; a run that fails before then keeps this.
+    let worktreeIncludeNote = cron.useWorktree ? 'not written' : 'not written: Use worktree is off';
+    // The file as written, shown in full above the prompt. Null leaves the section out.
+    let worktreeIncludeText = null;
+
     // Written once the child exists, so the header can carry its pid.
     const writeHeader = (pid) => {
       stream.write(
@@ -1316,7 +1325,11 @@ class CronService {
             (wait) =>
               `${(wait.kind === 'usage' ? 'held' : 'queued').padEnd(11)}waited ${formatRuntime(startedAt - new Date(wait.since))} for ${wait.detail}`,
           ),
+          `Use worktree      ${Boolean(cron.useWorktree)}`,
+          `Cleanup worktree  ${cleanupWorktree}`,
+          `.worktreeinclude  ${worktreeIncludeNote}`,
           `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs].join(' ')}`,
+          ...(worktreeIncludeText === null ? [] : ['--- .worktreeinclude ---', worktreeIncludeText.replace(/\n$/, '')]),
           '--- prompt ---',
           cron.prompt ?? '',
           '--- output ---',
@@ -1396,6 +1409,23 @@ class CronService {
       emit('run:started', run);
       await finish('failed', 'bad working directory');
       return run;
+    }
+
+    // Claude Code copies what the file lists when it creates a worktree, so it
+    // is rewritten from the setting on every run, before the child starts. A
+    // file that cannot be written is noted in the header; the run still goes.
+    if (cron.useWorktree) {
+      const { defaultWorktreeInclude } = await loadSettings();
+      worktreeIncludeNote = await writeWorktreeInclude(cwd, String(defaultWorktreeInclude ?? ''))
+        .then((result) => {
+          if (!result.written) return `not written: ${result.skipped}`;
+          worktreeIncludeText = result.text;
+          return `wrote ${result.written}`;
+        })
+        .catch((err) => {
+          console.error(`[cron] could not write ${WORKTREE_INCLUDE_FILE} for "${cron.name}": ${err.message}`);
+          return `error: ${err.message}`;
+        });
     }
 
     let child;
