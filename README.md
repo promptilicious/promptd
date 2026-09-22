@@ -166,7 +166,7 @@ Model discovery is slower on the first run after login, around 14 seconds agains
 
 The **One-time Execution** tab holds prompts that run once, at a date and time you pick, instead of on a repeating schedule. Everything else about them is a cron: the same working directory, model, effort, usage delay, prompt, `Is Active` checkbox, prompt preamble, log, statistics block and Stop button.
 
-The form is the cron form with **Runs at** where the Cron field was: a date and time in your local clock, with `+1hr`, `+4hr` and a *Tomorrow at* shortcut. The server stores it as UTC.
+The form is the cron form with **Runs at** where the Cron field was: a date and time in your local clock, with `+30m`, `+1hr`, `+3hr` shortcuts and a *Select datetime* calendar that opens on whatever Runs at already says. A new one defaults to tomorrow at 8am; editing keeps the time it was scheduled for. The server stores it as UTC.
 
 The list shows the ten most recent, newest first, and **Load 10 older** goes back through the rest. A finished one stays in the list as history, so the tab is both what is coming and what has already gone.
 

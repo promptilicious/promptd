@@ -1271,21 +1271,27 @@ function scheduledAtPicker(input) {
       title,
       onclick: () => {
         input.value = asFieldValue(new Date(Date.now() + minutes * 60000));
-        update();
+        input.dispatchEvent(new Event('change', { bubbles: true }));
       },
     });
 
-  const tomorrowAt = el('input', { type: 'time', class: 'time-entry', value: '09:00' });
-  const applyTomorrow = () => {
-    const [hours, minutes] = tomorrowAt.value.split(':');
-    if (hours === undefined || minutes === undefined) return;
-    const date = new Date();
-    date.setDate(date.getDate() + 1);
-    date.setHours(Number(hours), Number(minutes), 0, 0);
-    input.value = asFieldValue(date);
+  /**
+   * The calendar, for a date the presets do not reach. It opens on whatever
+   * Runs at already says rather than on today, so opening the picker and
+   * closing it again cannot quietly move a date that was already set.
+   */
+  const chooser = el('input', { type: 'datetime-local', class: 'time-entry', value: input.value });
+  chooser.addEventListener('change', () => {
+    if (!chooser.value) return;
+    input.value = chooser.value;
     update();
+  });
+  // Typing in the field, or a preset button, moves the calendar with it.
+  const syncChooser = () => {
+    chooser.value = input.value;
   };
-  tomorrowAt.addEventListener('change', applyTomorrow);
+  input.addEventListener('input', syncChooser);
+  input.addEventListener('change', syncChooser);
 
   update();
 
@@ -1293,12 +1299,12 @@ function scheduledAtPicker(input) {
     el('label', { text: 'Runs at' }),
     input,
     el('div', { class: 'preset-row' }, [
+      inMinutes('+30m', 30, 'Thirty minutes from now'),
       inMinutes('+1hr', 60, 'One hour from now'),
-      inMinutes('+4hr', 240, 'Four hours from now'),
+      inMinutes('+3hr', 180, 'Three hours from now'),
       el('span', { class: 'preset-sep' }),
-      el('span', { class: 'preset-label', text: 'Tomorrow at' }),
-      tomorrowAt,
-      el('button', { type: 'button', class: 'btn small', text: 'Set', onclick: applyTomorrow }),
+      el('span', { class: 'preset-label', text: 'Select datetime' }),
+      chooser,
     ]),
     el('div', { class: 'hint', text: 'Your local time. It runs once, then stays in the list as history.' }),
     preview,
@@ -1435,9 +1441,21 @@ async function renderExecutionForm(id, duplicateOf) {
   const execution = sourceId ? await api(`/api/executions/${sourceId}`) : null;
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
-  /** An ISO time in the shape the datetime-local field wants: local, no zone. */
+  /**
+   * An ISO time in the shape the datetime-local field wants: local, no zone.
+   *
+   * With nothing to read — a new execution, or a duplicate of one already run
+   * — it offers tomorrow at 8am. Most one-time runs are "do this overnight",
+   * and a default in the morning is one nobody has to clear first.
+   */
   const asFieldValue = (iso) => {
-    const date = iso ? new Date(iso) : new Date(Date.now() + 3600000);
+    let date;
+    if (iso) date = new Date(iso);
+    else {
+      date = new Date();
+      date.setDate(date.getDate() + 1);
+      date.setHours(8, 0, 0, 0);
+    }
     if (Number.isNaN(date.getTime())) return '';
     const pad = (value) => String(value).padStart(2, '0');
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
