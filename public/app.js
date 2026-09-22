@@ -2145,9 +2145,11 @@ async function renderSettings() {
       el('h2', { text: 'Worktrees' }),
       el('div', { class: 'field' }, [el('label', { text: 'Default .worktreeinclude' }), worktreeInclude]),
       el('div', { class: 'hint' }, [
-        'Written to a job\'s working directory as ',
+        'Written as ',
         el('span', { class: 'mono', text: '.worktreeinclude' }),
-        ', and only for jobs with worktrees turned on. ',
+        ' before each run of a job with Use worktree on, to the root of the git repository its working directory is in. ',
+        'It goes at the root even when the working directory is a subfolder, because that is the only place Claude Code reads it. ',
+        'Nothing is written while this is empty, or when the working directory is not in a git repository. ',
         'Claude Code copies the files it lists into each new worktree: one pattern per line, written like ',
         el('span', { class: 'mono', text: '.gitignore' }),
         ', matching only files git ignores, such as ',
@@ -2157,7 +2159,7 @@ async function renderSettings() {
       el('div', { class: 'hint warn' }, [
         'Any ',
         el('span', { class: 'mono', text: '.worktreeinclude' }),
-        ' already in that folder is overwritten with this text, including one the repo has committed.',
+        ' already at the repository root is overwritten with this text on every run, including one the repo has committed.',
       ]),
     ]),
     el('div', { class: 'card' }, [
