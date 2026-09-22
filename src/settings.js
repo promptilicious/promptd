@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ROOT } from './paths.js';
+import { DEFAULT_USAGE_THRESHOLDS, normalizeUsageThresholds } from './usage.js';
 
 export const SETTINGS_FILE = path.join(ROOT, 'settings.json');
 
@@ -33,6 +34,9 @@ export const DEFAULT_SETTINGS = {
   // Runs allowed at once. A trigger arriving with every slot taken is held as
   // delayed and started, oldest first, as the running ones finish. 0 is no limit.
   maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
+  // The percentage each Delay for usage limit has to reach before a cron that
+  // ticks it is held.
+  usageDelayThresholds: DEFAULT_USAGE_THRESHOLDS,
   // Set once the log folders have been renamed from cron names to cron ids.
   logsMigrated: false,
 };
@@ -41,7 +45,8 @@ export const DEFAULT_SETTINGS = {
 export async function loadSettings() {
   try {
     const parsed = JSON.parse(await fsp.readFile(SETTINGS_FILE, 'utf8'));
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    // Filled per key, so a hand edit that drops one threshold keeps the other three.
+    return { ...DEFAULT_SETTINGS, ...parsed, usageDelayThresholds: normalizeUsageThresholds(parsed?.usageDelayThresholds) };
   } catch (err) {
     if (err.code === 'ENOENT') {
       await saveSettings(DEFAULT_SETTINGS);

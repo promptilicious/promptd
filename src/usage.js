@@ -188,43 +188,84 @@ function kindOf(window) {
 
 /**
  * The usage categories a cron can be told to wait on, each matched against what
- * a limit *is* rather than how the header words it. `blocks` is the threshold
- * that holds a trigger back: a rate limit has to be spent outright, while extra
- * credits are a spending cap, so the cron is held before the money runs out.
- *
- * `matches` and `blocks` are functions, so JSON.stringify drops them and the
- * same array can be handed to the page as the checkbox list.
+ * a limit *is* rather than how the header words it. A trigger is held while its
+ * limit is at or above that category's threshold, which the Settings page sets;
+ * `defaultThreshold` is what it is out of the box.
  */
 export const USAGE_DELAY_CATEGORIES = [
   {
     id: 'session',
     label: 'Session',
-    hint: 'Wait while the 5-hour session limit is at 100%.',
+    limit: 'the 5-hour session limit',
+    defaultThreshold: 90,
     matches: (window) => kindOf(window) === 'session',
-    blocks: (used) => used >= 100,
   },
   {
     id: 'weekly',
     label: 'Weekly',
-    hint: 'Wait while the rolling 7-day limit, all models, is at 100%.',
+    limit: 'the rolling 7-day limit, all models,',
+    defaultThreshold: 95,
     matches: (window) => kindOf(window) === 'weekly_all',
-    blocks: (used) => used >= 100,
   },
   {
     id: 'fable',
     label: 'Fable',
-    hint: 'Wait while the Fable weekly limit is at 100%.',
+    limit: 'the Fable weekly limit',
+    defaultThreshold: 95,
     matches: (window) => kindOf(window) === 'weekly_scoped' && /fable/i.test(window?.scope ?? window?.label ?? ''),
-    blocks: (used) => used >= 100,
   },
   {
     id: 'credits',
-    label: 'Monthly Credits 90%',
-    hint: 'Wait while more than 90% of the extra usage credits are spent. Credits reset on the 1st of each month.',
+    label: 'Monthly Credits',
+    limit: 'spending on extra usage credits',
+    note: 'Credits reset on the 1st of each month.',
+    defaultThreshold: 90,
     matches: (window) => kindOf(window) === 'spend',
-    blocks: (used) => used > 90,
   },
 ];
+
+/** A whole percentage from 1 to 100, or null when the input is not one. */
+export function parseUsageThreshold(input) {
+  const value = Number(input);
+  return Number.isInteger(value) && value >= 1 && value <= 100 ? value : null;
+}
+
+/** Every category's threshold, always all four keys; a missing or bad one takes its default. */
+export function normalizeUsageThresholds(input) {
+  const value = {};
+  for (const category of USAGE_DELAY_CATEGORIES) {
+    value[category.id] = parseUsageThreshold(input?.[category.id]) ?? category.defaultThreshold;
+  }
+  return value;
+}
+
+export const DEFAULT_USAGE_THRESHOLDS = normalizeUsageThresholds({});
+
+/**
+ * The thresholds in force. Held in memory like the concurrent job limit: the
+ * server sets them from settings.json at boot and again on every save, so a
+ * trigger deciding whether to hold never waits on a disk read.
+ */
+let thresholds = DEFAULT_USAGE_THRESHOLDS;
+
+export function setUsageThresholds(input) {
+  thresholds = normalizeUsageThresholds(input);
+  return thresholds;
+}
+
+/** The categories as the page draws them, with the threshold in force now. */
+export function usageDelayOptions() {
+  return USAGE_DELAY_CATEGORIES.map((category) => {
+    const threshold = thresholds[category.id];
+    return {
+      id: category.id,
+      label: category.label,
+      threshold,
+      defaultThreshold: category.defaultThreshold,
+      hint: `Wait while ${category.limit} is at ${threshold}% or more.${category.note ? ` ${category.note}` : ''}`,
+    };
+  });
+}
 
 /** Every category, always all four keys, so a cron file never carries a half set. */
 export function normalizeUsageDelay(input) {
@@ -253,11 +294,13 @@ export function usageBlockers(reading, delay) {
   for (const category of USAGE_DELAY_CATEGORIES) {
     if (!delay?.[category.id]) continue;
     const window = windows.find((candidate) => category.matches(candidate));
-    if (!window || !category.blocks(window.usedPercent)) continue;
+    const threshold = thresholds[category.id];
+    if (!window || window.usedPercent < threshold) continue;
     blockers.push({
       id: category.id,
       label: category.label,
       usedPercent: window.usedPercent,
+      threshold,
       resetsAt: window.resetsAt ?? null,
     });
   }

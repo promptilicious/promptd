@@ -216,18 +216,20 @@ When the time is up, or you cancel, the crons and one-time executions are re-rea
 
 ## Delaying a cron for usage
 
-Each cron has a **Delay for usage** section on its form: four checkboxes, all off by default.
+Each cron has a **Delay for usage** section on its form: four checkboxes, all off by default. Each one holds the trigger while its limit is at or above a percentage, shown in parentheses next to the checkbox.
 
-| Checkbox                | Holds the trigger while                                     |
-| ----------------------- | ----------------------------------------------------------- |
-| Session                 | the 5-hour session limit is at 100%                          |
-| Weekly                  | the rolling 7-day limit, all models, is at 100%              |
-| Fable                   | the Fable weekly limit is at 100%                            |
-| Monthly Credits 90%     | more than 90% of the extra usage credits are spent           |
+| Checkbox        | Watches                                   | Default |
+| --------------- | ----------------------------------------- | ------- |
+| Session         | the 5-hour session limit                  | 90%     |
+| Weekly          | the rolling 7-day limit, all models       | 95%     |
+| Fable           | the Fable weekly limit                    | 95%     |
+| Monthly Credits | spending on extra usage credits           | 90%     |
+
+The percentages are set on the Settings page, under **Delay for usage**, and apply to every cron and one-time execution that ticks the box. A change reaches the next trigger; a trigger already waiting is re-checked at once, so raising a percentage can release it.
 
 These are the same limits the header meters draw, matched on what a limit *is* rather than on its label, so nothing has to change here when the wording does. Tick none and the cron behaves exactly as it always has.
 
-When a cron with at least one box ticked triggers, usage is read and every ticked limit is checked. If any is over its threshold the run does not start: the cron goes to `delayed`, and the trigger waits.
+When a cron with at least one box ticked triggers, usage is read and every ticked limit is checked. If any is at or above its percentage the run does not start: the cron goes to `delayed`, and the trigger waits.
 
 1. **The status reads `delayed`,** and hovering it names every limit it is waiting on, what each is at, when each resets, and the estimated start. The Next run column shows that estimate too.
 2. **It starts on the first reading that shows the limit clear.** Waiting costs no extra API requests: the check reads the same cached numbers the header meters draw, and never asks the endpoint out of turn. That reading refreshes at most once every five minutes however many triggers are waiting, so a run can start up to five minutes after its limit actually resets. Getting the account rate limited is the worse outcome, and the endpoint is shared with every other Claude session on this machine.
@@ -299,11 +301,12 @@ The **⚙** button at the right of the header opens a page for everything below.
   "lastUpdateCheckAt": null,
   "lastUpdateLaunchedAt": null,
   "lastUpdateFromCommit": null,
-  "maxConcurrentJobs": 8
+  "maxConcurrentJobs": 8,
+  "usageDelayThresholds": { "session": 90, "weekly": 95, "fable": 95, "credits": 90 }
 }
 ```
 
-`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
+`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
 
 The check runs on the interval either way. `selfUpdate` decides only whether what it finds gets applied: with it off, the server still fetches and compares, and an available update shows as an amber **Update available** badge in the header that links to this page. Nothing is pulled and no cron is paused until you press **Update now**.
 
@@ -723,7 +726,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/notifications?before=&limit=` | One page of notifications, newest first, plus the unread count and the cursor for the next page                                                                                 |
 | POST             | `/api/notifications/read`          | Mark notifications read. Body `{"ids":[...]}`; answers with what is still unread                                                                                               |
 | GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are waiting and how many of those are queued for a slot, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
-| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours` and `maxConcurrentJobs`                                                                                          |
+| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs` and `usageDelayThresholds`                                                                  |
 | GET              | `/api/queue`                       | The concurrent job limit, what is running under it with each job's average run length, and what is queued behind it with each one's position and estimated start                |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"30m"\|"1h"\|"3h"\|"restart"}`                                                                                                            |

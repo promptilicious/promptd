@@ -287,12 +287,12 @@ function waitingSummary(jobs) {
 function delayTitle(delayed) {
   if (!delayed) return '';
   if (delayed.hold === 'concurrency') return queueTitle(delayed);
-  const lines = ['Waiting on a spent usage limit.'];
+  const lines = ['Waiting on a usage limit at or above its threshold.'];
   for (const reason of delayed.reasons ?? []) {
     const resets = reason.resetsAt
       ? `resets ${fmtRelative(reason.resetsAt)} (${fmtDateTime(reason.resetsAt)})`
       : 'no reset time reported';
-    lines.push(`${reason.label}: ${Math.round(reason.usedPercent)}% used, ${resets}`);
+    lines.push(`${reason.label}: ${Math.round(reason.usedPercent)}% used (delays at ${reason.threshold}%), ${resets}`);
   }
   // Usage is only read every five minutes, and a waiting run adds no lookups of
   // its own, so the start can trail the reset by that much.
@@ -357,12 +357,12 @@ function riskJobLine(job) {
 function delayRiskTitle(risk) {
   const sections = ['This run could start late.'];
   if (risk.usage?.length) {
-    const lines = ['A usage limit this job waits on is spent:'];
+    const lines = ['A usage limit this job waits on is at or above its threshold:'];
     for (const limit of risk.usage) {
       const resets = limit.resetsAt
         ? `resets ${fmtRelative(limit.resetsAt)} (${fmtDateTime(limit.resetsAt)})`
         : 'no reset time reported';
-      lines.push(`${limit.label}: ${Math.round(limit.usedPercent)}% used, ${resets}`);
+      lines.push(`${limit.label}: ${Math.round(limit.usedPercent)}% used (delays at ${limit.threshold}%), ${resets}`);
     }
     lines.push('The run waits until a usage check shows it clear. Usage is checked every 5 minutes.');
     sections.push(lines.join('\n'));
@@ -1261,10 +1261,16 @@ function usageDelayPicker(selected) {
   const note = el('div', {
     class: 'hint',
     text:
-      'A ticked limit that is spent makes the run wait instead of starting, Run now included. ' +
+      'A ticked limit at or above its percentage makes the run wait instead of starting, Run now included. ' +
       'It starts when usage clears, within about 5 minutes. Only one run waits at a time; any ' +
       'trigger that arrives while it waits is dropped.',
   });
+  const thresholdsNote = el('div', { class: 'hint' }, [
+    'The percentages are set on the ',
+    // A new tab, so following it does not throw away what is typed in the form.
+    el('a', { href: '#/settings', target: '_blank', rel: 'noopener', text: 'Settings page' }),
+    ' and apply to every cron and one-time execution.',
+  ]);
 
   const paint = (categories) => {
     boxes.clear();
@@ -1273,7 +1279,10 @@ function usageDelayPicker(selected) {
         const box = el('input', { type: 'checkbox' });
         box.checked = Boolean(selected?.[category.id]);
         boxes.set(category.id, box);
-        return el('label', { class: 'check', title: category.hint }, [box, category.label]);
+        return el('label', { class: 'check', title: category.hint }, [
+          box,
+          el('span', {}, [`${category.label} `, el('span', { class: 'muted', text: `(${category.threshold}%)` })]),
+        ]);
       }),
     );
   };
@@ -1288,7 +1297,7 @@ function usageDelayPicker(selected) {
 
   return {
     read: () => Object.fromEntries([...boxes].map(([id, box]) => [id, box.checked])),
-    field: el('div', { class: 'field' }, [el('label', { text: 'Delay for usage' }), grid, note]),
+    field: el('div', { class: 'field' }, [el('label', { text: 'Delay for usage' }), grid, note, thresholdsNote]),
   };
 }
 
@@ -1787,6 +1796,55 @@ async function renderSettings() {
   limitInput.addEventListener('change', () => applyLimit(Number(limitInput.value)));
   limitReset.addEventListener('click', () => applyLimit(processors));
 
+  // ---- usage delay thresholds ----
+  const usageCategories = config.usageDelayCategories ?? [];
+  // Tracked per category like the fields above, so a rejected entry restores the
+  // value in force rather than the one the page loaded with.
+  const thresholds = { ...settings.usageDelayThresholds };
+  const thresholdInputs = new Map();
+
+  const applyThreshold = async (category, value) => {
+    const input = thresholdInputs.get(category.id);
+    if (!Number.isInteger(value) || value < 1 || value > 100) {
+      toast(`${category.label} must be a whole number from 1 to 100`, true);
+      input.value = String(thresholds[category.id]);
+      return;
+    }
+    thresholds[category.id] = value;
+    input.value = String(value);
+    await save({ usageDelayThresholds: { [category.id]: value } }, `${category.label} delays at ${value}%`);
+  };
+
+  const thresholdRow = el(
+    'div',
+    { class: 'preset-row' },
+    usageCategories.flatMap((category, index) => {
+      const input = el('input', {
+        type: 'text',
+        class: 'mono narrow',
+        value: String(thresholds[category.id] ?? category.defaultThreshold),
+        'aria-label': `${category.label} threshold`,
+      });
+      input.addEventListener('change', () => applyThreshold(category, Number(input.value)));
+      thresholdInputs.set(category.id, input);
+      return [
+        index ? el('span', { class: 'preset-sep' }) : null,
+        el('span', { class: 'preset-label', text: category.label }),
+        input,
+        el('span', { class: 'preset-label', text: '%' }),
+      ];
+    }),
+  );
+
+  const thresholdDefaults = usageCategories.map((category) => `${category.label} ${category.defaultThreshold}%`).join(', ');
+  const thresholdReset = el('button', { class: 'btn small', text: 'Use defaults' });
+  thresholdReset.addEventListener('click', async () => {
+    const defaults = Object.fromEntries(usageCategories.map((category) => [category.id, category.defaultThreshold]));
+    Object.assign(thresholds, defaults);
+    for (const [id, input] of thresholdInputs) input.value = String(defaults[id]);
+    await save({ usageDelayThresholds: defaults }, 'Usage delays back to their defaults');
+  });
+
   const stat = (value, label, sub) =>
     el('div', { class: 'stat' }, [
       value.nodeType ? value : el('div', { class: 'stat-value', text: value }),
@@ -2005,6 +2063,16 @@ async function renderSettings() {
       el('div', { class: 'hint' }, [
         'Next slot is the soonest a running job is due to finish: its own average run length, less how long it has been going. ',
         'A job with no finished runs behind it has no average and is left out, so a slot can come free sooner than this says.',
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
+      el('h2', { text: 'Delay for usage' }),
+      thresholdRow,
+      el('div', { class: 'preset-row' }, [thresholdReset]),
+      el('div', { class: 'hint' }, [
+        'A cron or one-time execution with a limit ticked under Delay for usage waits while that limit is at or above its percentage here. ',
+        'The same percentage applies to every job that ticks it, and a change reaches the next trigger. ',
+        `The defaults are ${thresholdDefaults}.`,
       ]),
     ]),
     el('div', { class: 'card' }, [

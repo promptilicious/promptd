@@ -1084,6 +1084,11 @@ textarea:focus {
   color: var(--muted);
 }
 
+.hint a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .hint.ok {
   color: var(--green);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

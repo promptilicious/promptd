@@ -30,7 +30,14 @@ import { modelCatalog } from './models.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings, normalizeMaxConcurrentJobs, patchSettings } from './settings.js';
 import { migrateLogDirs } from './logsMigration.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
-import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
+import {
+  USAGE_DELAY_CATEGORIES,
+  normalizeUsageDelay,
+  parseUsageThreshold,
+  setUsageThresholds,
+  usageDelayOptions,
+  usageMonitor,
+} from './usage.js';
 import { lifetimeStats } from './stats.js';
 import { systemMonitor } from './system.js';
 import { MAX_NOTIFICATIONS, NOTIFICATIONS_DIR, PAGE_SIZE, notificationCenter } from './notifications.js';
@@ -190,8 +197,6 @@ async function findRecord(id) {
 }
 
 app.get('/api/config', (_req, res) => {
-  // USAGE_DELAY_CATEGORIES carries its matcher functions; JSON.stringify drops
-  // them, so the page receives exactly the id, label and hint it draws.
   res.json({
     storageRoot: ROOT,
     cronsDir: CRONS_DIR,
@@ -201,7 +206,8 @@ app.get('/api/config', (_req, res) => {
     maxNotifications: MAX_NOTIFICATIONS,
     executionsDir: EXECUTIONS_DIR,
     effortLevels: EFFORT_LEVELS,
-    usageDelayCategories: USAGE_DELAY_CATEGORIES,
+    // Each with the threshold in force now, which the form draws next to its label.
+    usageDelayCategories: usageDelayOptions(),
     // What the concurrent job limit defaults to, so the Settings page can say
     // what "processors" means on this machine.
     defaultMaxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
@@ -319,10 +325,29 @@ app.put('/api/settings', async (req, res, next) => {
       if (limit === null) return res.status(400).json({ error: 'maxConcurrentJobs must be 0 or a positive whole number' });
       patch.maxConcurrentJobs = limit;
     }
+    if ('usageDelayThresholds' in (req.body ?? {})) {
+      // Any subset of the categories; the ones left out keep what is on disk.
+      const given = req.body.usageDelayThresholds ?? {};
+      const thresholds = { ...(await loadSettings()).usageDelayThresholds };
+      for (const category of USAGE_DELAY_CATEGORIES) {
+        if (!(category.id in given)) continue;
+        const value = parseUsageThreshold(given[category.id]);
+        if (value === null) {
+          return res.status(400).json({ error: `usageDelayThresholds.${category.id} must be a whole number from 1 to 100` });
+        }
+        thresholds[category.id] = value;
+      }
+      patch.usageDelayThresholds = thresholds;
+    }
     const saved = await patchSettings(patch);
     // Written first, applied second: the service reads its limit from memory, so
     // a save that did not reach the disk must not change what is running.
     if ('maxConcurrentJobs' in patch) cronService.setConcurrencyLimit(saved.maxConcurrentJobs);
+    if ('usageDelayThresholds' in patch) {
+      setUsageThresholds(saved.usageDelayThresholds);
+      // A raised threshold can clear a held trigger now rather than at the next review.
+      cronService.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
+    }
     res.json(saved);
   } catch (err) {
     next(err);
@@ -780,6 +805,7 @@ const bootSettings = await loadSettings(); // writes settings.json with defaults
 // Before anything is armed, so the very first trigger is held by the same limit
 // every later one is.
 cronService.setConcurrencyLimit(bootSettings.maxConcurrentJobs);
+setUsageThresholds(bootSettings.usageDelayThresholds);
 // Before any schedule can write a log: after this the folders are cron ids.
 await migrateLogDirs().catch((err) => console.error(`[logs] migration failed: ${err.message}`));
 runningCommit = await currentCommit();
