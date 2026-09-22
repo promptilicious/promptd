@@ -1408,3 +1408,59 @@ input.narrow {
     display: none;
   }
 }
+
+/* The live queue on the Settings page: what is running under the concurrent
+   job limit, and what is waiting behind it. */
+.queue-body {
+  display: grid;
+  gap: 12px;
+}
+
+.queue-list {
+  display: grid;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.queue-row {
+  display: grid;
+  grid-template-columns: 26px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  background: var(--panel);
+}
+
+/* The place in line, which is the one number the row is really about. */
+.queue-pos {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.queue-pos.running {
+  border-color: transparent;
+  color: var(--accent);
+}
+
+.queue-when {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* A name that goes somewhere reads as a link; the row is not clickable itself. */
+.queue-row .link:hover {
+  color: var(--accent);
+}

@@ -250,6 +250,42 @@ held       waited 43m 18s for Session
 
 A pause outranks a delay. If usage clears while every schedule is paused, the trigger keeps waiting and goes when the pause lifts. Deactivating a cron throws away a scheduled trigger that is still waiting; a **Run now** that is waiting survives, because that one is your own press.
 
+## Limiting concurrent jobs
+
+Every run is a `claude` process of its own. Left alone, ten triggers landing at once start ten of them, and they compete for the same cores. The **Limit concurrent jobs** setting caps how many run at a time and queues the rest.
+
+It lives on the Settings page and defaults to this machine's processor count. Set it to `0` for no limit.
+
+When a trigger arrives with every slot taken, the run does not start: the job goes to `delayed`, and the trigger waits in a queue.
+
+1. **The queue is first in, first out.** Runs keep the order their triggers fired, so a schedule that fires at 9:00 goes before one that fired at 9:01 however long each waits.
+2. **A finishing run starts the next one immediately.** The slot is handed over the moment the run's process closes, before the rest of its bookkeeping — the log footer, the counters, the notification — is written.
+3. **The status reads `delayed`,** and hovering it gives the position in the queue, how many jobs are running, and the estimated start. The Next run column shows the estimate too.
+4. **Only one trigger waits per job,** the same rule the usage delay follows. A second trigger arriving while one is queued is dropped, not stacked behind it.
+5. **Run now does not override the limit.** Pressing it with every slot taken queues the trigger and answers 202 with the delay, rather than starting `claude` anyway.
+
+**Stop drops a queued trigger.** While a job is `delayed` the Run now button is a **Stop** button, and pressing it throws the waiting trigger away. The schedule is untouched.
+
+### The estimate
+
+The **next slot** time is the soonest a running job is due to finish: that job's own average run length, less how long it has been going, taking the lowest across everything running. A job at position 2 in the queue is estimated against the second slot to come free, and so on.
+
+Two things it does not claim. A job with no completed run behind it has no average and is left out of the estimate entirely, so a slot can come free sooner than the page says. And a run already past its average could end at any moment, which is how it reads — never as a time in the past.
+
+### What it does not do
+
+- **Lowering the limit never stops a run.** It only holds the next ones; whatever is already going finishes.
+- **The queue lives in memory.** Like the pause and the usage delay, a restart clears it, and the next trigger of each cron starts afresh.
+- **A pause outranks it.** Nothing leaves the queue while every schedule is held; lifting the pause drains it.
+- **A queued trigger is not a running one.** It does not count towards the runs an update waits to drain.
+- **The usage delay is checked twice.** A trigger is checked against its watched limits on the way in, and again when its slot comes free — so a limit spent while it queued still holds it back rather than being stepped over.
+
+A run that waited says so in its log header, above the prompt:
+
+```
+queued     waited 4m 06s for a slot behind 8 running jobs
+```
+
 ## Settings and self update
 
 The **⚙** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
@@ -262,11 +298,12 @@ The **⚙** button at the right of the header opens a page for everything below.
   "updateCheckIntervalHours": 24,
   "lastUpdateCheckAt": null,
   "lastUpdateLaunchedAt": null,
-  "lastUpdateFromCommit": null
+  "lastUpdateFromCommit": null,
+  "maxConcurrentJobs": 8
 }
 ```
 
-The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
+`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
 
 The check runs on the interval either way. `selfUpdate` decides only whether what it finds gets applied: with it off, the server still fetches and compares, and an available update shows as an amber **Update available** badge in the header that links to this page. Nothing is pulled and no cron is paused until you press **Update now**.
 
@@ -675,18 +712,19 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/crons`                       | List, with next run time and live-run state                                                                                                                                    |
 | POST             | `/api/crons`                       | Create                                                                                                                                                                         |
 | GET, PUT, DELETE | `/api/crons/:id`                   | Read, update, delete                                                                                                                                                           |
-| POST             | `/api/crons/:id/run`               | Trigger now. 409 if already running, if crons are paused, or if a trigger is already waiting on usage. 202 with `delayed` instead of a run when a watched limit is spent        |
-| POST             | `/api/crons/:id/stop`              | Kill the in-flight run, or drop a trigger waiting on usage (409 if neither)                                                                                                    |
+| POST             | `/api/crons/:id/run`               | Trigger now. 409 if already running, if crons are paused, or if a trigger is already waiting. 202 with `delayed` instead of a run when a watched limit is spent or every slot is taken |
+| POST             | `/api/crons/:id/stop`              | Kill the in-flight run, or drop a waiting trigger (409 if neither)                                                                                                             |
 | GET              | `/api/crons/:id/logs`              | Run history newest first, plus the cron's lifetime totals and per-run averages                                                                                                 |
 | GET              | `/api/crons/:id/logs/:file`        | One log as JSON                                                                                                                                                                |
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
-| GET              | `/api/config`                      | Storage paths, the log and notification retention limits, effort levels, and the usage-delay categories                                                                                                  |
+| GET              | `/api/config`                      | Storage paths, the log and notification retention limits, effort levels, the usage-delay categories, and the default concurrent job limit                                        |
 | GET              | `/api/system`                      | Machine stats: the current reading, the last fifteen minutes behind it, what each meter means, and this machine's cores, memory and storage path                                |
 | GET              | `/api/notifications?before=&limit=` | One page of notifications, newest first, plus the unread count and the cursor for the next page                                                                                 |
 | POST             | `/api/notifications/read`          | Mark notifications read. Body `{"ids":[...]}`; answers with what is still unread                                                                                               |
-| GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are held for usage, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
-| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate` and `updateCheckIntervalHours`                                                                                                               |
+| GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are waiting and how many of those are queued for a slot, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
+| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours` and `maxConcurrentJobs`                                                                                          |
+| GET              | `/api/queue`                       | The concurrent job limit, what is running under it with each job's average run length, and what is queued behind it with each one's position and estimated start                |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"15m"\|"1h"\|"6h"\|"restart"}`                                                                                                            |
 | DELETE           | `/api/pause`                       | Resume (409 if not paused, or if the pause belongs to an update)                                                                                                               |

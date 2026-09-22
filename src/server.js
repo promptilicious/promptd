@@ -27,7 +27,7 @@ import {
 } from './executions.js';
 import { cronFileWatcher } from './watcher.js';
 import { modelCatalog } from './models.js';
-import { loadSettings, patchSettings } from './settings.js';
+import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings, normalizeMaxConcurrentJobs, patchSettings } from './settings.js';
 import { migrateLogDirs } from './logsMigration.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, usageMonitor } from './usage.js';
@@ -198,6 +198,9 @@ app.get('/api/config', (_req, res) => {
     executionsDir: EXECUTIONS_DIR,
     effortLevels: EFFORT_LEVELS,
     usageDelayCategories: USAGE_DELAY_CATEGORIES,
+    // What the concurrent job limit defaults to, so the Settings page can say
+    // what "processors" means on this machine.
+    defaultMaxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
   });
 });
 
@@ -301,10 +304,30 @@ app.put('/api/settings', async (req, res, next) => {
       if (!Number.isFinite(hours) || hours <= 0) return res.status(400).json({ error: 'updateCheckIntervalHours must be a positive number' });
       patch.updateCheckIntervalHours = hours;
     }
-    res.json(await patchSettings(patch));
+    if ('maxConcurrentJobs' in (req.body ?? {})) {
+      const limit = normalizeMaxConcurrentJobs(req.body.maxConcurrentJobs);
+      if (limit === null) return res.status(400).json({ error: 'maxConcurrentJobs must be 0 or a positive whole number' });
+      patch.maxConcurrentJobs = limit;
+    }
+    const saved = await patchSettings(patch);
+    // Written first, applied second: the service reads its limit from memory, so
+    // a save that did not reach the disk must not change what is running.
+    if ('maxConcurrentJobs' in patch) cronService.setConcurrencyLimit(saved.maxConcurrentJobs);
+    res.json(saved);
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * The concurrent job limit, what is running under it, and what is queued behind
+ * it — with the estimated start time of each waiting trigger.
+ *
+ * Answered from memory: the queue is never written to disk, for the same reason
+ * the pause is not. A restart comes back with nothing waiting.
+ */
+app.get('/api/queue', (_req, res) => {
+  res.json(cronService.concurrencyInfo());
 });
 
 /**
@@ -539,8 +562,14 @@ app.post('/api/:kind(crons|executions)/:id/run', async (req, res, next) => {
           : `everything is paused ${cronService.pauseInfo().label}; cancel the pause to run one`,
       });
     }
-    if (cronService.isDelayed(cron.id)) {
-      return res.status(409).json({ error: `a trigger for this ${noun(req)} is already waiting on usage` });
+    const waiting = cronService.delayInfo(cron.id);
+    if (waiting) {
+      return res.status(409).json({
+        error:
+          waiting.hold === 'concurrency'
+            ? `a trigger for this ${noun(req)} is already queued behind the ${waiting.limit} job limit`
+            : `a trigger for this ${noun(req)} is already waiting on usage`,
+      });
     }
     const result = await cronService.trigger(cron.id, 'manual');
     if (!result) return res.status(409).json({ error: `this ${noun(req)} is already running` });
@@ -714,6 +743,8 @@ app.get('/api/health', async (_req, res) => {
     startedAt: STARTED_AT,
     paused: cronService.isPaused(),
     delayed: cronService.delayedCount(),
+    queued: cronService.queuedCount(),
+    concurrencyLimit: cronService.concurrencyLimit,
     unreadNotifications: notificationCenter.unreadCount(),
     usage,
     ...selfUpdater.availability(),
@@ -729,7 +760,10 @@ await ensureDirs();
 // Subscribes to the event bus before anything can emit, and reads the folder
 // behind the server coming up: 5000 small files are not worth a slow start.
 notificationCenter.start();
-await loadSettings(); // writes settings.json with defaults on first run
+const bootSettings = await loadSettings(); // writes settings.json with defaults on first run
+// Before anything is armed, so the very first trigger is held by the same limit
+// every later one is.
+cronService.setConcurrencyLimit(bootSettings.maxConcurrentJobs);
 // Before any schedule can write a log: after this the folders are cron ids.
 await migrateLogDirs().catch((err) => console.error(`[logs] migration failed: ${err.message}`));
 runningCommit = await currentCommit();

@@ -1,8 +1,25 @@
 import fsp from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { ROOT } from './paths.js';
 
 export const SETTINGS_FILE = path.join(ROOT, 'settings.json');
+
+/**
+ * How many runs may be in flight at once, out of the box.
+ *
+ * Every run is a `claude` process of its own, so the processor count is the
+ * point past which they stop getting more done and start competing for the
+ * same cores. Setting it to 0 turns the limit off entirely.
+ */
+export const DEFAULT_MAX_CONCURRENT_JOBS = os.cpus().length || 1;
+
+/** A whole number of jobs, or null when the input is not one. 0 is unlimited. */
+export function normalizeMaxConcurrentJobs(input) {
+  const value = Number(input);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.floor(value);
+}
 
 export const DEFAULT_SETTINGS = {
   // Check once a day whether the project's main branch is behind its remote,
@@ -13,6 +30,9 @@ export const DEFAULT_SETTINGS = {
   lastUpdateCheckAt: null,
   lastUpdateLaunchedAt: null,
   lastUpdateFromCommit: null,
+  // Runs allowed at once. A trigger arriving with every slot taken is held as
+  // delayed and started, oldest first, as the running ones finish. 0 is no limit.
+  maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
   // Set once the log folders have been renamed from cron names to cron ids.
   logsMigrated: false,
 };

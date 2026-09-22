@@ -9,6 +9,9 @@ let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
 let reloadTimer = null; // counting down to a reload after an update was started
 let updateWatchTimer = null; // polling while an update waits for runs to finish
+// Set by the Settings page so run activity can redraw its queue card without
+// rebuilding the whole page under the user's cursor. Cleared on navigation.
+let repaintQueue = null;
 // The commit the server reported when this page loaded. If it ever differs, the
 // server has been updated underneath us and this page is running old code.
 let loadedCommit = null;
@@ -77,6 +80,18 @@ function fmtRelative(iso) {
 }
 
 /**
+ * A time meant to be ahead of us, as a countdown.
+ *
+ * An estimate that has come and gone is not wrong — the run it was read off is
+ * simply going longer than its average — so it reads as imminent rather than as
+ * a time in the past, which for a "next slot" would make no sense at all.
+ */
+function fmtCountdown(iso) {
+  if (!iso) return '';
+  return new Date(iso).getTime() <= Date.now() ? 'any moment' : fmtRelative(iso);
+}
+
+/**
  * A run length, always down to the second so a live clock ticks visibly.
  * Minutes and hours are zero-padded so the digits do not jump around.
  */
@@ -104,6 +119,11 @@ function fmtElapsed(iso) {
 function tickRuntimes() {
   for (const node of document.querySelectorAll('[data-runtime-start]')) {
     node.textContent = fmtElapsed(node.dataset.runtimeStart);
+  }
+  // The same idea pointed the other way: an estimate counting down to the time
+  // a queued job could start.
+  for (const node of document.querySelectorAll('[data-countdown-to]')) {
+    node.textContent = fmtCountdown(node.dataset.countdownTo);
   }
 }
 
@@ -235,11 +255,24 @@ function delayNames(delayed) {
 }
 
 /**
+ * The tail of a list's summary line: what is waiting, split by what is holding
+ * it. The two are different states — one waits on the clock, the other on a
+ * running job — so one number for both would hide which.
+ */
+function waitingSummary(jobs) {
+  const waiting = jobs.filter((job) => job.isDelayed);
+  const queued = waiting.filter((job) => job.delayed?.hold === 'concurrency').length;
+  const onUsage = waiting.length - queued;
+  return `${onUsage ? ` · ${onUsage} waiting on usage` : ''}${queued ? ` · ${queued} queued for a slot` : ''}`;
+}
+
+/**
  * Hover text for a delayed badge: which limits are holding the trigger, what
  * each is at, and the earliest the run can start.
  */
 function delayTitle(delayed) {
   if (!delayed) return '';
+  if (delayed.hold === 'concurrency') return queueTitle(delayed);
   const lines = ['Waiting on a spent usage limit.'];
   for (const reason of delayed.reasons ?? []) {
     const resets = reason.resetsAt
@@ -256,6 +289,45 @@ function delayTitle(delayed) {
   );
   lines.push(`Waiting since ${fmtDateTime(delayed.delayedAt)}. Stop drops it.`);
   return lines.join('\n');
+}
+
+/**
+ * Hover text for a queued badge: where the trigger is in line, what it is
+ * behind, and when a slot is expected to come free.
+ *
+ * The estimate is the soonest a running job is due to finish, worked out from
+ * what that job's own runs have averaged. A job that has never finished one has
+ * no average and is left out, so the real start can come earlier than this says.
+ */
+function queueTitle(delayed) {
+  const lines = [
+    `Queued behind the concurrent job limit of ${delayed.limit}.`,
+    `Position ${delayed.position + 1} of ${delayed.queueLength}, with ${delayed.runningCount} job${delayed.runningCount === 1 ? '' : 's'} running.`,
+    delayed.resumeAt
+      ? `Could start ${fmtCountdown(delayed.resumeAt)} (${fmtDateTime(delayed.resumeAt)}), estimated from what the running jobs average.`
+      : 'No estimate: the running jobs have no completed runs to average.',
+    `Waiting since ${fmtDateTime(delayed.delayedAt)}. Stop drops it.`,
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * The Next run cell for a trigger that is waiting, either kind of job and
+ * either reason: when it might go, and why it has not.
+ */
+function waitingCell(delayed) {
+  const queued = delayed.hold === 'concurrency';
+  const when = queued ? 'when a slot frees' : 'when usage clears';
+  const why = queued ? `queued at ${delayed.position + 1} of ${delayed.queueLength}` : `held for ${delayNames(delayed)}`;
+  return el('div', { title: delayTitle(delayed) }, [
+    delayed.resumeAt
+      ? el('div', { text: fmtCountdown(delayed.resumeAt), 'data-countdown-to': delayed.resumeAt })
+      : el('div', { text: when }),
+    el('div', {
+      class: 'cron-desc',
+      text: delayed.resumeAt ? `${fmtDateTime(delayed.resumeAt)}${queued ? ' · estimated' : ''}` : why,
+    }),
+  ]);
 }
 
 /** Hover text for a paused badge: when it lifts, or why it cannot be lifted. */
@@ -409,10 +481,14 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
       try {
         const result = await api(`/api/${apiBase(cron)}/${cron.id}/run`, { method: 'POST' });
         onStarted?.();
-        // Run now does not override the usage delay setting; a blocked press
-        // becomes the waiting trigger instead of starting claude anyway.
-        if (result?.delayed) toast(`"${cron.name}" is waiting on ${delayNames(result.delayed)}.`, true);
-        else toast(`Started "${cron.name}"`);
+        // Run now overrides neither the usage delay nor the concurrent job
+        // limit; a blocked press becomes the waiting trigger instead of starting
+        // claude anyway.
+        if (result?.delayed?.hold === 'concurrency') {
+          toast(`"${cron.name}" is queued at position ${result.delayed.position + 1}; every slot is taken.`, true);
+        } else if (result?.delayed) {
+          toast(`"${cron.name}" is waiting on ${delayNames(result.delayed)}.`, true);
+        } else toast(`Started "${cron.name}"`);
       } catch (err) {
         toast(err.message, true);
         event.target.disabled = false;
@@ -511,8 +587,7 @@ async function paintCrons(panel, pause, sub) {
   else if (pause.paused) line = `${armed} armed of ${crons.length} — ${pauseSummary(pause)}`;
   else line = `${armed} armed of ${crons.length}`;
 
-  const held = crons.filter((c) => c.isDelayed).length;
-  if (held) line += ` · ${held} waiting on usage`;
+  line += waitingSummary(crons);
   if (pause.paused && pause.droppedCount) {
     line += ` · ${pause.droppedCount} trigger${pause.droppedCount === 1 ? '' : 's'} dropped`;
   }
@@ -581,15 +656,7 @@ async function paintCrons(panel, pause, sub) {
 
 /** The Next run cell: a held trigger, a real schedule, or nothing to say. */
 function nextRunCell(cron, pause) {
-  if (cron.isDelayed) {
-    return el('div', { title: delayTitle(cron.delayed) }, [
-      el('div', { text: cron.delayed.resumeAt ? fmtRelative(cron.delayed.resumeAt) : 'when usage clears' }),
-      el('div', {
-        class: 'cron-desc',
-        text: cron.delayed.resumeAt ? fmtDateTime(cron.delayed.resumeAt) : `held for ${delayNames(cron.delayed)}`,
-      }),
-    ]);
-  }
+  if (cron.isDelayed) return waitingCell(cron.delayed);
   if (!cron.nextRunAt) return el('span', { class: 'muted', text: cron.isActive ? 'not scheduled' : 'deactivated' });
   // A pause leaves the schedule registered, so this time is real — it is when
   // the trigger arrives and is thrown away, not when it runs.
@@ -628,9 +695,7 @@ async function paintExecutions(panel, pause, sub) {
   else if (pause.paused) line = `${page.scheduled} scheduled of ${page.total} — ${pauseSummary(pause)}`;
   else line = `${page.scheduled} scheduled of ${page.total}`;
 
-  const held = executions.filter((execution) => execution.isDelayed).length;
-  if (held) line += ` · ${held} waiting on usage`;
-  sub(line);
+  sub(line + waitingSummary(executions));
 
   if (!page.total) {
     panel.replaceChildren(
@@ -719,15 +784,7 @@ async function paintExecutions(panel, pause, sub) {
 
 /** When a one-time execution goes, or when it went and what became of it. */
 function scheduledCell(execution, pause) {
-  if (execution.isDelayed) {
-    return el('div', { title: delayTitle(execution.delayed) }, [
-      el('div', { text: execution.delayed.resumeAt ? fmtRelative(execution.delayed.resumeAt) : 'when usage clears' }),
-      el('div', {
-        class: 'cron-desc',
-        text: execution.delayed.resumeAt ? fmtDateTime(execution.delayed.resumeAt) : `held for ${delayNames(execution.delayed)}`,
-      }),
-    ]);
-  }
+  if (execution.isDelayed) return waitingCell(execution.delayed);
   const when = el('div', { text: fmtDateTime(execution.scheduledAt) ?? '—' });
   if (execution.status !== 'scheduled' || !execution.isActive) {
     const note =
@@ -1590,6 +1647,129 @@ async function renderSettings() {
     save({ updateCheckIntervalHours: hours }, `Checking every ${hours}h`);
   });
 
+  // ---- concurrent job limit ----
+  const processors = config.defaultMaxConcurrentJobs ?? 1;
+  // Tracked like the interval above, so a rejected entry restores the value in
+  // force rather than the one the page loaded with.
+  let jobLimit = Number.isFinite(Number(settings.maxConcurrentJobs)) ? Number(settings.maxConcurrentJobs) : processors;
+  const limitInput = el('input', { type: 'text', class: 'mono narrow', value: String(jobLimit) });
+  const limitReset = el('button', { class: 'btn small', text: `Use ${processors} (processors)` });
+  const queueBody = el('div', { class: 'queue-body' });
+
+  const applyLimit = async (value) => {
+    if (!Number.isInteger(value) || value < 0) {
+      toast('Concurrent jobs must be 0 or a whole number', true);
+      limitInput.value = String(jobLimit);
+      return;
+    }
+    jobLimit = value;
+    limitInput.value = String(value);
+    await save(
+      { maxConcurrentJobs: value },
+      value === 0 ? 'Running jobs with no limit' : `Running at most ${value} job${value === 1 ? '' : 's'} at once`,
+    );
+    paintQueue();
+  };
+
+  limitInput.addEventListener('change', () => applyLimit(Number(limitInput.value)));
+  limitReset.addEventListener('click', () => applyLimit(processors));
+
+  const stat = (value, label, sub) =>
+    el('div', { class: 'stat' }, [
+      value.nodeType ? value : el('div', { class: 'stat-value', text: value }),
+      el('div', { class: 'stat-label', text: label }),
+      el('div', { class: 'stat-sub', text: sub }),
+    ]);
+
+  /**
+   * The live queue: what is running under the limit and what is behind it.
+   *
+   * Redrawn on its own rather than with the page, so a run starting while the
+   * limit field has focus does not take the half-typed number away.
+   */
+  const paintQueue = async () => {
+    let state;
+    try {
+      state = await api('/api/queue');
+    } catch (err) {
+      queueBody.replaceChildren(el('div', { class: 'hint warn', text: err.message }));
+      return;
+    }
+
+    const nextSlot = state.nextSlotAt
+      ? el('div', { class: 'stat-value', text: fmtCountdown(state.nextSlotAt), 'data-countdown-to': state.nextSlotAt })
+      : el('div', { class: 'stat-value', text: '—' });
+
+    const parts = [
+      el('div', { class: 'stat-strip' }, [
+        stat(
+          state.limit === 0 ? '∞' : String(state.limit),
+          'job limit',
+          state.limit === 0 ? 'no limit' : `${processors} processors`,
+        ),
+        stat(String(state.runningCount), state.runningCount === 1 ? 'job running' : 'jobs running', 'right now'),
+        stat(String(state.queuedCount), 'queued', state.queuedCount ? 'oldest goes first' : 'nothing waiting'),
+        stat(nextSlot, 'next slot', state.nextSlotAt ? 'estimated' : 'no estimate yet'),
+      ]),
+    ];
+
+    if (state.running.length) {
+      parts.push(el('h3', { text: 'Running now' }));
+      parts.push(
+        el(
+          'div',
+          { class: 'queue-list' },
+          state.running.map((run) =>
+            el('div', { class: 'queue-row' }, [
+              el('span', { class: 'queue-pos running', text: '▸' }),
+              el('div', {}, [
+                el('a', { class: 'cron-name link', href: `${hashBase(run)}/logs/${run.cronId}`, text: run.cronName }),
+                el('div', {
+                  class: 'cron-desc',
+                  text: Number.isFinite(run.averageRuntimeSeconds)
+                    ? `averages ${fmtDuration(run.averageRuntimeSeconds * 1000)} a run`
+                    : 'no finished runs to average yet',
+                }),
+              ]),
+              el('div', { class: 'queue-when mono', 'data-runtime-start': run.startedAt, text: fmtElapsed(run.startedAt) }),
+            ]),
+          ),
+        ),
+      );
+    }
+
+    if (state.queued.length) {
+      parts.push(el('h3', { text: 'Waiting for a slot' }));
+      parts.push(
+        el(
+          'div',
+          { class: 'queue-list' },
+          state.queued.map((entry) =>
+            el('div', { class: 'queue-row', title: delayTitle(entry) }, [
+              el('span', { class: 'queue-pos', text: String(entry.position + 1) }),
+              el('div', {}, [
+                el('a', { class: 'cron-name link', href: `${hashBase(entry)}/logs/${entry.cronId}`, text: entry.cronName }),
+                el('div', { class: 'cron-desc' }, [
+                  `${entry.kind === 'execution' ? 'one-time' : 'cron'} · ${entry.source} trigger · waiting `,
+                  el('span', { 'data-runtime-start': entry.arrivedAt, text: fmtElapsed(entry.arrivedAt) }),
+                ]),
+              ]),
+              entry.resumeAt
+                ? el('div', { class: 'queue-when mono', 'data-countdown-to': entry.resumeAt, text: fmtCountdown(entry.resumeAt) })
+                : el('div', { class: 'queue-when muted', text: 'no estimate' }),
+            ]),
+          ),
+        ),
+      );
+    }
+
+    if (!state.running.length && !state.queued.length) {
+      parts.push(el('div', { class: 'hint', text: 'Nothing is running and nothing is queued.' }));
+    }
+
+    queueBody.replaceChildren(...parts);
+  };
+
   const showCheck = (result) => {
     setUpdateBadge(Boolean(result.updatable), result.behind);
     if (result.updatable) {
@@ -1689,6 +1869,32 @@ async function renderSettings() {
       readOnly('Update log', settings.updateLog),
     ]),
     el('div', { class: 'card' }, [
+      el('h2', { text: 'Limit concurrent jobs' }),
+      el('div', { class: 'preset-row' }, [
+        el('span', { class: 'preset-label', text: 'Run at most' }),
+        limitInput,
+        el('span', { class: 'preset-label', text: 'jobs at once' }),
+        el('span', { class: 'preset-sep' }),
+        limitReset,
+      ]),
+      el('div', { class: 'hint' }, [
+        'A trigger that arrives with every slot taken is held as ',
+        el('span', { class: 'mono', text: 'delayed' }),
+        ' and started when a run finishes. The queue is first in, first out, so runs keep the order their triggers fired. ',
+        `Set 0 for no limit. The default is this machine's processor count (${processors}).`,
+      ]),
+      el('div', { class: 'hint warn' }, [
+        'Lowering this never stops a run already going — it only holds the next ones. ',
+        'The queue lives in memory: a restart clears it, and the next trigger of each cron starts it afresh.',
+      ]),
+      el('div', { class: 'card-divider' }),
+      queueBody,
+      el('div', { class: 'hint' }, [
+        'Next slot is the soonest a running job is due to finish: its own average run length, less how long it has been going. ',
+        'A job with no finished runs behind it has no average and is left out, so a slot can come free sooner than this says.',
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
       el('h2', { text: 'Storage' }),
       readOnly('Storage root', config.storageRoot),
       readOnly('Crons', config.cronsDir),
@@ -1709,6 +1915,9 @@ async function renderSettings() {
   );
 
   check();
+  paintQueue();
+  // Run activity redraws the queue on its own from here; the page is not rebuilt.
+  repaintQueue = paintQueue;
 }
 
 // ---- logs -------------------------------------------------------------
@@ -1944,6 +2153,7 @@ function parseHash() {
 
 async function route() {
   closeLogStream();
+  repaintQueue = null;
   clearTimeout(modelPollTimer);
   clearTimeout(reloadTimer);
   clearTimeout(updateWatchTimer);
@@ -1976,6 +2186,9 @@ function refreshCurrentView() {
   } else if (section === 'list') {
     renderHome(kind === 'execution' ? 'executions' : 'crons').catch(() => {});
   }
+  // The Settings page only has one live part; redrawing all of it would throw
+  // away whatever the user is typing into a field.
+  repaintQueue?.();
 }
 
 function connectEvents() {
@@ -2020,12 +2233,23 @@ function connectEvents() {
         );
       }
       if (type === 'run:delayed') {
-        const when = payload.resumeAt ? ` Starts ${fmtRelative(payload.resumeAt)}.` : '';
-        toast(`${named} is waiting on ${delayNames(payload)}.${when}`, true);
+        if (payload.hold === 'concurrency') {
+          const when = payload.resumeAt ? ` Could start ${fmtCountdown(payload.resumeAt)}.` : '';
+          toast(`${named} is queued at position ${payload.position + 1} of ${payload.queueLength}.${when}`, true);
+        } else {
+          const when = payload.resumeAt ? ` Starts ${fmtRelative(payload.resumeAt)}.` : '';
+          toast(`${named} is waiting on ${delayNames(payload)}.${when}`, true);
+        }
       }
       // Only the release that actually starts the run is worth a toast; a
       // cancelled or dropped one already reported itself where it happened.
-      if (type === 'run:released' && payload.ran) toast(`${named} usage cleared, starting now`);
+      if (type === 'run:released' && payload.ran) {
+        toast(
+          payload.hold === 'concurrency'
+            ? `${named} reached the front of the queue, starting now`
+            : `${named} usage cleared, starting now`,
+        );
+      }
       if (type === 'run:dropped') {
         // A pause is missed time, not queued time, so the count says how many
         // runs this cron has now lost rather than how many are waiting.
@@ -2044,6 +2268,7 @@ function connectEvents() {
     const { updateAvailable, updateBehind } = JSON.parse(event.data);
     setUpdateBadge(Boolean(updateAvailable), updateBehind);
   });
+  events.addEventListener('queue:changed', () => repaintQueue?.());
   events.addEventListener('pause:changed', () => refreshCurrentView());
   events.addEventListener('update:waiting', () => refreshCurrentView());
   events.addEventListener('update:launched', () => refreshCurrentView());

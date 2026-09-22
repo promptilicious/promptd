@@ -114,14 +114,23 @@ function describe(event) {
       return {
         kind: 'delayed',
         read: false,
-        message: `${name} is waiting on ${blockerNames(event)}`,
+        // A queued trigger says where it stands rather than what it is waiting
+        // on: the limit is the same for every one of them, the place is not.
+        message:
+          event.hold === 'concurrency'
+            ? `${name} is queued at position ${event.position + 1} of ${event.queueLength}, behind ${event.runningCount} running job${event.runningCount === 1 ? '' : 's'}`
+            : `${name} is waiting on ${blockerNames(event)}`,
         ...cron,
       };
     case 'run:released':
       return {
         kind: 'delayed',
         read: true,
-        message: event.ran ? `${name} usage cleared, starting now` : `${name} waiting trigger dropped: ${event.reason}`,
+        message: event.ran
+          ? event.hold === 'concurrency'
+            ? `${name} reached the front of the queue, starting now`
+            : `${name} usage cleared, starting now`
+          : `${name} waiting trigger dropped: ${event.reason}`,
         ...cron,
       };
     case 'execution:overdue':

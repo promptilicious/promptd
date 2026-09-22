@@ -11,6 +11,7 @@ import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from '.
 import { getExecution, listExecutions, patchExecution } from './executions.js';
 import { hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 import { countRun } from './stats.js';
+import { DEFAULT_MAX_CONCURRENT_JOBS } from './settings.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -171,6 +172,26 @@ function blockerNames(blockers) {
   return blockers.map((blocker) => blocker.label).join(', ');
 }
 
+/**
+ * How long a job's successful runs take on average, in milliseconds, or null
+ * when it has never finished one.
+ *
+ * Read off the counters the record already carries, so a queue estimate costs
+ * nothing at the moment it is wanted. A job with no completed run behind it has
+ * no average, and a made-up number would be worse than saying nothing.
+ */
+function averageRuntimeMs(job) {
+  const runs = Number(job?.lifetimeRuns);
+  const seconds = Number(job?.lifetimeRuntimeSeconds);
+  if (!Number.isFinite(runs) || runs <= 0 || !Number.isFinite(seconds) || seconds <= 0) return null;
+  return (seconds / runs) * 1000;
+}
+
+/** "4 running jobs" / "1 running job" — what a queued trigger is behind. */
+function runningPhrase(count) {
+  return `${count} running job${count === 1 ? '' : 's'}`;
+}
+
 class CronService {
   constructor() {
     /** @type {Map<string, Cron>} cron id -> scheduled job */
@@ -187,10 +208,11 @@ class CronService {
     this.pauseState = null;
     this.pauseTimer = null;
     /**
-     * Triggers held because a usage limit the cron watches is spent. At most one
-     * per cron: a second trigger arriving while one waits is lost, not queued.
-     * Memory-only like the pause, so a restart comes back with nothing waiting
-     * and the next trigger checks usage fresh.
+     * Triggers that cannot run yet, whichever of the two reasons is holding
+     * them: a usage limit the cron watches is spent (`hold: 'usage'`), or every
+     * concurrent slot is taken (`hold: 'concurrency'`). At most one per cron —
+     * a second trigger arriving while one waits is lost, not stacked behind it.
+     * Memory-only like the pause, so a restart comes back with nothing waiting.
      * @type {Map<string, object>} cron id -> waiting trigger
      */
     this.delayed = new Map();
@@ -230,6 +252,23 @@ class CronService {
      * @type {Map<string, Promise>}
      */
     this.completions = new Map();
+    /**
+     * How many runs may be in flight at once; 0 is no limit. Loaded from
+     * settings at boot and rewritten whenever the setting is saved, so this
+     * copy is what every admission decision reads without touching the disk.
+     */
+    this.concurrencyLimit = DEFAULT_MAX_CONCURRENT_JOBS;
+    /**
+     * Triggers past the concurrency gate whose child does not exist yet.
+     *
+     * `running` is only set several awaits into `execute`, so counting slots off
+     * it alone would let two triggers arriving in that window both take the last
+     * one. This is incremented before the first await and dropped once the run
+     * is in `running`, so a slot is never handed out twice.
+     */
+    this.pendingStarts = 0;
+    /** Set while the queue is being walked, so a run finishing mid-walk does not start a second one. */
+    this.draining = false;
   }
 
   isPaused() {
@@ -312,23 +351,49 @@ class CronService {
     // A trigger whose usage cleared during the pause was held by the pause, not
     // by usage. Do not make it wait out another review interval.
     this.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
+    // Same for the queue: the slots were free the whole time the pause held it.
+    this.drainQueue().catch((err) => console.error(`[cron] queue drain failed: ${err.message}`));
     return this.pauseInfo();
   }
 
   // ---- usage delays ---------------------------------------------------
 
-  /** The trigger waiting on usage for this cron, or null. JSON-safe. */
+  /**
+   * The trigger waiting for this cron, or null. JSON-safe.
+   *
+   * A queued trigger is finished off here rather than when it was parked: its
+   * place in the queue and the time it might start both move as runs finish, so
+   * they are worked out at the moment they are asked for.
+   */
   delayInfo(cronId) {
-    return this.delayed.get(cronId) ?? null;
+    const entry = this.delayed.get(cronId) ?? null;
+    if (!entry || entry.hold !== 'concurrency') return entry;
+    const queue = this.queued();
+    const position = queue.indexOf(entry);
+    return {
+      ...entry,
+      position,
+      queueLength: queue.length,
+      limit: this.concurrencyLimit,
+      runningCount: this.running.size,
+      // The slot this one is in line for, which is the (position + 1)-th to come
+      // free. Past the number of runs going there is nothing to estimate from.
+      resumeAt: this.slotEstimates()[position] ?? null,
+    };
   }
 
   isDelayed(cronId) {
     return this.delayed.has(cronId);
   }
 
-  /** How many triggers are waiting on usage. Never counted as running. */
+  /** How many triggers are waiting, on usage or on a free slot. Never counted as running. */
   delayedCount() {
     return this.delayed.size;
+  }
+
+  /** The triggers held by a usage limit, which are the ones the review timer is for. */
+  usageDelays() {
+    return [...this.delayed.values()].filter((entry) => entry.hold !== 'concurrency');
   }
 
   /**
@@ -353,14 +418,22 @@ class CronService {
     return usageBlockers(reading, delay);
   }
 
-  /** Parks a trigger until the limits it named clear. */
-  hold(cron, source, blockers) {
+  /**
+   * Parks a trigger until the limits it named clear.
+   *
+   * `arrivedAt` is passed when this trigger has already been waiting on
+   * something else, so a queue it goes back into puts it where it was rather
+   * than at the back.
+   */
+  hold(cron, source, blockers, arrivedAt = null) {
     const now = new Date().toISOString();
     const entry = {
       cronId: cron.id,
       cronName: cron.name,
       kind: cron.kind ?? 'cron',
       source,
+      hold: 'usage',
+      arrivedAt: arrivedAt ?? now,
       delayedAt: now,
       checkedAt: now,
       reasons: blockers,
@@ -374,15 +447,15 @@ class CronService {
   }
 
   /**
-   * Drops a waiting trigger without running it. This is what Stop does to a
-   * delayed cron: the schedule is untouched, so the next trigger checks usage
-   * again like any other.
+   * Drops a waiting trigger without running it, whether it was waiting on usage
+   * or on a free slot. This is what Stop does to a delayed cron: the schedule is
+   * untouched, so the next trigger is checked afresh like any other.
    */
   async cancelDelay(cronId, cancelledBy = 'user') {
     const entry = this.delayed.get(cronId);
     if (!entry) return null;
     this.delayed.delete(cronId);
-    if (!this.delayed.size) this.stopDelayReview();
+    if (!this.usageDelays().length) this.stopDelayReview();
     console.log(`[cron] "${entry.cronName}" held trigger cancelled by ${cancelledBy}`);
     // A cron's schedule fires again on its own, so dropping one trigger changes
     // nothing lasting. A one-time execution has no second trigger: leaving it
@@ -428,7 +501,7 @@ class CronService {
    */
   async reviewDelays() {
     if (this.reviewing) return;
-    if (!this.delayed.size) {
+    if (!this.usageDelays().length) {
       this.stopDelayReview();
       return;
     }
@@ -436,7 +509,7 @@ class CronService {
     try {
       const reading = await usageMonitor.state();
 
-      for (const entry of [...this.delayed.values()]) {
+      for (const entry of this.usageDelays()) {
         const cron = await findJob(entry.cronId);
         if (!cron) {
           this.delayed.delete(entry.cronId);
@@ -474,11 +547,230 @@ class CronService {
         const waited = Date.now() - Date.parse(entry.delayedAt);
         console.log(`[cron] "${cron.name}" usage cleared after ${formatRuntime(waited)}; starting held ${entry.source} trigger`);
         emit('run:released', { ...entry, ran: true, reason: 'usage cleared' });
-        await this.execute(cron, entry.source, { since: entry.delayedAt, reasons: entry.reasons });
+        // Through the concurrency gate like any other trigger: usage clearing
+        // says this run may go, not that there is a slot for it. It keeps the
+        // time it first had to wait, so it does not lose its place in the queue.
+        await this.admit(
+          cron,
+          entry.source,
+          [{ kind: 'usage', since: entry.delayedAt, detail: blockerNames(entry.reasons) }],
+          entry.arrivedAt ?? entry.delayedAt,
+        );
       }
     } finally {
       this.reviewing = false;
-      if (!this.delayed.size) this.stopDelayReview();
+      if (!this.usageDelays().length) this.stopDelayReview();
+    }
+  }
+
+  // ---- the concurrent job limit ---------------------------------------
+
+  /**
+   * Slots taken right now: the runs in flight plus the triggers on their way to
+   * being one.
+   */
+  activeCount() {
+    return this.running.size + this.pendingStarts;
+  }
+
+  /** How many triggers are queued behind the limit. */
+  queuedCount() {
+    return this.queued().length;
+  }
+
+  /**
+   * The queued triggers, first in first out.
+   *
+   * Ordered by when each trigger first had to wait rather than by when it
+   * joined this queue, so a trigger that sat out a spent usage limit comes back
+   * to the place it had rather than to the back of the line. That is what keeps
+   * the queue running jobs in the order they fired.
+   */
+  queued() {
+    return [...this.delayed.values()]
+      .filter((entry) => entry.hold === 'concurrency')
+      .sort((a, b) => Date.parse(a.arrivedAt) - Date.parse(b.arrivedAt));
+  }
+
+  /**
+   * When each running job is expected to give its slot back, soonest first.
+   *
+   * A run's estimate is its own average runtime less however long it has been
+   * going; one already past its average could end at any moment, so it reads as
+   * now rather than as a time in the past. A job with no completed run behind it
+   * has no average and is left out — which can only make these later than what
+   * happens, never earlier.
+   */
+  slotEstimates() {
+    const now = Date.now();
+    return [...this.running.values()]
+      .filter((run) => Number.isFinite(run.averageRuntimeMs))
+      .map((run) => now + Math.max(0, run.averageRuntimeMs - (now - Date.parse(run.startedAt))))
+      .sort((a, b) => a - b)
+      .map((at) => new Date(at).toISOString());
+  }
+
+  /** The earliest a queued trigger could start, or null when nothing can be said. */
+  nextSlotAt() {
+    return this.slotEstimates()[0] ?? null;
+  }
+
+  /**
+   * Applies the saved limit. Raising it lets whatever is queued go at once;
+   * lowering it never stops a run already going — it only holds the next ones.
+   */
+  setConcurrencyLimit(limit) {
+    const value = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : DEFAULT_MAX_CONCURRENT_JOBS;
+    if (value === this.concurrencyLimit) return this.concurrencyLimit;
+    this.concurrencyLimit = value;
+    console.log(`[cron] concurrent job limit is now ${value === 0 ? 'unlimited' : value}`);
+    this.drainQueue().catch((err) => console.error(`[cron] queue drain failed: ${err.message}`));
+    emit('queue:changed', this.concurrencyInfo());
+    return this.concurrencyLimit;
+  }
+
+  /** The limit, what is running under it and what is waiting. JSON-safe. */
+  concurrencyInfo() {
+    return {
+      limit: this.concurrencyLimit,
+      defaultLimit: DEFAULT_MAX_CONCURRENT_JOBS,
+      runningCount: this.running.size,
+      queuedCount: this.queuedCount(),
+      nextSlotAt: this.nextSlotAt(),
+      running: [...this.running.values()].map((run) => ({
+        cronId: run.cronId,
+        cronName: run.cronName,
+        kind: run.kind,
+        startedAt: run.startedAt,
+        // Null for a job with no finished run behind it, which is also why it
+        // contributes nothing to the estimate above.
+        averageRuntimeSeconds: Number.isFinite(run.averageRuntimeMs) ? run.averageRuntimeMs / 1000 : null,
+      })),
+      queued: this.queued().map((entry) => this.delayInfo(entry.cronId)),
+    };
+  }
+
+  /**
+   * Parks a trigger behind the limit, as delayed.
+   *
+   * `reasons` is shaped like a usage blocker on purpose: the badge, the toast
+   * and the notification drawer then have one kind of waiting trigger to draw
+   * rather than two.
+   */
+  holdForSlot(job, source, waits = [], arrivedAt = null) {
+    const now = new Date().toISOString();
+    const entry = {
+      cronId: job.id,
+      cronName: job.name,
+      kind: job.kind ?? 'cron',
+      source,
+      hold: 'concurrency',
+      // When this trigger first had to wait, whatever held it. Its place in line.
+      arrivedAt: arrivedAt ?? waits[0]?.since ?? now,
+      delayedAt: now,
+      checkedAt: now,
+      limit: this.concurrencyLimit,
+      reasons: [{ id: 'concurrency', label: `Concurrent job limit (${this.concurrencyLimit})` }],
+      // Every wait this trigger has already served, for the run's log header.
+      waits,
+    };
+    this.delayed.set(job.id, entry);
+    const info = this.delayInfo(job.id);
+    console.log(
+      `[cron] "${job.name}" ${source} trigger queued at position ${info.position + 1} behind ${runningPhrase(this.running.size)}`,
+    );
+    emit('run:delayed', info);
+    return info;
+  }
+
+  /**
+   * Starts a trigger, or queues it when every slot is taken.
+   *
+   * The one door into `execute`: a schedule, a manual press, a catch-up and a
+   * trigger whose usage limit just cleared all come through here, so there is a
+   * single place the limit is enforced.
+   */
+  async admit(job, source, waits = [], arrivedAt = null) {
+    const limit = this.concurrencyLimit;
+    if (limit > 0 && this.activeCount() >= limit) {
+      return { delayed: this.holdForSlot(job, source, waits, arrivedAt) };
+    }
+    // Claimed before the first await in `execute`, so two triggers arriving
+    // together cannot both read the same free slot.
+    this.pendingStarts += 1;
+    try {
+      return await this.execute(job, source, waits);
+    } finally {
+      this.pendingStarts -= 1;
+    }
+  }
+
+  /**
+   * Starts queued triggers, oldest first, while there are slots for them.
+   *
+   * One walk at a time. A run finishing while this is mid-start asks for a walk
+   * of its own, which returns straight away; the loop here re-reads the free
+   * slots each time round, so the walk already going picks that slot up. The
+   * entry is only taken out of the queue once it is certain to start, so a slot
+   * lost while the record is read leaves it exactly where it was in line.
+   */
+  async drainQueue() {
+    if (this.draining) return 0;
+    this.draining = true;
+    let started = 0;
+    try {
+      for (;;) {
+        // Lifting the pause drains this; nothing new starts before then.
+        if (this.pauseState) return started;
+        if (this.concurrencyLimit > 0 && this.activeCount() >= this.concurrencyLimit) return started;
+        const entry = this.queued()[0];
+        if (!entry) return started;
+
+        const job = await findJob(entry.cronId);
+        // A usage limit this job watches can be spent by the time its slot comes
+        // free, so it is read again here rather than only on the way in. Without
+        // this the queue would step straight over the cron's own delay setting.
+        const blockers = job ? await this.blockersFor(job) : [];
+        // A slot can be taken while those reads happen.
+        if (this.concurrencyLimit > 0 && this.activeCount() >= this.concurrencyLimit) return started;
+        this.delayed.delete(entry.cronId);
+
+        if (!job) {
+          emit('run:released', { ...entry, ran: false, reason: 'cron deleted' });
+          continue;
+        }
+        // Deactivating a job withdraws its schedule, so a queued trigger has
+        // nothing left to belong to. A manual one is the user's own press.
+        if (!job.isActive && entry.source !== 'manual') {
+          console.log(`[cron] "${job.name}" queued trigger dropped: deactivated while waiting`);
+          emit('run:released', { ...entry, ran: false, reason: 'cron deactivated while waiting' });
+          continue;
+        }
+        if (this.running.has(entry.cronId)) {
+          emit('run:skipped', { cronId: job.id, cronName: job.name, kind: job.kind, source: entry.source, reason: 'already running' });
+          continue;
+        }
+        // It reached the front of the queue and found a limit spent. It moves to
+        // the usage hold, keeping the place in line it had.
+        if (blockers.length) {
+          this.hold(job, entry.source, blockers, entry.arrivedAt);
+          continue;
+        }
+
+        const waited = Date.now() - Date.parse(entry.arrivedAt);
+        console.log(`[cron] "${job.name}" waited ${formatRuntime(waited)} for a slot; starting it`);
+        emit('run:released', { ...entry, ran: true, reason: 'a slot came free' });
+        await this.admit(
+          job,
+          entry.source,
+          [...entry.waits, { kind: 'queue', since: entry.delayedAt, detail: `a slot behind ${runningPhrase(entry.limit)}` }],
+          entry.arrivedAt,
+        );
+        started += 1;
+      }
+    } finally {
+      this.draining = false;
+      emit('queue:changed', this.concurrencyInfo());
     }
   }
 
@@ -770,28 +1062,27 @@ class CronService {
       emit('run:skipped', { cronId, cronName: cron.name, kind: cron.kind, source });
       return null;
     }
-    // One waiting trigger per cron. A second one arriving while the first is
-    // held is lost rather than queued behind it, so a cron that sits out a long
-    // reset does not come back and fire a backlog.
+    // One waiting trigger per cron, whatever is holding it. A second one
+    // arriving while the first waits is lost rather than stacked behind it, so
+    // a cron that sits out a long reset does not come back and fire a backlog.
     if (this.delayed.has(cronId)) {
       const waiting = this.delayed.get(cronId);
-      console.warn(`[cron] "${cron.name}" already has a trigger held for usage; dropping the ${source} one`);
-      emit('run:skipped', {
-        cronId,
-        cronName: cron.name,
-        kind: cron.kind,
-        source,
-        reason: `a trigger is already waiting on ${blockerNames(waiting.reasons)}`,
-      });
+      const reason =
+        waiting.hold === 'concurrency'
+          ? `a trigger is already queued behind the ${waiting.limit} job limit`
+          : `a trigger is already waiting on ${blockerNames(waiting.reasons)}`;
+      console.warn(`[cron] "${cron.name}" already has a trigger waiting; dropping the ${source} one`);
+      emit('run:skipped', { cronId, cronName: cron.name, kind: cron.kind, source, reason });
       return null;
     }
 
-    // Run now goes through this too: it does not override the setting, it joins
-    // the queue of one.
+    // Run now goes through this too: it does not override the usage delay
+    // setting, it joins the queue of one.
     const blockers = await this.blockersFor(cron);
     if (blockers.length) return { delayed: this.hold(cron, source, blockers) };
 
-    return this.execute(cron, source);
+    // And then through the concurrent job limit, which may queue it.
+    return this.admit(cron, source);
   }
 
   /**
@@ -841,7 +1132,15 @@ class CronService {
     return run;
   }
 
-  async execute(cron, source, held = null) {
+  /**
+   * Starts the run. Called only by `admit`, which is where the concurrent job
+   * limit is enforced.
+   *
+   * `waits` is what this trigger already sat out before getting here — a spent
+   * usage limit, a full set of slots, or both in turn — and is written into the
+   * log header so the run says why it started when it did.
+   */
+  async execute(cron, source, waits = []) {
     const kind = cron.kind ?? 'cron';
     const { get, patch } = KINDS[kind];
     const startedAt = new Date();
@@ -867,9 +1166,12 @@ class CronService {
       pid: null,
       stopping: false,
       stoppedBy: null,
-      // Set when this run is a trigger that sat out a usage limit, so the UI can
-      // say the run went as soon as usage cleared.
-      heldSince: held?.since ?? null,
+      // Set when this trigger had to wait before it could start, so the UI can
+      // say the run went as soon as it was allowed to.
+      heldSince: waits[0]?.since ?? null,
+      // What this job's finished runs have averaged, kept on the run so the
+      // queue can estimate when the slot comes back without reading the disk.
+      averageRuntimeMs: averageRuntimeMs(cron),
     };
     this.running.set(cron.id, run);
     // Settled by `finish`, once the log is closed and the record written. What
@@ -897,9 +1199,10 @@ class CronService {
           `directory  ${cwd}`,
           `model      ${cron.model?.trim() || '(CLI default)'}`,
           `effort     ${cron.effort?.trim() || '(CLI default)'}`,
-          ...(held
-            ? [`held       waited ${formatRuntime(startedAt - new Date(held.since))} for ${blockerNames(held.reasons ?? [])}`]
-            : []),
+          ...waits.map(
+            (wait) =>
+              `${(wait.kind === 'usage' ? 'held' : 'queued').padEnd(11)}waited ${formatRuntime(startedAt - new Date(wait.since))} for ${wait.detail}`,
+          ),
           `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs].join(' ')}`,
           '--- prompt ---',
           cron.prompt ?? '',
@@ -923,6 +1226,9 @@ class CronService {
       if (handle?.killTimer) clearTimeout(handle.killTimer);
       this.handles.delete(cron.id);
       this.running.delete(cron.id);
+      // A slot has just come free. Whatever is queued goes now rather than
+      // waiting on the rest of this run's bookkeeping.
+      this.drainQueue().catch((err) => console.error(`[cron] queue drain failed: ${err.message}`));
       // Read fresh rather than trusting the copy this run started with: a long
       // run can outlive the page visit that initialized these counters.
       const current = (await get(cron.id).catch(() => null)) ?? cron;
