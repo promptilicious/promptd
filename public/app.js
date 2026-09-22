@@ -1299,6 +1299,9 @@ function scheduledAtPicker(input) {
     el('label', { text: 'Runs at' }),
     input,
     el('div', { class: 'preset-row' }, [
+      // The buttons are all relative to now, and the row reads as a sentence
+      // once it says so: Now +30m, +1hr, +3hr.
+      el('span', { class: 'preset-label', text: 'Now' }),
       inMinutes('+30m', 30, 'Thirty minutes from now'),
       inMinutes('+1hr', 60, 'One hour from now'),
       inMinutes('+3hr', 180, 'Three hours from now'),
