@@ -212,15 +212,21 @@ app.get('/api/config', (_req, res) => {
 app.get('/api/notifications', async (req, res, next) => {
   try {
     const before = String(req.query.before ?? '').trim() || null;
-    res.json(await notificationCenter.page({ before, limit: req.query.limit ?? PAGE_SIZE }));
+    // `?unread=1` is the drawer's filter: the same pages with the read ones left out.
+    const unreadOnly = ['1', 'true', 'yes'].includes(String(req.query.unread ?? '').toLowerCase());
+    res.json(await notificationCenter.page({ before, limit: req.query.limit ?? PAGE_SIZE, unreadOnly }));
   } catch (err) {
     next(err);
   }
 });
 
-/** Marks what the reader has actually had on screen. Body `{"ids":[...]}`. */
+/**
+ * Marks what the reader has actually had on screen. Body `{"ids":[...]}`, or
+ * `{"all":true}` for the drawer's "Mark all read" button.
+ */
 app.post('/api/notifications/read', async (req, res, next) => {
   try {
+    if (req.body?.all === true) return res.json(await notificationCenter.markAllRead());
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
     if (!ids.length) return res.status(400).json({ error: 'ids must be a non-empty array' });
     res.json(await notificationCenter.markRead(ids));

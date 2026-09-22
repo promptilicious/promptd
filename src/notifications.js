@@ -317,12 +317,26 @@ class NotificationCenter {
     return { marked: changed.length, unread };
   }
 
+  /** Marks every stored notification read, which is the drawer's one button. */
+  async markAllRead() {
+    await this.ready;
+    const changed = this.items.filter((record) => !record.read);
+    for (const record of changed) record.read = true;
+    await Promise.all(changed.map((record) => this.persist(record)));
+    if (changed.length) emit('notification:read', { ids: changed.map((record) => record.id), unread: 0 });
+    return { marked: changed.length, unread: 0 };
+  }
+
   /**
    * One page, newest first. `before` is the id of the last one already shown,
    * which is a cursor rather than an offset on purpose: notifications arrive
    * while the list is open, and an offset would show one of them twice.
+   *
+   * `unreadOnly` pages the unread ones alone, for the drawer's filter. The
+   * cursor is an id either way, so it keeps working across the filter being
+   * turned on: the read ones between two unread ones are simply skipped.
    */
-  async page({ before = null, limit = PAGE_SIZE } = {}) {
+  async page({ before = null, limit = PAGE_SIZE, unreadOnly = false } = {}) {
     await this.ready;
     const size = Math.max(1, Math.min(100, Number(limit) || PAGE_SIZE));
     let start = 0;
@@ -332,13 +346,16 @@ class NotificationCenter {
       // again from the top rather than answering with nothing.
       start = index >= 0 ? index + 1 : 0;
     }
-    const items = this.items.slice(start, start + size);
+    // The filter is applied after the cursor so the cursor stays an index into
+    // the one list everything else — prune, mark read, the event stream — uses.
+    const rest = unreadOnly ? this.items.slice(start).filter((record) => !record.read) : this.items.slice(start);
+    const items = rest.slice(0, size);
     return {
       items: items.map((record) => this.view(record)),
       // The cursor for the next page, and null when this was the last of them.
-      nextBefore: start + size < this.items.length ? items.at(-1)?.id ?? null : null,
+      nextBefore: rest.length > size ? items.at(-1)?.id ?? null : null,
       unread: this.unreadCount(),
-      total: this.items.length,
+      total: unreadOnly ? this.unreadCount() : this.items.length,
     };
   }
 

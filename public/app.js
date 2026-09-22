@@ -2336,6 +2336,8 @@ const drawerEl = document.getElementById('drawer');
 const drawerListEl = document.getElementById('drawer-list');
 const drawerBackdropEl = document.getElementById('drawer-backdrop');
 const drawerCloseEl = document.getElementById('drawer-close');
+const drawerUnreadEl = document.getElementById('drawer-unread');
+const drawerReadAllEl = document.getElementById('drawer-read-all');
 
 /** On screen this long and it counts as read. */
 const READ_AFTER_MS = 3000;
@@ -2350,6 +2352,7 @@ let readFlushTimer = null;
 let viewObserver = null; // watches items for the three-second rule
 let moreObserver = null; // watches the end of the list for the next page
 let sentinelEl = null;
+let unreadOnly = false; // the filter button: show only what is still unread
 
 function setBellBadge(count) {
   if (!bellBadgeEl) return;
@@ -2366,9 +2369,10 @@ function noteKindClass(kind) {
   return 'plain';
 }
 
-function renderNotification(record) {
+function renderNotification(record, { arriving = false } = {}) {
   const meta = `${fmtRelative(record.at)} · ${fmtDateTime(record.at)}`;
-  const node = el('div', { class: `note ${record.read ? '' : 'unread'}`.trim(), 'data-id': record.id }, [
+  const classes = ['note', record.read ? '' : 'unread', arriving ? 'arriving' : ''].filter(Boolean);
+  const node = el('div', { class: classes.join(' '), 'data-id': record.id }, [
     el('span', { class: `note-dot ${noteKindClass(record.kind)}` }),
     el('div', { class: 'note-body' }, [
       el('div', { class: 'note-message', text: record.message }),
@@ -2405,7 +2409,13 @@ function flushRead() {
   }, 400);
 }
 
-/** One item has now been on screen long enough. */
+/**
+ * One item has now been on screen long enough.
+ *
+ * Under the unread filter the row stays where it is and only loses its
+ * emphasis. Pulling it out from under the reader who is in the middle of
+ * reading it would be the one thing the filter must not do.
+ */
 function markSeen(id, node) {
   node.classList.remove('unread');
   viewObserver?.unobserve(node);
@@ -2423,8 +2433,11 @@ async function loadNextPage() {
   if (loadingPage || !drawerOpen) return;
   loadingPage = true;
   try {
-    const query = nextBefore ? `?before=${encodeURIComponent(nextBefore)}` : '';
-    const page = await api(`/api/notifications${query}`);
+    const params = new URLSearchParams();
+    if (nextBefore) params.set('before', nextBefore);
+    if (unreadOnly) params.set('unread', '1');
+    const query = params.toString();
+    const page = await api(`/api/notifications${query ? `?${query}` : ''}`);
     setBellBadge(page.unread);
     for (const record of page.items) {
       if (drawnIds.has(record.id)) continue;
@@ -2435,7 +2448,8 @@ async function loadNextPage() {
     }
     nextBefore = page.nextBefore;
     if (!drawnIds.size) {
-      drawerListEl.insertBefore(el('div', { class: 'drawer-empty', text: 'Nothing yet.' }), sentinelEl);
+      const empty = unreadOnly ? 'Nothing unread.' : 'Nothing yet.';
+      drawerListEl.insertBefore(el('div', { class: 'drawer-empty', text: empty }), sentinelEl);
     }
     // A short first page leaves the sentinel on screen, and an observer that is
     // already intersecting will not fire again — so ask once more by hand.
@@ -2456,23 +2470,35 @@ async function loadNextPage() {
 /** A notification that lands while the drawer is open, from the event stream. */
 function prependNotification(record) {
   if (!drawerOpen || drawnIds.has(record.id)) return;
+  // The filter means what it says: a notice that arrives already read — a run
+  // that succeeded — has no business appearing in a list of unread ones.
+  if (unreadOnly && record.read) return;
   // Only when the reader is at the top. Inserting above where they are reading
   // would move the list under them.
   if (drawerListEl.scrollTop > 40) return;
   drawnIds.add(record.id);
   drawerListEl.querySelector('.drawer-empty')?.remove();
-  const node = renderNotification(record);
+  const node = renderNotification(record, { arriving: true });
   drawerListEl.prepend(node);
   observeItem(node, record);
+}
+
+/** Empties the list and starts paging again, for an open and for the filter. */
+function resetList() {
+  drawnIds.clear();
+  nextBefore = null;
+  for (const timer of readTimers.values()) clearTimeout(timer);
+  readTimers.clear();
+  sentinelEl = el('div', { class: 'drawer-sentinel' });
+  drawerListEl.replaceChildren(sentinelEl);
+  moreObserver?.observe(sentinelEl);
+  drawerListEl.scrollTop = 0;
 }
 
 function openDrawer() {
   if (drawerOpen) return;
   drawerOpen = true;
-  drawnIds.clear();
-  nextBefore = null;
-  sentinelEl = el('div', { class: 'drawer-sentinel' });
-  drawerListEl.replaceChildren(sentinelEl);
+  resetList();
   drawerEl.classList.add('open');
   drawerEl.setAttribute('aria-hidden', 'false');
   drawerBackdropEl.classList.add('open');
@@ -2526,8 +2552,43 @@ function closeDrawer() {
   if (pendingRead.size) flushRead();
 }
 
+/** The filter button shows which of the two lists you are looking at. */
+function syncUnreadButton() {
+  if (!drawerUnreadEl) return;
+  drawerUnreadEl.classList.toggle('primary', unreadOnly);
+  drawerUnreadEl.setAttribute('aria-pressed', String(unreadOnly));
+  drawerUnreadEl.textContent = unreadOnly ? 'Showing unread' : 'Unread only';
+}
+
 bellEl?.addEventListener('click', () => (drawerOpen ? closeDrawer() : openDrawer()));
 drawerCloseEl?.addEventListener('click', closeDrawer);
+drawerUnreadEl?.addEventListener('click', () => {
+  unreadOnly = !unreadOnly;
+  syncUnreadButton();
+  if (!drawerOpen) return;
+  resetList();
+  loadNextPage();
+});
+drawerReadAllEl?.addEventListener('click', async () => {
+  drawerReadAllEl.disabled = true;
+  try {
+    const result = await api('/api/notifications/read', { method: 'POST', body: JSON.stringify({ all: true }) });
+    setBellBadge(result.unread);
+    // Everything on screen is read now, including the rows still counting out
+    // their three seconds and anything queued for the next flush.
+    for (const timer of readTimers.values()) clearTimeout(timer);
+    readTimers.clear();
+    pendingRead.clear();
+    for (const node of drawerListEl.querySelectorAll('.note.unread')) {
+      node.classList.remove('unread');
+      viewObserver?.unobserve(node);
+    }
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    drawerReadAllEl.disabled = false;
+  }
+});
 drawerBackdropEl?.addEventListener('click', closeDrawer);
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawer();
