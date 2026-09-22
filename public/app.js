@@ -609,11 +609,13 @@ async function paintCrons(panel, pause, sub) {
     el('tr', {}, [
       el('td', {}, [
         el('div', { class: 'cron-name', text: cron.name }),
-        cron.description ? el('div', { class: 'cron-desc', text: cron.description }) : null,
+        // Two lines on the page, all of it in the tooltip: a paragraph of
+        // description must not push the row taller than the ones around it.
+        cron.description ? el('div', { class: 'cron-desc clamp', text: cron.description, title: cron.description }) : null,
         el('div', { class: 'cron-desc mono', text: cron.cron }),
       ]),
       el('td', {}, [statusPill(cron, pause)]),
-      el('td', { class: 'hide-sm' }, [
+      el('td', { class: 'hide-sm time-cell' }, [
         cron.lastRunAt
           ? el('div', {}, [
               el('div', { text: fmtRelative(cron.lastRunAt) }),
@@ -624,7 +626,7 @@ async function paintCrons(panel, pause, sub) {
       el('td', { class: 'hide-sm' }, [
         cron.isRunning ? runtimePill(cron.currentRun?.startedAt) : outcomePill(cron.lastRunStatus),
       ]),
-      el('td', { class: 'hide-sm' }, [nextRunCell(cron, pause)]),
+      el('td', { class: 'hide-sm time-cell' }, [nextRunCell(cron, pause)]),
       el('td', {}, [
         el('div', { class: 'row-actions' }, [
           runControl(cron, { small: true, pause }),
@@ -642,9 +644,9 @@ async function paintCrons(panel, pause, sub) {
           el('tr', {}, [
             el('th', { text: 'Name' }),
             el('th', { text: 'Status' }),
-            el('th', { class: 'hide-sm', text: 'Last ran' }),
+            el('th', { class: 'hide-sm time-cell', text: 'Last ran' }),
             el('th', { class: 'hide-sm', text: 'Outcome' }),
-            el('th', { class: 'hide-sm', text: 'Next run' }),
+            el('th', { class: 'hide-sm time-cell', text: 'Next run' }),
             el('th', {}, ''),
           ]),
         ]),
@@ -717,11 +719,13 @@ async function paintExecutions(panel, pause, sub) {
     el('tr', {}, [
       el('td', {}, [
         el('div', { class: 'cron-name', text: execution.name }),
-        execution.description ? el('div', { class: 'cron-desc', text: execution.description }) : null,
+        execution.description
+          ? el('div', { class: 'cron-desc clamp', text: execution.description, title: execution.description })
+          : null,
         el('div', { class: 'cron-desc mono', text: 'one-time' }),
       ]),
       el('td', {}, [executionPill(execution, pause)]),
-      el('td', { class: 'hide-sm' }, [
+      el('td', { class: 'hide-sm time-cell' }, [
         execution.lastRunAt
           ? el('div', {}, [
               el('div', { text: fmtRelative(execution.lastRunAt) }),
@@ -732,7 +736,7 @@ async function paintExecutions(panel, pause, sub) {
       el('td', { class: 'hide-sm' }, [
         execution.isRunning ? runtimePill(execution.currentRun?.startedAt) : outcomePill(execution.lastRunStatus),
       ]),
-      el('td', { class: 'hide-sm' }, [scheduledCell(execution, pause)]),
+      el('td', { class: 'hide-sm time-cell' }, [scheduledCell(execution, pause)]),
       el('td', {}, [
         el('div', { class: 'row-actions' }, [
           runControl(execution, { small: true, pause }),
@@ -769,9 +773,9 @@ async function paintExecutions(panel, pause, sub) {
           el('tr', {}, [
             el('th', { text: 'Name' }),
             el('th', { text: 'Status' }),
-            el('th', { class: 'hide-sm', text: 'Last ran' }),
+            el('th', { class: 'hide-sm time-cell', text: 'Last ran' }),
             el('th', { class: 'hide-sm', text: 'Outcome' }),
-            el('th', { class: 'hide-sm', text: 'Scheduled for' }),
+            el('th', { class: 'hide-sm time-cell', text: 'Scheduled for' }),
             el('th', {}, ''),
           ]),
         ]),

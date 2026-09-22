@@ -640,8 +640,13 @@ a {
   cursor: help;
 }
 
+/*
+ * Wide enough that the date columns keep a time on one line. A run's "Sep 23,
+ * 3:00:00 AM" breaking after the comma, or worse before the AM, was the whole
+ * reason this is not 1080px.
+ */
 .view {
-  max-width: 1080px;
+  max-width: 1320px;
   margin: 0 auto;
   padding: 24px 22px 64px;
 }
@@ -838,6 +843,25 @@ tbody tr:hover {
   color: var(--muted);
   font-size: 12px;
   margin-top: 2px;
+}
+
+/*
+ * A description is two lines on the page and the whole thing in the tooltip.
+ * Some of them are a paragraph, and a paragraph in a table cell makes one row
+ * three times the height of its neighbours.
+ */
+.cron-desc.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 560px;
+  cursor: help;
+}
+
+/* Dates and countdowns read as one thing; a wrap splits "3:00:00 AM" in two. */
+.time-cell {
+  white-space: nowrap;
 }
 
 .mono {
