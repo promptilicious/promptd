@@ -2259,6 +2259,7 @@ function connectEvents() {
       if (type === 'run:skipped') {
         toast(payload.reason ? `${named} skipped: ${payload.reason}` : `${named} was still running; trigger skipped`, true);
       }
+      refreshJobs();
       refreshCurrentView();
     });
   }
@@ -2268,7 +2269,10 @@ function connectEvents() {
     const { updateAvailable, updateBehind } = JSON.parse(event.data);
     setUpdateBadge(Boolean(updateAvailable), updateBehind);
   });
-  events.addEventListener('queue:changed', () => repaintQueue?.());
+  events.addEventListener('queue:changed', (event) => {
+    setJobs(JSON.parse(event.data));
+    repaintQueue?.();
+  });
   events.addEventListener('pause:changed', () => refreshCurrentView());
   events.addEventListener('update:waiting', () => refreshCurrentView());
   events.addEventListener('update:launched', () => refreshCurrentView());
@@ -2593,6 +2597,84 @@ drawerBackdropEl?.addEventListener('click', closeDrawer);
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawer();
 });
+
+// ---- running jobs -----------------------------------------------------
+
+/**
+ * The leftmost meter: how much of the concurrent job limit is in use right now.
+ *
+ * It reads like the machine meters next to it on purpose — the limit is a
+ * resource the same way the CPU is, and a header that says "4/16" answers the
+ * question people open the page to ask before any of the lists do.
+ */
+const jobsEl = document.getElementById('jobs');
+let jobsNodes = null; // built once, written to in place
+let jobsRefreshTimer = null;
+
+/**
+ * What the bar fills against. A limit of 0 is unlimited, which no bar can draw,
+ * so it fills against the processor count the limit would have defaulted to —
+ * the same number the Settings page calls the default.
+ */
+function jobsScale({ limit, defaultLimit }) {
+  const ceiling = Number(limit) > 0 ? Number(limit) : Number(defaultLimit);
+  return Number.isFinite(ceiling) && ceiling > 0 ? ceiling : 1;
+}
+
+function buildJobsMeter() {
+  const value = el('span', { class: 'usage-pct', text: '0' });
+  const fill = el('div', { class: 'usage-fill' });
+  const root = el('div', { class: 'usage-meter jobs-meter' }, [
+    el('div', { class: 'usage-head' }, [el('span', { text: 'Running Jobs' }), value]),
+    el('div', { class: 'usage-track' }, [fill]),
+  ]);
+  jobsEl.replaceChildren(root);
+  jobsNodes = { root, value, fill };
+  return jobsNodes;
+}
+
+/**
+ * Draws one reading. `limit` 0 means unlimited: the count stands on its own
+ * rather than being shown over a ceiling that does not exist.
+ */
+function setJobs(state) {
+  if (!jobsEl || !state) return;
+  const running = Number(state.runningCount) || 0;
+  const queued = Number(state.queuedCount) || 0;
+  const limit = Number(state.limit) || 0;
+  const scale = jobsScale(state);
+  const nodes = jobsNodes ?? buildJobsMeter();
+  jobsEl.hidden = false;
+
+  nodes.value.textContent = limit > 0 ? `${running}/${limit}` : String(running);
+  nodes.fill.style.width = `${Math.max(0, Math.min(100, (running / scale) * 100))}%`;
+  // Only a real limit can be full; unlimited never colours, however busy it is.
+  const severity = limit > 0 && running >= limit ? 'critical' : limit > 0 && running >= scale * 0.75 ? 'warning' : '';
+  nodes.root.className = `usage-meter jobs-meter ${severity}`.trim();
+  nodes.root.setAttribute(
+    'data-tip',
+    [
+      `${running} running job${running === 1 ? '' : 's'}`,
+      limit > 0 ? `Limit ${limit}` : `No limit set (the bar fills against ${scale} processors)`,
+      `${queued} queued`,
+    ].join('\n'),
+  );
+}
+
+/**
+ * Re-reads the queue after run activity, coalesced: a burst of starts and
+ * finishes is one request rather than one each.
+ */
+function refreshJobs() {
+  clearTimeout(jobsRefreshTimer);
+  jobsRefreshTimer = setTimeout(async () => {
+    try {
+      setJobs(await api('/api/queue'));
+    } catch {
+      /* the next health poll draws it instead */
+    }
+  }, 250);
+}
 
 // ---- machine stats ----------------------------------------------------
 
@@ -2927,6 +3009,12 @@ async function checkHealth() {
     setUpdateBadge(Boolean(health.updateAvailable), health.updateBehind);
     setBellBadge(health.unreadNotifications);
     setUsage(health.usage);
+    setJobs({
+      runningCount: health.running,
+      queuedCount: health.queued,
+      limit: health.concurrencyLimit,
+      defaultLimit: health.defaultConcurrencyLimit,
+    });
     if (!health.commit) return; // not a git checkout, nothing to compare
     if (!loadedCommit) loadedCommit = health.commit;
     else if (health.commit !== loadedCommit) staleBuild = true;

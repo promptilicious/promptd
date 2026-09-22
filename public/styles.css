@@ -433,6 +433,24 @@ a {
 }
 
 /*
+ * Running jobs: the leftmost meter, and the only one about the app's own work
+ * rather than the machine or the account. It carries the same rule the machine
+ * group does so the three groups read as three.
+ */
+.usage.jobs {
+  padding-right: 14px;
+  border-right: 1px solid var(--border);
+}
+
+.jobs-meter {
+  min-width: 82px;
+}
+
+.jobs-meter .usage-fill {
+  background: var(--accent);
+}
+
+/*
  * Machine stats: the same meter as above, drawn from this computer rather than
  * the account, and separated from the subscription ones by a rule so the two
  * groups do not read as one row of eight.

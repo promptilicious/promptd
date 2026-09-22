@@ -751,6 +751,9 @@ app.get('/api/health', async (_req, res) => {
     delayed: cronService.delayedCount(),
     queued: cronService.queuedCount(),
     concurrencyLimit: cronService.concurrencyLimit,
+    // What the limit means when it is 0: the header's jobs meter fills against
+    // this rather than against "unlimited", which no bar can draw.
+    defaultConcurrencyLimit: DEFAULT_MAX_CONCURRENT_JOBS,
     unreadNotifications: notificationCenter.unreadCount(),
     usage,
     ...selfUpdater.availability(),
