@@ -2658,9 +2658,11 @@ function setJobs(state) {
   nodes.root.setAttribute(
     'data-tip',
     [
-      `${running} running job${running === 1 ? '' : 's'}`,
-      limit > 0 ? `Limit ${limit}` : `No limit set (the bar fills against ${scale} processors)`,
-      `${queued} queued`,
+      `Running ${running}`,
+      // No limit is still a label and a number: the bar has to fill against
+      // something, and that something is the processor count.
+      limit > 0 ? `Limit ${limit}` : `Limit none (bar fills against ${scale})`,
+      `Queued ${queued}`,
     ].join('\n'),
   );
 }
