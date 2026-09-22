@@ -92,6 +92,12 @@ function describe(event) {
         ...cron,
       };
     }
+    // A run that could not set up or tear down its worktree may have gone
+    // without the files it needed, or left a folder and branch behind.
+    case 'worktree:include-failed':
+      return { kind: 'worktree-failed', read: false, message: `${name} could not write .worktreeinclude: ${event.error}`, ...cron };
+    case 'worktree:cleanup-failed':
+      return { kind: 'worktree-failed', read: false, message: `${name} worktree clean up failed: ${event.error}`, ...cron };
     case 'run:stopping':
       return { kind: 'run', read: true, message: `${name} is stopping`, ...cron };
     case 'run:skipped':

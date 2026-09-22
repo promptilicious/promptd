@@ -584,6 +584,8 @@ The bell at the right of the header carries a count of what has not been read, a
 | A trigger held for usage            | A held trigger that cleared and ran                       |
 | Anything the updater did            | A pause, a resume, and the triggers a pause dropped       |
 | A cron file that will not parse     | A cron file added, changed, deleted or fixed              |
+| A failed `.worktreeinclude` write   |                                                           |
+| A failed worktree clean up          |                                                           |
 
 **Reading is not clicking.** An unread notification is marked read once it has been on screen for three seconds — the list is the acknowledgement, not a button. Scrolling past something faster than that leaves it unread. What has been seen is reported in one request rather than one per item, and the count travels to your other open tabs.
 

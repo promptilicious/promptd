@@ -2532,6 +2532,18 @@ function connectEvents() {
     });
   }
 
+  // Matches the wording the server writes into the notification drawer.
+  events.addEventListener('worktree:include-failed', (event) => {
+    const payload = JSON.parse(event.data);
+    const named = payload.kind === 'execution' ? `one-time "${payload.cronName}"` : `"${payload.cronName}"`;
+    toast(`${named} could not write .worktreeinclude: ${payload.error}`, true);
+  });
+  events.addEventListener('worktree:cleanup-failed', (event) => {
+    const payload = JSON.parse(event.data);
+    const named = payload.kind === 'execution' ? `one-time "${payload.cronName}"` : `"${payload.cronName}"`;
+    toast(`${named} worktree clean up failed: ${payload.error}`, true);
+  });
+
   // Pause and update progress: the badges and the sub line both come from it.
   events.addEventListener('update:availability', (event) => {
     const { updateAvailable, updateBehind } = JSON.parse(event.data);
@@ -2636,7 +2648,7 @@ function setBellBadge(count) {
 
 /** The coloured dot: what kind of thing this was, at a glance. */
 function noteKindClass(kind) {
-  if (kind === 'run-failed' || kind === 'cron-broken') return 'bad';
+  if (kind === 'run-failed' || kind === 'cron-broken' || kind === 'worktree-failed') return 'bad';
   if (kind === 'delayed' || kind === 'update' || kind === 'system') return 'warn';
   return 'plain';
 }

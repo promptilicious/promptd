@@ -153,8 +153,15 @@ async function cleanUpWorktree(job, cwd) {
     return `cleaned up in ${((Date.now() - started) / 1000).toFixed(1)}s: ${result.cleaned}`;
   } catch (err) {
     console.error(`[cron] worktree clean up failed for "${job.name}": ${err.message}`);
+    // Left behind, the worktree is found again by the next run, or by nobody.
+    emit('worktree:cleanup-failed', { cronId: job.id, cronName: job.name, kind: job.kind ?? 'cron', error: oneLine(err.message) });
     return `error: ${err.message}`;
   }
+}
+
+/** git's messages can run to several lines; a notification is one. */
+function oneLine(text) {
+  return String(text).replace(/\s+/g, ' ').trim();
 }
 
 export function validateCronExpression(expression) {
@@ -1448,6 +1455,7 @@ class CronService {
         })
         .catch((err) => {
           console.error(`[cron] could not write ${WORKTREE_INCLUDE_FILE} for "${cron.name}": ${err.message}`);
+          emit('worktree:include-failed', { cronId: cron.id, cronName: cron.name, kind, error: oneLine(err.message) });
           return `error: ${err.message}`;
         });
     }
