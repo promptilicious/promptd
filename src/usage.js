@@ -20,7 +20,7 @@ const CREDENTIALS_FILE = path.join(os.homedir(), '.claude', '.credentials.json')
 
 // Usage moves slowly and every open tab polls /api/health, so the endpoint is
 // asked once per window at most and every request is answered from the cache.
-const TTL_MS = 5 * 60 * 1000;
+export const TTL_MS = 5 * 60 * 1000;
 // A failed lookup backs off, doubling from here: a rate-limited endpoint should
 // not be asked again on the same timer that just tripped it.
 const ERROR_BACKOFF_MS = 5 * 60 * 1000;

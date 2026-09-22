@@ -9,7 +9,7 @@ import { emit } from './events.js';
 import { resolveUserPath } from './paths.js';
 import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from './store.js';
 import { getExecution, listExecutions, patchExecution } from './executions.js';
-import { hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
+import { TTL_MS as USAGE_CHECK_MS, hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 import { countRun } from './stats.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS } from './settings.js';
 
@@ -20,6 +20,11 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 // and never asks the endpoint — so it is short enough to start the run promptly
 // once a refresh lands rather than adding a wait of its own on top.
 const DELAY_REVIEW_MS = 30 * 1000;
+
+// A job that has never finished a run has no runtime to go on, so the delay
+// outlook only counts it as taking a slot when it fires this close before the
+// run being looked at. Cron has a one-minute grain, so this is "at the same time".
+const SAME_MOMENT_MS = 60 * 1000;
 
 /**
  * Streaming JSON gives us the assistant text as it is produced plus a final
@@ -272,6 +277,14 @@ class CronService {
     this.pendingStarts = 0;
     /** Set while the queue is being walked, so a run finishing mid-walk does not start a second one. */
     this.draining = false;
+    /**
+     * id -> name and average runtime of every job on disk, refreshed by each
+     * rebuild — which a finished run triggers, so the averages stay current.
+     * What the delay outlook reads to say whether another job will still be
+     * holding a slot when this one is due, without a disk read per row.
+     * @type {Map<string, {name: string, averageRuntimeMs: number|null}>}
+     */
+    this.profiles = new Map();
   }
 
   isPaused() {
@@ -639,6 +652,7 @@ class CronService {
       defaultLimit: DEFAULT_MAX_CONCURRENT_JOBS,
       runningCount: this.running.size,
       queuedCount: this.queuedCount(),
+      usageDelayedCount: this.usageDelays().length,
       // What is armed behind the queue: the header's jobs tooltip shows both.
       armedCrons: this.armedCrons,
       armedExecutions: this.armedExecutions,
@@ -825,6 +839,10 @@ class CronService {
     const executions = await listExecutions();
     const overdue = this.armExecutions(executions);
 
+    this.profiles = new Map(
+      [...crons, ...executions].map((job) => [job.id, { name: job.name, averageRuntimeMs: averageRuntimeMs(job) }]),
+    );
+
     // Schedules stay registered through a pause, and every trigger they produce
     // is dropped on arrival by `trigger`. Nothing runs either way; the
     // difference is that a dropped trigger can be reported, and an unregistered
@@ -983,6 +1001,91 @@ class CronService {
     const job = this.jobs.get(cronId);
     const next = job?.nextRun();
     return next ? next.toISOString() : null;
+  }
+
+  /**
+   * What could hold this job's next run when it arrives at `at`, or null when
+   * nothing points that way.
+   *
+   * A forecast from what is known now, not a promise either way: a usage limit
+   * the job waits on that is spent and will not have cleared by then, and the
+   * jobs expected to fill every concurrent slot at that moment.
+   */
+  delayOutlook(job, at) {
+    const due = Math.max(Date.parse(at), Date.now());
+    if (!Number.isFinite(due)) return null;
+    const usage = this.usageOutlook(job, due);
+    const concurrency = this.concurrencyOutlook(job.id, due);
+    return usage.length || concurrency ? { usage, concurrency } : null;
+  }
+
+  /**
+   * The watched limits spent in the cached reading that will still read as
+   * spent at `due`. Never a lookup of its own, for the reason `blockersFor`
+   * gives, and a reset only frees the run once a usage check has seen it.
+   */
+  usageOutlook(job, due) {
+    const delay = normalizeUsageDelay(job.usageDelay);
+    if (!hasUsageDelay(delay)) return [];
+    return usageBlockers(usageMonitor.reading(), delay).filter(
+      (blocker) => !blocker.resetsAt || Date.parse(blocker.resetsAt) + USAGE_CHECK_MS > due,
+    );
+  }
+
+  /**
+   * The jobs expected to hold every slot at `due`, or null when one should be
+   * free: runs going now that should not have finished, triggers queued ahead,
+   * and other schedules firing close enough before to still be running.
+   *
+   * Each job counts once, whatever mix of reasons applies to it: a job never
+   * runs twice at once, and a second trigger while one waits is dropped. A job
+   * with no finished run to average is taken to still be going, since nothing
+   * says it will be done.
+   */
+  concurrencyOutlook(jobId, due) {
+    const limit = this.concurrencyLimit;
+    if (limit <= 0) return null;
+    const busy = new Map();
+
+    for (const run of this.running.values()) {
+      if (run.cronId === jobId) continue;
+      const hasAverage = Number.isFinite(run.averageRuntimeMs);
+      const endsAt = hasAverage ? Date.parse(run.startedAt) + run.averageRuntimeMs : Infinity;
+      if (endsAt <= due) continue;
+      busy.set(run.cronId, {
+        name: run.cronName,
+        state: 'running',
+        until: hasAverage ? new Date(endsAt).toISOString() : null,
+      });
+    }
+
+    const slots = this.slotEstimates();
+    this.queued().forEach((entry, position) => {
+      if (entry.cronId === jobId || busy.has(entry.cronId)) return;
+      const startsAt = slots[position] ? Date.parse(slots[position]) : null;
+      const average = this.profiles.get(entry.cronId)?.averageRuntimeMs;
+      // Only one expected to have started and finished by then gives its slot back.
+      if (startsAt !== null && Number.isFinite(average) && startsAt + average <= due) return;
+      busy.set(entry.cronId, { name: entry.cronName, state: 'queued' });
+    });
+
+    const now = Date.now();
+    for (const [id, schedule] of this.jobs) {
+      if (id === jobId || busy.has(id)) continue;
+      const profile = this.profiles.get(id);
+      const reach = Number.isFinite(profile?.averageRuntimeMs) ? profile.averageRuntimeMs : SAME_MOMENT_MS;
+      // croner answers the first run strictly after the date it is given.
+      const start = schedule.nextRun(new Date(Math.max(now, due - reach) - 1));
+      if (!start || start.getTime() > due) continue;
+      busy.set(id, {
+        name: profile?.name ?? id,
+        state: 'scheduled',
+        startsAt: start.toISOString(),
+        averageRuntimeSeconds: Number.isFinite(profile?.averageRuntimeMs) ? profile.averageRuntimeMs / 1000 : null,
+      });
+    }
+
+    return busy.size >= limit ? { limit, busy: [...busy.values()] } : null;
   }
 
   isRunning(cronId) {

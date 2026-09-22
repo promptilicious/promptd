@@ -134,16 +134,19 @@ function readExecutionForm(body) {
 function decorate(cron) {
   const run = cronService.currentRun(cron.id);
   const delayed = cronService.delayInfo(cron.id);
+  const nextRunAt = cronService.nextRun(cron.id);
   return {
     ...cron,
     // Always the full set, so a cron file written before this setting existed
     // still answers every checkbox the form draws.
     usageDelay: normalizeUsageDelay(cron.usageDelay),
-    nextRunAt: cronService.nextRun(cron.id),
+    nextRunAt,
     isRunning: Boolean(run),
     currentRun: run,
     isDelayed: Boolean(delayed),
     delayed,
+    // A trigger already waiting says so itself; this is about the next one.
+    delayRisk: nextRunAt && !delayed ? cronService.delayOutlook(cron, nextRunAt) : null,
   };
 }
 
@@ -168,6 +171,7 @@ function decorateExecution(execution) {
     currentRun: run,
     isDelayed: Boolean(delayed),
     delayed,
+    delayRisk: armed && !delayed ? cronService.delayOutlook(execution, execution.scheduledAt) : null,
   };
 }
 
@@ -750,6 +754,7 @@ app.get('/api/health', async (_req, res) => {
     paused: cronService.isPaused(),
     delayed: cronService.delayedCount(),
     queued: cronService.queuedCount(),
+    usageDelayed: cronService.usageDelays().length,
     concurrencyLimit: cronService.concurrencyLimit,
     // What the limit means when it is 0: the header's jobs meter fills against
     // this rather than against "unlimited", which no bar can draw.

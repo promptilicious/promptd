@@ -916,6 +916,19 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+/* A next run time that could start late: the warning in front, the reason on hover. */
+.delay-risk {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: help;
+}
+
+.delay-risk svg {
+  display: block;
+  color: var(--amber);
+}
+
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12.5px;

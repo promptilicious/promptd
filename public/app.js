@@ -325,6 +325,69 @@ function queueTitle(delayed) {
   return lines.join('\n');
 }
 
+const WARN_ICON =
+  '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">' +
+  '<path d="M8 1.8 15 14.2H1Z" fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />' +
+  '<path d="M8 6.2v3.6" style="stroke: var(--bg)" stroke-width="1.7" stroke-linecap="round" />' +
+  '<circle cx="8" cy="12" r="1" style="fill: var(--bg)" /></svg>';
+
+// Past this many, the list of jobs expected to hold a slot is cut short: the
+// reason is the limit being full, not who in particular is filling it.
+const RISK_JOB_LINES = 6;
+
+/** One job expected to be holding a slot when this run is due, as a tooltip line. */
+function riskJobLine(job) {
+  if (job.state === 'queued') return `${job.name}: queued ahead of it`;
+  if (job.state === 'scheduled') {
+    const average = Number.isFinite(job.averageRuntimeSeconds)
+      ? `, averages ${fmtDuration(job.averageRuntimeSeconds * 1000)} a run`
+      : '';
+    return `${job.name}: starts ${fmtDateTime(job.startsAt)}${average}`;
+  }
+  return job.until
+    ? `${job.name}: running, expected to finish ${fmtDateTime(job.until)}`
+    : `${job.name}: running, no finished run to estimate from`;
+}
+
+/**
+ * Hover text for the warning on a next run time: what could hold that run
+ * when it arrives. The server's forecast from what it knows now, so it says
+ * "could" — a run can finish early, and a limit can be read again sooner.
+ */
+function delayRiskTitle(risk) {
+  const sections = ['This run could start late.'];
+  if (risk.usage?.length) {
+    const lines = ['A usage limit this job waits on is spent:'];
+    for (const limit of risk.usage) {
+      const resets = limit.resetsAt
+        ? `resets ${fmtRelative(limit.resetsAt)} (${fmtDateTime(limit.resetsAt)})`
+        : 'no reset time reported';
+      lines.push(`${limit.label}: ${Math.round(limit.usedPercent)}% used, ${resets}`);
+    }
+    lines.push('The run waits until a usage check shows it clear. Usage is checked every 5 minutes.');
+    sections.push(lines.join('\n'));
+  }
+  if (risk.concurrency) {
+    const { limit, busy } = risk.concurrency;
+    const lines = [`The concurrent job limit of ${limit} could be full. Expected to be going then:`];
+    lines.push(...busy.slice(0, RISK_JOB_LINES).map(riskJobLine));
+    if (busy.length > RISK_JOB_LINES) lines.push(`and ${busy.length - RISK_JOB_LINES} more`);
+    lines.push('The run would queue for the next free slot.');
+    sections.push(lines.join('\n'));
+  }
+  return sections.join('\n\n');
+}
+
+/**
+ * The first line of a next run time: the countdown, with the warning in front
+ * when that run could be held. A pause drops the trigger instead of holding it,
+ * so while one is on the warning would be about a run that is not coming.
+ */
+function nextRunLine(text, risk, pause) {
+  if (!risk || pause.paused) return el('div', { text });
+  return el('div', { class: 'delay-risk', title: delayRiskTitle(risk) }, [el('span', { html: WARN_ICON }), text]);
+}
+
 /**
  * The Next run cell for a trigger that is waiting, either kind of job and
  * either reason: when it might go, and why it has not.
@@ -684,7 +747,7 @@ function nextRunCell(cron, pause) {
         : null,
     },
     [
-      el('div', { text: fmtRelative(cron.nextRunAt) }),
+      nextRunLine(fmtRelative(cron.nextRunAt), cron.delayRisk, pause),
       el('div', {
         class: 'cron-desc',
         text: pause.paused ? `${fmtDateTime(cron.nextRunAt)} · dropped` : fmtDateTime(cron.nextRunAt),
@@ -823,7 +886,7 @@ function scheduledCell(execution, pause) {
         : null,
     },
     [
-      el('div', { text: execution.isOverdue ? 'overdue' : fmtRelative(execution.scheduledAt) }),
+      nextRunLine(execution.isOverdue ? 'overdue' : fmtRelative(execution.scheduledAt), execution.delayRisk, pause),
       el('div', { class: 'cron-desc', text: fmtDateTime(execution.scheduledAt) }),
     ],
   );
@@ -2671,17 +2734,19 @@ function buildJobsMeter() {
   const value = el('span', { class: 'usage-pct', text: '0' });
   const fill = el('div', { class: 'usage-fill' });
   // A panel rather than the text tooltip the other meters use: the rule under
-  // Queued separates what is happening now from what is merely armed, and a
-  // tooltip made of one string cannot draw a line.
+  // Usage Delay separates what is happening now from what is merely armed, and
+  // a tooltip made of one string cannot draw a line.
   const running = jobsPopRow('Running');
   const limit = jobsPopRow('Limit');
   const queued = jobsPopRow('Queued');
+  const usageDelayed = jobsPopRow('Usage Delay');
   const crons = jobsPopRow('Crons Armed');
   const executions = jobsPopRow('OTE Scheduled');
   const pop = el('div', { class: 'jobs-pop' }, [
     running.row,
     limit.row,
     queued.row,
+    usageDelayed.row,
     el('div', { class: 'jobs-pop-rule' }),
     crons.row,
     executions.row,
@@ -2692,7 +2757,7 @@ function buildJobsMeter() {
     pop,
   ]);
   jobsEl.replaceChildren(root);
-  jobsNodes = { root, value, fill, running, limit, queued, crons, executions };
+  jobsNodes = { root, value, fill, running, limit, queued, usageDelayed, crons, executions };
   return jobsNodes;
 }
 
@@ -2719,6 +2784,7 @@ function setJobs(state) {
   // something, and that something is the processor count.
   nodes.limit.value.textContent = limit > 0 ? String(limit) : `none (of ${scale})`;
   nodes.queued.value.textContent = String(queued);
+  nodes.usageDelayed.value.textContent = String(Number(state.usageDelayedCount) || 0);
   nodes.crons.value.textContent = String(Number(state.armedCrons) || 0);
   nodes.executions.value.textContent = String(Number(state.armedExecutions) || 0);
 }
@@ -3074,6 +3140,7 @@ async function checkHealth() {
     setJobs({
       runningCount: health.running,
       queuedCount: health.queued,
+      usageDelayedCount: health.usageDelayed,
       limit: health.concurrencyLimit,
       defaultLimit: health.defaultConcurrencyLimit,
       armedCrons: health.armedCrons,
