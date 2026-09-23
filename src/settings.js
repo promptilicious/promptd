@@ -23,6 +23,8 @@ export function normalizeMaxConcurrentJobs(input) {
 }
 
 export const DEFAULT_SETTINGS = {
+  // Shown after "Claude Conductor" in the header bar. Blank shows the name alone.
+  serverName: '',
   // Check once a day whether the project's main branch is behind its remote,
   // and if so pull and restart. Set false to leave updates to you.
   selfUpdate: true,

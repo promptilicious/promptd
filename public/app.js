@@ -4,6 +4,7 @@ const toastsEl = document.getElementById('toasts');
 const updateBadgeEl = document.getElementById('update-badge');
 const usageEl = document.getElementById('usage');
 const systemEl = document.getElementById('system');
+const brandNameEl = document.getElementById('brand-name');
 
 let logStream = null; // EventSource tailing one log file
 let modelPollTimer = null; // set while model discovery is still running
@@ -1814,10 +1815,26 @@ async function renderSettings() {
     try {
       await api('/api/settings', { method: 'PUT', body: JSON.stringify(patch) });
       toast(description);
+      return true;
     } catch (err) {
       toast(err.message, true);
+      return false;
     }
   };
+
+  const serverNameInput = el('input', {
+    type: 'text',
+    value: typeof settings.serverName === 'string' ? settings.serverName : '',
+    placeholder: 'e.g. Office Mac mini',
+    autocomplete: 'off',
+    'aria-label': 'Server name',
+  });
+  // `change` fires on blur, and only when the text differs from what it held on focus.
+  serverNameInput.addEventListener('change', async () => {
+    const name = serverNameInput.value.trim();
+    serverNameInput.value = name;
+    if (await save({ serverName: name }, name ? `Server name set to ${name}` : 'Server name cleared')) setServerName(name);
+  });
 
   selfUpdate.addEventListener('change', () =>
     save({ selfUpdate: selfUpdate.checked }, selfUpdate.checked ? 'Self update on' : 'Self update off'),
@@ -2103,7 +2120,16 @@ async function renderSettings() {
       ]),
     ]),
     el('div', { class: 'card' }, [
-      el('h2', { text: 'Self update' }),
+      el('h2', { text: 'Server Settings' }),
+      el('h3', { text: 'Server Name' }),
+      el('div', { class: 'field' }, [serverNameInput]),
+      el('div', { class: 'hint' }, [
+        'Shown in the header bar as ',
+        el('span', { class: 'mono', text: 'Claude Conductor - <name>' }),
+        ', so two open servers can be told apart. Leave it blank to show Claude Conductor alone.',
+      ]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Updates' }),
       el('label', { class: 'check' }, [
         selfUpdate,
         'Check for updates once per interval and apply them automatically',
@@ -2128,8 +2154,8 @@ async function renderSettings() {
         ' and restarts the service. Update now works even with self update off.',
       ]),
       el('div', { class: 'card-divider' }),
-      el('h3', { text: 'Last check' }),
-      readOnly('Last checked', settings.lastUpdateCheckAt ? `${fmtDateTime(settings.lastUpdateCheckAt)} (${fmtRelative(settings.lastUpdateCheckAt)})` : 'never'),
+      el('h3', { text: 'Dates' }),
+      readOnly('Last check for updates', settings.lastUpdateCheckAt ? `${fmtDateTime(settings.lastUpdateCheckAt)} (${fmtRelative(settings.lastUpdateCheckAt)})` : 'never'),
       readOnly(
         'Last update started',
         settings.lastUpdateLaunchedAt
@@ -2138,8 +2164,6 @@ async function renderSettings() {
       ),
       // An update restarts the service, so this says whether the last one landed.
       readOnly('Server last boot time', health.startedAt ? `${fmtDateTime(health.startedAt)} (${fmtRelative(health.startedAt)})` : 'unknown'),
-      readOnly('Project folder', settings.projectDir),
-      readOnly('Update log', settings.updateLog),
     ]),
     el('div', { class: 'card' }, [
       el('h2', { text: 'Limit concurrent jobs' }),
@@ -2221,6 +2245,8 @@ async function renderSettings() {
           ? `${config.notificationsDir} (${notifications.total} stored, ${notifications.unread} unread)`
           : config.notificationsDir,
       ),
+      readOnly('Project folder', settings.projectDir),
+      readOnly('Update log', settings.updateLog),
       el('div', { class: 'hint' }, [
         'Every cron, every log line and every notification is a plain file under the storage root. ',
         'Editing a cron by hand is fine: the folder is watched. ',
@@ -2649,6 +2675,12 @@ function setUpdateBadge(available, behind = 0) {
   if (!available) return;
   const commits = behind ? `${behind} commit${behind === 1 ? '' : 's'} behind origin/main. ` : '';
   updateBadgeEl.title = `${commits}Open Settings to update.`;
+}
+
+/** The header bar names the server, so two open ones can be told apart. */
+function setServerName(name) {
+  if (!brandNameEl) return;
+  brandNameEl.textContent = name ? `Claude Conductor - ${name}` : 'Claude Conductor';
 }
 
 // ---- notifications ----------------------------------------------------
@@ -3393,5 +3425,8 @@ setInterval(() => {
 }, 15000);
 
 checkHealth();
+api('/api/settings')
+  .then((settings) => setServerName(settings.serverName))
+  .catch(() => {});
 connectEvents();
 route();

@@ -319,6 +319,10 @@ app.get('/api/settings', async (_req, res, next) => {
 app.put('/api/settings', async (req, res, next) => {
   try {
     const patch = {};
+    if ('serverName' in (req.body ?? {})) {
+      if (typeof req.body.serverName !== 'string') return res.status(400).json({ error: 'serverName must be a string' });
+      patch.serverName = req.body.serverName.trim();
+    }
     if ('selfUpdate' in (req.body ?? {})) patch.selfUpdate = Boolean(req.body.selfUpdate);
     if ('updateCheckIntervalHours' in (req.body ?? {})) {
       const hours = Number(req.body.updateCheckIntervalHours);
