@@ -344,6 +344,11 @@ app.put('/api/settings', async (req, res, next) => {
       }
       patch.usageDelayThresholds = thresholds;
     }
+    if ('defaultWorkingDirectory' in (req.body ?? {})) {
+      if (typeof req.body.defaultWorkingDirectory !== 'string') return res.status(400).json({ error: 'defaultWorkingDirectory must be a string' });
+      // Blank would run in home anyway; saved as ~/ so a new job's field still shows where it starts.
+      patch.defaultWorkingDirectory = req.body.defaultWorkingDirectory.trim() || '~/';
+    }
     if ('defaultWorktreeInclude' in (req.body ?? {})) {
       if (typeof req.body.defaultWorktreeInclude !== 'string') return res.status(400).json({ error: 'defaultWorktreeInclude must be a string' });
       patch.defaultWorktreeInclude = req.body.defaultWorktreeInclude;

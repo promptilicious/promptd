@@ -225,7 +225,7 @@ Each cron has a **Delay for usage** section on its form: four checkboxes, all of
 | Fable           | the Fable weekly limit                    | 95%     |
 | Monthly Credits | spending on extra usage credits           | 90%     |
 
-The percentages are set on the Settings page, under **Delay for usage**, and apply to every cron and one-time execution that ticks the box. A change reaches the next trigger; a trigger already waiting is re-checked at once, so raising a percentage can release it.
+The percentages are set on the Settings page, under **Job Settings** → **Delay for usage**, and apply to every cron and one-time execution that ticks the box. A change reaches the next trigger; a trigger already waiting is re-checked at once, so raising a percentage can release it.
 
 These are the same limits the header meters draw, matched on what a limit *is* rather than on its label, so nothing has to change here when the wording does. Tick none and the cron behaves exactly as it always has.
 
@@ -303,11 +303,12 @@ The **⚙** button at the right of the header opens a page for everything below.
   "lastUpdateFromCommit": null,
   "maxConcurrentJobs": 8,
   "usageDelayThresholds": { "session": 90, "weekly": 95, "fable": 95, "credits": 90 },
+  "defaultWorkingDirectory": "~/",
   "defaultWorktreeInclude": ""
 }
 ```
 
-`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. `defaultWorktreeInclude` is the text written as `.worktreeinclude` to the root of the git repository a job's working directory is in, before each run of a job with **Use worktree** ticked, overwriting any file already there. It goes at the root even when the working directory is a subfolder, because that is the only place Claude Code reads it; nothing is written while it is empty. Claude Code copies the ignored files it lists, such as `.env`, into each new worktree. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
+`maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. `defaultWorkingDirectory` is where the Working Directory field of a new cron or one-time execution starts, `~/` unless you change it; a blank value is saved as `~/`, and no saved job moves when it changes. `defaultWorktreeInclude` is the text written as `.worktreeinclude` to the root of the git repository a job's working directory is in, before each run of a job with **Use worktree** ticked, overwriting any file already there. It goes at the root even when the working directory is a subfolder, because that is the only place Claude Code reads it; nothing is written while it is empty. Claude Code copies the ignored files it lists, such as `.env`, into each new worktree. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
 
 The check runs on the interval either way. `selfUpdate` decides only whether what it finds gets applied: with it off, the server still fetches and compares, and an available update shows as an amber **Update available** badge in the header that links to this page. Nothing is pulled and no cron is paused until you press **Update now**.
 
@@ -678,7 +679,7 @@ An alias records what it resolved to: a cron set to `haiku` logs `Model: claude-
 
 ## Working directory
 
-The field defaults to `~/` on a new cron and autocompletes as you type: suggestions come from the filesystem, `↑`/`↓` picks one, `Enter` or `Tab` accepts it. Accepting ends the path in `/`, so pressing `Enter` again drills into that directory. Under the field, a live note shows the absolute path the run will use, or says the path does not exist.
+On a new cron or one-time execution the field starts at the **Default working directory** from the Settings page, under **Job Settings** (`~/` unless you change it); editing or duplicating a job keeps its own. It autocompletes as you type: suggestions come from the filesystem, `↑`/`↓` picks one, `Enter` or `Tab` accepts it. Accepting ends the path in `/`, so pressing `Enter` again drills into that directory. Under the field, a live note shows the absolute path the run will use, or says the path does not exist.
 
 Paths are stored exactly as typed. They are resolved at spawn time:
 
@@ -737,7 +738,7 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/notifications?before=&limit=` | One page of notifications, newest first, plus the unread count and the cursor for the next page                                                                                 |
 | POST             | `/api/notifications/read`          | Mark notifications read. Body `{"ids":[...]}`; answers with what is still unread                                                                                               |
 | GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are waiting and how many of those are queued for a slot, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
-| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs`, `usageDelayThresholds` and `defaultWorktreeInclude`                                        |
+| GET, PUT         | `/api/settings`                    | Read settings; write `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs`, `usageDelayThresholds`, `defaultWorkingDirectory` and `defaultWorktreeInclude`                                   |
 | GET              | `/api/queue`                       | The concurrent job limit, what is running under it with each job's average run length, and what is queued behind it with each one's position and estimated start                |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"30m"\|"1h"\|"3h"\|"restart"}`                                                                                                            |

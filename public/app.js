@@ -1034,10 +1034,22 @@ function cronPicker(input) {
 }
 
 /**
+ * Where a new job's Working Directory field starts, from the Settings page. A
+ * settings read that fails falls back to home rather than blocking the form.
+ */
+async function defaultWorkingDirectory() {
+  const settings = await api('/api/settings').catch(() => ({}));
+  return typeof settings.defaultWorkingDirectory === 'string' && settings.defaultWorkingDirectory.trim()
+    ? settings.defaultWorkingDirectory
+    : '~/';
+}
+
+/**
  * Wraps the Working Directory input in a directory picker: suggestions from the
  * server as you type, keyboard selection, and a live note of where the path lands.
+ * A null label leaves the field unlabelled, for a place with a heading of its own.
  */
-function directoryPicker(input) {
+function directoryPicker(input, { label = 'Working Directory' } = {}) {
   const menu = el('div', { class: 'combo-menu', hidden: 'hidden' });
   const hint = el('div', { class: 'hint', text: DIR_HINT });
   let items = [];
@@ -1126,7 +1138,7 @@ function directoryPicker(input) {
   });
 
   return el('div', { class: 'field' }, [
-    el('label', { text: 'Working Directory' }),
+    label ? el('label', { text: label }) : null,
     el('div', { class: 'combo' }, [input, menu]),
     hint,
   ]);
@@ -1449,6 +1461,7 @@ function scheduledAtPicker(input) {
 async function renderForm(id, duplicateOf) {
   const sourceId = id ?? duplicateOf;
   const cron = sourceId ? await api(`/api/crons/${sourceId}`) : null;
+  const startDirectory = cron ? null : await defaultWorkingDirectory();
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   const inputs = {
@@ -1467,8 +1480,8 @@ async function renderForm(id, duplicateOf) {
     workingDirectory: el('input', {
       type: 'text',
       class: 'mono',
-      // New crons start at the home directory; editing shows whatever was saved.
-      value: cron ? (cron.workingDirectory ?? '') : '~/',
+      // New crons start at the Settings page default; editing or duplicating shows the source's.
+      value: cron ? (cron.workingDirectory ?? '') : startDirectory,
       placeholder: '~/code/project',
       autocomplete: 'off',
       spellcheck: 'false',
@@ -1572,6 +1585,7 @@ async function renderForm(id, duplicateOf) {
 async function renderExecutionForm(id, duplicateOf) {
   const sourceId = id ?? duplicateOf;
   const execution = sourceId ? await api(`/api/executions/${sourceId}`) : null;
+  const startDirectory = execution ? null : await defaultWorkingDirectory();
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   /**
@@ -1616,7 +1630,7 @@ async function renderExecutionForm(id, duplicateOf) {
     workingDirectory: el('input', {
       type: 'text',
       class: 'mono',
-      value: execution ? (execution.workingDirectory ?? '') : '~/',
+      value: execution ? (execution.workingDirectory ?? '') : startDirectory,
       placeholder: '~/code/project',
       autocomplete: 'off',
       spellcheck: 'false',
@@ -1896,6 +1910,28 @@ async function renderSettings() {
     await save({ usageDelayThresholds: defaults }, 'Usage delays back to their defaults');
   });
 
+  // ---- default working directory ----
+  // Tracked like the fields above, so leaving the field unchanged saves nothing.
+  let startDirectory = typeof settings.defaultWorkingDirectory === 'string' && settings.defaultWorkingDirectory.trim() ? settings.defaultWorkingDirectory : '~/';
+  const startDirectoryInput = el('input', {
+    type: 'text',
+    class: 'mono',
+    value: startDirectory,
+    placeholder: '~/',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    'aria-label': 'Default working directory',
+  });
+  // Blur rather than change: taking a suggestion sets the value from script,
+  // which a change event can miss. Clicking a suggestion keeps the focus.
+  startDirectoryInput.addEventListener('blur', () => {
+    const value = startDirectoryInput.value.trim() || '~/';
+    startDirectoryInput.value = value;
+    if (value === startDirectory) return;
+    startDirectory = value;
+    save({ defaultWorkingDirectory: value }, `New jobs start in ${value}`);
+  });
+
   // ---- worktrees ----
   const worktreeInclude = el('textarea', {
     class: 'compact',
@@ -2132,13 +2168,24 @@ async function renderSettings() {
       ]),
     ]),
     el('div', { class: 'card' }, [
-      el('h2', { text: 'Delay for usage' }),
+      el('h2', { text: 'Job Settings' }),
+      el('h3', { text: 'Delay for usage' }),
       thresholdRow,
       el('div', { class: 'preset-row' }, [thresholdReset]),
       el('div', { class: 'hint' }, [
         'A cron or one-time execution with a limit ticked under Delay for usage waits while that limit is at or above its percentage here. ',
         'The same percentage applies to every job that ticks it, and a change reaches the next trigger. ',
         `The defaults are ${thresholdDefaults}.`,
+      ]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Default working directory' }),
+      directoryPicker(startDirectoryInput, { label: null }),
+      el('div', { class: 'hint' }, [
+        'Where the Working Directory field of a new cron or one-time execution starts. ',
+        'Editing or duplicating a job keeps the directory it already has, and changing this moves no saved job. ',
+        'The default is ',
+        el('span', { class: 'mono', text: '~/' }),
+        '.',
       ]),
     ]),
     el('div', { class: 'card' }, [

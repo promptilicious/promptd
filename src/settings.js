@@ -37,6 +37,8 @@ export const DEFAULT_SETTINGS = {
   // The percentage each Delay for usage limit has to reach before a cron that
   // ticks it is held.
   usageDelayThresholds: DEFAULT_USAGE_THRESHOLDS,
+  // Where the Working Directory field of a new cron or one-time execution starts.
+  defaultWorkingDirectory: '~/',
   // Written as .worktreeinclude to the root of a job's git repository when it runs
   // in a worktree, naming the ignored files Claude Code copies into new ones.
   defaultWorktreeInclude: '',
