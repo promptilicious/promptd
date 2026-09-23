@@ -1511,6 +1511,14 @@ class CronService {
     // text, so the log reads like plain output and can still be tailed live.
     let pending = '';
     let sawText = false;
+    let textTail = ''; // last two characters of assistant text, to size the break before the next block
+    let textBlockOpened = false;
+
+    const writeText = (text) => {
+      sawText = true;
+      textTail = (textTail + text).slice(-2);
+      stream.write(text);
+    };
 
     const handleLine = (line) => {
       const trimmed = line.trim();
@@ -1522,12 +1530,19 @@ class CronService {
         stream.write(`${line}\n`); // not JSON (a CLI warning); keep it verbatim
         return;
       }
-      if (event.type === 'stream_event' && event.event?.type === 'content_block_delta') {
-        const text = event.event.delta?.type === 'text_delta' ? event.event.delta.text : null;
-        if (text) {
-          sawText = true;
-          stream.write(text);
+      if (event.type === 'stream_event') {
+        const inner = event.event;
+        if (inner?.type === 'content_block_start') {
+          textBlockOpened = inner.content_block?.type === 'text';
+          return;
         }
+        const text = inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta' ? inner.delta.text : null;
+        if (!text) return;
+        // Each text block is a new paragraph: the ones either side of a tool
+        // call arrive back to back and would otherwise run into one line.
+        if (textBlockOpened && sawText && !textTail.endsWith('\n\n')) writeText(textTail.endsWith('\n') ? '\n' : '\n\n');
+        textBlockOpened = false;
+        writeText(text);
         return;
       }
       if (event.type === 'result') {
