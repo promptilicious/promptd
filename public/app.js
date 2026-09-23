@@ -1836,6 +1836,41 @@ async function renderSettings() {
     if (await save({ serverName: name }, name ? `Server name set to ${name}` : 'Server name cleared')) setServerName(name);
   });
 
+  // ---- server color ----
+  // Tracked like the fields below, so a failed save puts back the color in force.
+  let serverColor = /^#[0-9a-f]{6}$/i.test(settings.serverColor ?? '') ? settings.serverColor.toLowerCase() : DEFAULT_SERVER_COLOR;
+  const swatches = SERVER_COLORS.map((color) =>
+    el('button', { type: 'button', class: 'swatch', style: `background: ${color.hex}`, title: color.label, 'aria-label': color.label }),
+  );
+  const customColor = el('input', { type: 'color', class: 'swatch-custom', title: 'Custom color', 'aria-label': 'Custom server color' });
+
+  const markColor = (hex) => {
+    swatches.forEach((swatch, i) => swatch.setAttribute('aria-pressed', SERVER_COLORS[i].hex === hex ? 'true' : 'false'));
+    customColor.value = hex;
+    customColor.classList.toggle('selected', !SERVER_COLORS.some((color) => color.hex === hex));
+  };
+
+  const applyServerColor = async (hex) => {
+    const previous = serverColor;
+    serverColor = hex;
+    markColor(hex);
+    setServerColor(hex);
+    const named = SERVER_COLORS.find((color) => color.hex === hex);
+    const saved = await save(
+      { serverColor: hex === DEFAULT_SERVER_COLOR ? '' : hex },
+      hex === DEFAULT_SERVER_COLOR ? 'Server color back to the default' : `Server color set to ${named?.label ?? hex}`,
+    );
+    if (saved) return;
+    serverColor = previous;
+    markColor(previous);
+    setServerColor(previous);
+  };
+
+  swatches.forEach((swatch, i) => swatch.addEventListener('click', () => applyServerColor(SERVER_COLORS[i].hex)));
+  // `change` fires once the picker closes; dragging inside it saves nothing.
+  customColor.addEventListener('change', () => applyServerColor(customColor.value.toLowerCase()));
+  markColor(serverColor);
+
   selfUpdate.addEventListener('change', () =>
     save({ selfUpdate: selfUpdate.checked }, selfUpdate.checked ? 'Self update on' : 'Self update off'),
   );
@@ -2127,6 +2162,18 @@ async function renderSettings() {
         'Shown in the header bar as ',
         el('span', { class: 'mono', text: 'Claude Conductor - <name>' }),
         ', so two open servers can be told apart. Leave it blank to show Claude Conductor alone.',
+      ]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Server Color' }),
+      el('div', { class: 'preset-row' }, [
+        ...swatches,
+        el('span', { class: 'preset-sep' }),
+        el('span', { class: 'preset-label', text: 'Custom' }),
+        customColor,
+      ]),
+      el('div', { class: 'hint' }, [
+        'Colors the band across the top of every page, the dot beside the name, and the buttons and highlights. ',
+        'Give each server its own and you can tell which one is open before reading anything. Orange is the default.',
       ]),
       el('div', { class: 'card-divider' }),
       el('h3', { text: 'Updates' }),
@@ -2681,6 +2728,35 @@ function setUpdateBadge(available, behind = 0) {
 function setServerName(name) {
   if (!brandNameEl) return;
   brandNameEl.textContent = name ? `Claude Conductor - ${name}` : 'Claude Conductor';
+}
+
+/** The Server Color swatches. The first is the stylesheet's own accent, saved as blank. */
+const SERVER_COLORS = [
+  { label: 'Orange', hex: '#d97757' },
+  { label: 'Blue', hex: '#5b9cf5' },
+  { label: 'Green', hex: '#4cc38a' },
+  { label: 'Purple', hex: '#a58af5' },
+  { label: 'Pink', hex: '#ec79b4' },
+  { label: 'Teal', hex: '#3cc4c4' },
+  { label: 'Amber', hex: '#e0a846' },
+  { label: 'Red', hex: '#ef6b6b' },
+];
+const DEFAULT_SERVER_COLOR = SERVER_COLORS[0].hex;
+
+/** Recolors the accent, and the band across the header bar with it. Blank puts the default back. */
+function setServerColor(hex) {
+  const root = document.documentElement.style;
+  if (!/^#[0-9a-f]{6}$/i.test(hex ?? '')) {
+    for (const name of ['--accent', '--accent-soft', '--accent-ink']) root.removeProperty(name);
+    return;
+  }
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  const [lr, lg, lb] = [r, g, b].map((v) => (v / 255 <= 0.03928 ? v / 255 / 12.92 : ((v / 255 + 0.055) / 1.055) ** 2.4));
+  root.setProperty('--accent', hex);
+  root.setProperty('--accent-soft', `rgba(${r}, ${g}, ${b}, 0.14)`);
+  // Dark text on a light pick and white on a dark one, so a primary button
+  // stays readable whatever custom color is chosen. 0.2 is where they cross.
+  root.setProperty('--accent-ink', 0.2126 * lr + 0.7152 * lg + 0.0722 * lb > 0.2 ? '#1b1207' : '#ffffff');
 }
 
 // ---- notifications ----------------------------------------------------
@@ -3426,7 +3502,10 @@ setInterval(() => {
 
 checkHealth();
 api('/api/settings')
-  .then((settings) => setServerName(settings.serverName))
+  .then((settings) => {
+    setServerName(settings.serverName);
+    setServerColor(settings.serverColor);
+  })
   .catch(() => {});
 connectEvents();
 route();
