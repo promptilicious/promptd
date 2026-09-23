@@ -64,6 +64,18 @@ export async function removeWorktree(dir, name) {
 }
 
 /**
+ * Where `dir` sits inside its repository, such as `apps/web`, or null at the
+ * top of one or outside git. The root git reports has its symlinks resolved,
+ * so `dir` is resolved too before the two are compared.
+ */
+export async function pathInRepo(dir) {
+  const root = await repoRoot(dir);
+  if (!root) return null;
+  const relative = path.relative(root, await fsp.realpath(dir).catch(() => dir));
+  return relative && !relative.startsWith('..') ? relative : null;
+}
+
+/**
  * Writes the default .worktreeinclude to the root of the repository `dir` is
  * in, replacing whatever file is there.
  *

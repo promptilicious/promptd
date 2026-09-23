@@ -12,7 +12,7 @@ import { getExecution, listExecutions, patchExecution } from './executions.js';
 import { TTL_MS as USAGE_CHECK_MS, hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
 import { countRun } from './stats.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings } from './settings.js';
-import { WORKTREE_INCLUDE_FILE, removeWorktree, writeWorktreeInclude } from './worktree.js';
+import { WORKTREE_INCLUDE_FILE, pathInRepo, removeWorktree, writeWorktreeInclude } from './worktree.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -47,10 +47,32 @@ const PROMPT_PREFIX =
   'the turn with a blocking command. Never use ScheduleWakeup, run_in_background, or /loop to carry ' +
   'remaining work forward.';
 
-/** The prompt as the CLI receives it: the preamble, then what the job says. */
-function promptFor(job) {
+/**
+ * Added after the preamble when a job runs in a worktree. Facts only this
+ * service knows, worded to hold for any repository; what to do about them is
+ * for the job's own prompt to say. Unlike the preamble it differs per job, so
+ * the log shows it.
+ *
+ * `subfolder` is where the job's working directory sits in its repository. A
+ * worktree session starts at the top of its copy, not in that folder.
+ */
+function worktreeNotice(job, subfolder) {
+  return [
+    'Worktree: you are running in a git worktree. Keep all changes, commands and subagents inside it.',
+    subfolder ? `This job's folder is ${subfolder} within the worktree.` : null,
+    'Git-ignored files, such as installed dependencies, are not copied in unless listed in .worktreeinclude.',
+    job.cleanupWorktree
+      ? 'When this run ends, the worktree and its branch are deleted: uncommitted changes and commits only on that branch are lost.'
+      : 'The next run of this job reuses this worktree as you leave it.',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+/** The prompt as the CLI receives it: the preamble, the worktree notice if any, then what the job says. */
+function promptFor(job, notice = null) {
   const prompt = job.prompt ?? '';
-  return prompt.trim() ? `${PROMPT_PREFIX}\n\n${prompt}` : PROMPT_PREFIX;
+  return [PROMPT_PREFIX, notice, prompt.trim() ? prompt : null].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -1335,6 +1357,8 @@ class CronService {
     let worktreeIncludeNote = cron.useWorktree ? 'not written' : 'not written: Use worktree is off';
     // The file as written, shown in full above the prompt. Null leaves the section out.
     let worktreeIncludeText = null;
+    // What the prompt was told about the worktree, shown above the prompt. Null leaves it out.
+    let worktreeNoticeText = null;
 
     // Written once the child exists, so the header can carry its pid.
     const writeHeader = (pid) => {
@@ -1356,6 +1380,7 @@ class CronService {
           `Cleanup worktree  ${Boolean(cron.cleanupWorktree)}`,
           `.worktreeinclude  ${worktreeIncludeNote}`,
           `command    ${CLAUDE_BIN} -p <prompt> ${[...CLAUDE_ARGS, ...modelArgs, ...effortArgs, ...worktreeArgs].join(' ')}`,
+          ...(worktreeNoticeText === null ? [] : ['--- worktree notice ---', worktreeNoticeText]),
           ...(worktreeIncludeText === null ? [] : ['--- .worktreeinclude ---', worktreeIncludeText.replace(/\n$/, '')]),
           '--- prompt ---',
           cron.prompt ?? '',
@@ -1458,11 +1483,12 @@ class CronService {
           emit('worktree:include-failed', { cronId: cron.id, cronName: cron.name, kind, error: oneLine(err.message) });
           return `error: ${err.message}`;
         });
+      worktreeNoticeText = worktreeNotice(cron, await pathInRepo(cwd));
     }
 
     let child;
     try {
-      child = spawn(CLAUDE_BIN, ['-p', promptFor(cron), ...CLAUDE_ARGS, ...modelArgs, ...effortArgs, ...worktreeArgs], {
+      child = spawn(CLAUDE_BIN, ['-p', promptFor(cron, worktreeNoticeText), ...CLAUDE_ARGS, ...modelArgs, ...effortArgs, ...worktreeArgs], {
         cwd,
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe'],
