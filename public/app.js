@@ -2211,9 +2211,8 @@ async function renderSettings() {
       ),
       // An update restarts the service, so this says whether the last one landed.
       readOnly('Server last boot time', health.startedAt ? `${fmtDateTime(health.startedAt)} (${fmtRelative(health.startedAt)})` : 'unknown'),
-    ]),
-    el('div', { class: 'card' }, [
-      el('h2', { text: 'Limit concurrent jobs' }),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Limit concurrent jobs' }),
       el('div', { class: 'preset-row' }, [
         el('span', { class: 'preset-label', text: 'Run at most' }),
         limitInput,
