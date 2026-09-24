@@ -771,3 +771,11 @@ As the field changes, a green line below it shows when the expression next fires
 - Deleting a cron or a one-time execution leaves its logs on disk. Remove `logs/<id>/` by hand if you want them gone — and with the cron file gone, its lifetime totals go with it.
 - Renaming a cron carries its lifetime totals, because they live on the cron file rather than being recounted from the logs.
 - Renaming a cron moves no logs: the log folder is named for the cron's id, which never changes, so history follows the rename by staying put.
+
+## Disclaimer
+
+promptd is an independent project. It is not affiliated with, endorsed by, or sponsored by Anthropic. It runs prompts through Claude Code, which you install and sign in to separately. Claude, Claude Code and Anthropic are trademarks of Anthropic, PBC.
+
+## License
+
+Copyright 2026 Tyler Neal. Licensed under the [Apache License, Version 2.0](LICENSE).
