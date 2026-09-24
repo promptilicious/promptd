@@ -2258,10 +2258,9 @@ async function renderSettings() {
         el('span', { class: 'mono', text: '~/' }),
         '.',
       ]),
-    ]),
-    el('div', { class: 'card' }, [
-      el('h2', { text: 'Worktrees' }),
-      el('div', { class: 'field' }, [el('label', { text: 'Default .worktreeinclude' }), worktreeInclude]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Default .worktreeinclude' }),
+      el('div', { class: 'field' }, [worktreeInclude]),
       el('div', { class: 'hint' }, [
         'Written as ',
         el('span', { class: 'mono', text: '.worktreeinclude' }),
