@@ -1035,14 +1035,19 @@ function cronPicker(input) {
 }
 
 /**
- * Where a new job's Working Directory field starts, from the Settings page. A
- * settings read that fails falls back to home rather than blocking the form.
+ * Where a new job's Working Directory and Prompt fields start, from the Settings
+ * page. A settings read that fails falls back to home and a blank prompt rather
+ * than blocking the form.
  */
-async function defaultWorkingDirectory() {
+async function newJobDefaults() {
   const settings = await api('/api/settings').catch(() => ({}));
-  return typeof settings.defaultWorkingDirectory === 'string' && settings.defaultWorkingDirectory.trim()
-    ? settings.defaultWorkingDirectory
-    : '~/';
+  return {
+    workingDirectory:
+      typeof settings.defaultWorkingDirectory === 'string' && settings.defaultWorkingDirectory.trim()
+        ? settings.defaultWorkingDirectory
+        : '~/',
+    prompt: typeof settings.defaultPrompt === 'string' ? settings.defaultPrompt : '',
+  };
 }
 
 /**
@@ -1462,7 +1467,7 @@ function scheduledAtPicker(input) {
 async function renderForm(id, duplicateOf) {
   const sourceId = id ?? duplicateOf;
   const cron = sourceId ? await api(`/api/crons/${sourceId}`) : null;
-  const startDirectory = cron ? null : await defaultWorkingDirectory();
+  const defaults = cron ? null : await newJobDefaults();
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   const inputs = {
@@ -1482,7 +1487,7 @@ async function renderForm(id, duplicateOf) {
       type: 'text',
       class: 'mono',
       // New crons start at the Settings page default; editing or duplicating shows the source's.
-      value: cron ? (cron.workingDirectory ?? '') : startDirectory,
+      value: cron ? (cron.workingDirectory ?? '') : defaults.workingDirectory,
       placeholder: '~/code/project',
       autocomplete: 'off',
       spellcheck: 'false',
@@ -1490,7 +1495,7 @@ async function renderForm(id, duplicateOf) {
     prompt: el('textarea', { placeholder: 'The prompt passed to claude -p' }),
     isActive: el('input', { type: 'checkbox' }),
   };
-  inputs.prompt.value = cron?.prompt ?? '';
+  inputs.prompt.value = cron ? (cron.prompt ?? '') : defaults.prompt;
   inputs.isActive.checked = cron ? Boolean(cron.isActive) : true;
 
   const worktree = worktreePicker(cron, { id });
@@ -1586,7 +1591,7 @@ async function renderForm(id, duplicateOf) {
 async function renderExecutionForm(id, duplicateOf) {
   const sourceId = id ?? duplicateOf;
   const execution = sourceId ? await api(`/api/executions/${sourceId}`) : null;
-  const startDirectory = execution ? null : await defaultWorkingDirectory();
+  const defaults = execution ? null : await newJobDefaults();
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   /**
@@ -1631,7 +1636,7 @@ async function renderExecutionForm(id, duplicateOf) {
     workingDirectory: el('input', {
       type: 'text',
       class: 'mono',
-      value: execution ? (execution.workingDirectory ?? '') : startDirectory,
+      value: execution ? (execution.workingDirectory ?? '') : defaults.workingDirectory,
       placeholder: '~/code/project',
       autocomplete: 'off',
       spellcheck: 'false',
@@ -1639,7 +1644,7 @@ async function renderExecutionForm(id, duplicateOf) {
     prompt: el('textarea', { placeholder: 'The prompt passed to claude -p' }),
     isActive: el('input', { type: 'checkbox' }),
   };
-  inputs.prompt.value = execution?.prompt ?? '';
+  inputs.prompt.value = execution ? (execution.prompt ?? '') : defaults.prompt;
   inputs.isActive.checked = execution ? Boolean(execution.isActive) : true;
 
   const worktree = worktreePicker(execution, { id, oneTime: true });
@@ -1984,6 +1989,17 @@ async function renderSettings() {
     save({ defaultWorkingDirectory: value }, `New jobs start in ${value}`);
   });
 
+  // ---- default prompt ----
+  const defaultPrompt = el('textarea', {
+    class: 'compact',
+    'aria-label': 'Default prompt',
+    text: typeof settings.defaultPrompt === 'string' ? settings.defaultPrompt : '',
+  });
+  // `change` fires on blur, and only when the text differs from what it held on focus.
+  defaultPrompt.addEventListener('change', () =>
+    save({ defaultPrompt: defaultPrompt.value }, defaultPrompt.value.trim() ? 'Default prompt saved' : 'Default prompt cleared'),
+  );
+
   // ---- worktrees ----
   const worktreeInclude = el('textarea', {
     class: 'compact',
@@ -2256,6 +2272,14 @@ async function renderSettings() {
         'The default is ',
         el('span', { class: 'mono', text: '~/' }),
         '.',
+      ]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Default prompt' }),
+      el('div', { class: 'field' }, [defaultPrompt]),
+      el('div', { class: 'hint' }, [
+        'Where the Prompt field of a new cron or one-time execution starts. ',
+        'Editing or duplicating a job keeps the prompt it already has, and changing this rewrites no saved job. ',
+        'Leave it blank to start new jobs with an empty prompt.',
       ]),
       el('div', { class: 'card-divider' }),
       el('h3', { text: 'Default .worktreeinclude' }),

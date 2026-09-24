@@ -360,6 +360,10 @@ app.put('/api/settings', async (req, res, next) => {
       // Blank would run in home anyway; saved as ~/ so a new job's field still shows where it starts.
       patch.defaultWorkingDirectory = req.body.defaultWorkingDirectory.trim() || '~/';
     }
+    if ('defaultPrompt' in (req.body ?? {})) {
+      if (typeof req.body.defaultPrompt !== 'string') return res.status(400).json({ error: 'defaultPrompt must be a string' });
+      patch.defaultPrompt = req.body.defaultPrompt;
+    }
     if ('defaultWorktreeInclude' in (req.body ?? {})) {
       if (typeof req.body.defaultWorktreeInclude !== 'string') return res.status(400).json({ error: 'defaultWorktreeInclude must be a string' });
       patch.defaultWorktreeInclude = req.body.defaultWorktreeInclude;

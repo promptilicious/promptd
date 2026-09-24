@@ -43,6 +43,8 @@ export const DEFAULT_SETTINGS = {
   usageDelayThresholds: DEFAULT_USAGE_THRESHOLDS,
   // Where the Working Directory field of a new cron or one-time execution starts.
   defaultWorkingDirectory: '~/',
+  // Where the Prompt field of a new cron or one-time execution starts.
+  defaultPrompt: '',
   // Written as .worktreeinclude to the root of a job's git repository when it runs
   // in a worktree, naming the ignored files Claude Code copies into new ones.
   defaultWorktreeInclude: '',
