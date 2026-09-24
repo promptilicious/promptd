@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { emit } from './events.js';
 import { LOGS_DIR } from './paths.js';
 import { loadSettings, patchSettings } from './settings.js';
-import { cronService } from './cronService.js';
+import { hub } from './hub.js';
 
 // Normally the checkout this file lives in; overridable so the update path can
 // be exercised against a scratch repository.
@@ -21,10 +21,10 @@ const UPDATE_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 const TICK_MS = 15 * 60 * 1000;
 const FIRST_TICK_MS = 60 * 1000;
 
-// Restarting on top of a live run kills it: the run's stdout is a pipe to this
-// process, so the child dies of EPIPE at its next write, mid-task and with
-// nothing recorded. So an update holds the schedules and waits for the last run
-// to end before the restart.
+// The update restarts the local node too, and a run's stdout is a pipe to the
+// node, so the child would die of EPIPE at its next write, mid-task and with
+// nothing recorded. So an update holds every node's schedules and waits for the
+// last run to end before the restart.
 const DRAIN_INTERVAL_MS = 10 * 1000;
 // A run that never ends must not hold the schedules paused forever. Generous,
 // because a legitimately long cron finishing is worth more than a prompt update.
@@ -141,7 +141,7 @@ class SelfUpdater {
   state() {
     return {
       draining: this.draining,
-      runningCount: cronService.runningCount(),
+      runningCount: hub.runningCount(),
       since: this.drainStartedAt ? new Date(this.drainStartedAt).toISOString() : null,
     };
   }
@@ -188,7 +188,7 @@ class SelfUpdater {
     // be cancelled from the page.
     this.draining = true;
     this.drainStartedAt = Date.now();
-    await cronService.pauseAll({ mode: 'update', label: 'for update' });
+    await hub.pauseAll({ mode: 'update', label: 'for update' });
     emit('update:launched', { behind: result.behind, from: result.head, pid: null, ...this.state() });
 
     const pid = this.startDrain();
@@ -202,8 +202,8 @@ class SelfUpdater {
   startDrain() {
     let pid = null;
     const tick = () => {
-      const running = cronService.runningCount();
-      if (running === 0) {
+      const running = hub.runningCount();
+      if (running === 0 && hub.everyNodeHolding()) {
         this.stopDrain();
         pid = this.launch();
         return;
@@ -212,7 +212,7 @@ class SelfUpdater {
         console.error(`[update] gave up after ${Math.round(DRAIN_LIMIT_MS / 60000)}m; ${running} run(s) still going. Resuming schedules, update not applied.`);
         this.stopDrain();
         emit('update:abandoned', { runningCount: running });
-        cronService.resumeAll('update gave up waiting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+        hub.resumeAll('update gave up waiting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
         return;
       }
       // The news is how many runs are left, so it is only news when that number
@@ -286,6 +286,8 @@ class SelfUpdater {
         ...process.env,
         PROMPTD_PROJECT_DIR: PROJECT_DIR,
         PROMPTD_LAUNCHD_LABEL: process.env.PROMPTD_LAUNCHD_LABEL ?? 'local.promptd',
+        PROMPTD_NODE_LAUNCHD_LABEL:
+          process.env.PROMPTD_NODE_LAUNCHD_LABEL ?? `${process.env.PROMPTD_LAUNCHD_LABEL ?? 'local.promptd'}.node`,
       },
     });
     // A successful update restarts us, so the restart kills this process before
@@ -297,7 +299,7 @@ class SelfUpdater {
       const grace = setTimeout(() => {
         console.error(`[update] no restart arrived; see ${UPDATE_LOG}. Resuming schedules.`);
         emit('update:failed', { code, updateLog: UPDATE_LOG });
-        cronService.resumeAll('update finished without restarting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+        hub.resumeAll('update finished without restarting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
       }, RESTART_GRACE_MS);
       grace.unref?.();
     });

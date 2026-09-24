@@ -1,6 +1,6 @@
 # promptd
 
-A lightweight web UI to schedule, manage, and run Claude prompts, either as a cron that repeats on a schedule or as a one-time execution at a date and time you pick. A small Node.js server holds a set of crons and one-time executions, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/promptd`.
+A lightweight web UI to schedule, manage, and run Claude prompts, either as a cron that repeats on a schedule or as a one-time execution at a date and time you pick. A small Node.js hub holds a set of crons and one-time executions and serves the web page. One or more nodes, on this machine or others, fetch their jobs from it, spawn `claude -p` on each one's schedule, and report the output back as it happens. No database: every cron and every log line is a plain file under `~/.claude/promptd`.
 
 - Two tabs on the home page: **Crons**, which run on a schedule, and **One-time Execution**, which run once at a date you pick.
 - Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
@@ -22,11 +22,39 @@ Needs Node 18 or newer, and Claude Code installed and signed in — `claude --ve
 
 ```bash
 npm install
-npm start          # http://127.0.0.1:4321
+npm start          # the hub on http://127.0.0.1:4321, plus one node on this machine
 npm run dev        # same, restarts on file changes
+npm run start:hub  # the hub alone
+npm run start:node # a node alone
 ```
 
+## Hub and nodes
+
+promptd is two processes. The **hub** (`src/server.js`) stores every job, log, setting and notification, and serves the web page. A **node** (`src/node.js`) runs jobs: it keeps its own schedules, spawns `claude`, and holds runs against its usage limits and concurrency limit.
+
+A node only ever calls the hub, never the other way round. Every 2 seconds it posts a report (what it is running, new log output, finished runs, events), then fetches its work (its jobs, the settings, the pause, and any **Run now** or **Stop** pressed on the page). Only the hub needs to be reachable, so a node can sit behind NAT on another network.
+
+1. **Which node runs a job.** Each job has a **Node** field. Blank means the default node, set on the Settings page under **Nodes**. The first node to connect becomes the default, so jobs saved before nodes existed run on this machine.
+2. **The token.** The hub writes a random token to `~/.claude/promptd/node-token` on first boot, and refuses node requests without it. A node on the same machine reads the file; a node elsewhere is given it as `PROMPTD_NODE_TOKEN`.
+3. **When the hub is down.** A node keeps its jobs on disk under `~/.claude/promptd/node/` and keeps running them. It catches the hub up on output and results when the hub is back.
+4. **When a node is down.** Its jobs show `node offline`, and **Run now** answers 409 until it reconnects. A one-time execution it was running when it stopped is closed as `interrupted`.
+5. **Node identity.** A node names itself after its hostname. Two processes with the same id are refused, so set `PROMPTD_NODE_ID` if two nodes share a hostname.
+
+Usage limits, model discovery and machine stats all belong to a node. The header meters and the Model dropdown show the default node's.
+
+### Adding a node on another Mac
+
+Clone the project there, then:
+
+```bash
+NODE_ONLY=1 HUB_URL=http://<hub-address>:4321 NODE_TOKEN=<token> ./scripts/register-app-mac-os.sh
+```
+
+Copy the token from `~/.claude/promptd/node-token` on the hub's machine. The hub has to be reachable from the node, which on another network usually means binding it to `0.0.0.0` — read [Network access](#network-access) first. The token protects the node API only; the web page itself still has no password.
+
 ## Start at login (macOS)
+
+Two launchd agents: `local.promptd` runs the hub and `local.promptd.node` runs the local node.
 
 macOS starts per-user background processes with **launchd**. Run this once:
 
@@ -34,7 +62,7 @@ macOS starts per-user background processes with **launchd**. Run this once:
 ./scripts/register-app-mac-os.sh
 ```
 
-It finds your `node` and `claude`, runs `npm install` if `node_modules` is missing, writes the LaunchAgent plist with absolute paths, registers it, and waits until the server answers before reporting success. Output ends with the commands for restarting, stopping and removing it.
+It finds your `node` and `claude`, runs `npm install` if `node_modules` is missing, writes both LaunchAgent plists with absolute paths, registers them, and waits until the hub answers and the node has connected before reporting success. An install registered before nodes existed gets its node agent from the hub itself, the first time it boots on the new code. Output ends with the commands for restarting, stopping and removing it.
 
 Overrides, if you need them:
 
@@ -42,8 +70,13 @@ Overrides, if you need them:
 | -------- | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
 | `PORT`   | `4321`                   | Port the server listens on                                                                                   |
 | `HOST`   | `127.0.0.1`              | Bind address. `0.0.0.0` accepts connections from your network — read [Network access](#network-access) first |
-| `LABEL`  | `local.promptd` | launchd service name                                                                                         |
-| `FORCE`  | unset                    | Replace an already-registered agent                                                                          |
+| `LABEL`  | `local.promptd` | launchd service name of the hub                                                                              |
+| `NODE_LABEL` | `$LABEL.node`        | launchd service name of the node                                                                             |
+| `NODE_ONLY`  | unset                | Register only the node, for a Mac that joins a hub elsewhere                                                 |
+| `HUB_URL`    | this Mac's hub       | Where the node finds the hub                                                                                 |
+| `NODE_TOKEN` | read from the hub's storage folder | The hub's node token, needed when the hub is on another machine                                 |
+| `NODE_ID`, `NODE_NAME` | the hostname | How the node names itself                                                                                    |
+| `FORCE`  | unset                    | Replace agents that are already registered                                                                   |
 
 ```bash
 PORT=5000 ./scripts/register-app-mac-os.sh     # a different port
@@ -51,7 +84,7 @@ HOST=0.0.0.0 ./scripts/register-app-mac-os.sh  # reachable from your network
 FORCE=1 ./scripts/register-app-mac-os.sh       # re-register after moving the project
 ```
 
-Run again without `FORCE` and it changes nothing, just prints how to restart, replace or remove what is already there.
+Run again without `FORCE` and it leaves registered agents alone, adds any that are missing, and prints how to restart, replace or remove each one.
 
 ### Network access
 
@@ -126,11 +159,13 @@ Run that from the project directory, since it uses `$PWD`. Then register and sta
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.promptd.plist
 ```
 
-That starts it now and at every login. Open http://127.0.0.1:4321.
+That starts the hub now and at every login. The node's plist, `~/Library/LaunchAgents/local.promptd.node.plist`, is the same shape with `src/node.js` in place of `src/server.js`, `PROMPTD_HUB_URL` in place of `PORT` and `HOST`, and `node.log` in place of `server.log`. Bootstrap it the same way, then open http://127.0.0.1:4321.
 
 Set `HOST` to `0.0.0.0` in that plist to accept connections from your network — read [Network access](#network-access) before you do. Editing the plist takes a `bootout` then `bootstrap`, not a `kickstart`.
 
 ### Start and stop
+
+Each command takes the hub's label, `local.promptd`, or the node's, `local.promptd.node`.
 
 | Task                        | Command                                                                                                           |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
@@ -138,7 +173,7 @@ Set `HOST` to `0.0.0.0` in that plist to accept connections from your network �
 | Stop (and disable at login) | `launchctl bootout gui/$(id -u)/local.promptd`                                                           |
 | Restart after changing code | `launchctl kickstart -k gui/$(id -u)/local.promptd`                                                      |
 | Is it running?              | `launchctl print gui/$(id -u)/local.promptd \| grep -E "state =\|pid ="`                                 |
-| Server log                  | `tail -f ~/Library/Logs/promptd/server.log`                                                              |
+| Logs                        | `tail -f ~/Library/Logs/promptd/server.log ~/Library/Logs/promptd/node.log`                              |
 | Remove entirely             | `launchctl bootout gui/$(id -u)/local.promptd && rm ~/Library/LaunchAgents/local.promptd.plist` |
 
 `bootout` both stops the server and stops it coming back at login, so it is the pair to `bootstrap` rather than a temporary pause. Editing the plist requires a `bootout` then `bootstrap`; `kickstart -k` only restarts the process with the plist launchd already has.
@@ -187,7 +222,7 @@ A one-time execution has no second chance the way a cron does, so a missed trigg
 
 Saving one with a time already in the past is allowed for the same reason, and the form says so before you save: *That time has passed — saving this runs it now.*
 
-A run the server was restarted out from under is a different thing. On boot it is closed as `interrupted` rather than started again — the work may have been half done, and re-running something because the machine rebooted is worse than leaving it for the **Run now** button.
+A run its node was restarted out from under is a different thing. When the node comes back it is closed as `interrupted` rather than started again — the work may have been half done, and re-running something because the machine rebooted is worse than leaving it for the **Run now** button.
 
 ## Pausing every cron
 
@@ -198,7 +233,7 @@ A run the server was restarted out from under is a different thing. On boot it i
 | 30 minutes    | 30 minutes from now                            |
 | 1 hour        | an hour from now                               |
 | 3 hours       | three hours from now                           |
-| Until restart | the pause is cancelled, or the server restarts |
+| Until restart | the pause is cancelled, or the hub restarts    |
 
 While paused, the dropdown is replaced by **Cancel pause**, which resumes immediately. Every status reads `Paused 30 minutes` (or whichever length you chose), and hovering one says when it lifts.
 
@@ -372,7 +407,7 @@ The checker refuses rather than guesses, and says why in the server log and in `
 
 ### The restart needs the launchd agent
 
-Only launchd can bring the server back after it stops, so the updater restarts the service registered under `local.promptd` (override with `PROMPTD_LAUNCHD_LABEL`). See [Start at login](#start-at-login-macos).
+Only launchd can bring a process back after it stops, so the updater restarts the node registered under `local.promptd.node` and then the hub under `local.promptd` (override with `PROMPTD_NODE_LAUNCHD_LABEL` and `PROMPTD_LAUNCHD_LABEL`). An update pulls this checkout only: a node on another Mac runs its own checkout and is updated there. See [Start at login](#start-at-login-macos).
 
 If no such agent is registered — you are running `npm start` in a terminal, say — the update is still pulled, but the running server is left alone and the log says so:
 
@@ -399,6 +434,12 @@ The paths in use are listed on the Settings page, under **Storage**.
 │   └── update.log                  # appended by the self updater
 ├── notifications/
 │   └── 2026-09-15T22-38-33.816Z-25ec7aca.json  # one file per notice, newest 5000 kept
+├── node/                           # this machine's node
+│   ├── state.json                  # its copy of its jobs and settings, and writes not yet sent
+│   ├── uploads.json                # logs still being sent to the hub
+│   └── logs/<uuid>/<run>.txt       # a run's log until the hub has all of it
+├── node-token                      # the secret nodes present to the hub
+├── nodes.json                      # every node that has connected
 └── settings.json                   # app settings, written with defaults on first run
 ```
 
@@ -418,6 +459,7 @@ A cron file:
   "usageDelay": { "session": true, "weekly": false, "fable": false, "credits": true },
   "prompt": "Write a two line summary of today.",
   "isActive": true,
+  "nodeId": "",
   "createdAt": "2026-09-10T06:11:04.188Z",
   "updatedAt": "2026-09-10T06:11:04.188Z",
   "lastRunAt": "2026-09-10T06:11:12.789Z",
@@ -664,7 +706,14 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | `CLAUDE_BIN`              | `claude`                        | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`.                                                                 |
 | `WATCH_INTERVAL_MS`       | `3000`                          | How often the crons folder is polled for outside changes. `0` disables it.                                                                       |
 | `SYSTEM_SAMPLE_MS`        | `5000`                          | How often machine stats are sampled. `0` disables the service and its meters. Floored at `1000`.                                                 |
-| `PROMPTD_LAUNCHD_LABEL` | `local.promptd`        | The launchd service the updater restarts                                                                                                         |
+| `PROMPTD_LAUNCHD_LABEL` | `local.promptd`        | The hub's launchd service, which the updater restarts                                                                                            |
+| `PROMPTD_NODE_LAUNCHD_LABEL` | `$PROMPTD_LAUNCHD_LABEL.node` | The local node's launchd service, which the updater restarts first                                                                     |
+| `PROMPTD_HUB_URL`       | `http://127.0.0.1:$PORT` | Node: where the hub is                                                                                                                         |
+| `PROMPTD_NODE_TOKEN`    | read from `node-token`  | Node: the hub's token, when the hub is on another machine                                                                                       |
+| `PROMPTD_NODE_ID`       | the hostname, lowercased | Node: its id. Must be unique across nodes                                                                                                      |
+| `PROMPTD_NODE_NAME`     | the hostname            | Node: the name the page shows                                                                                                                   |
+| `PROMPTD_NODE_HOME`     | `$PROMPTD_HOME/node`    | Node: where it keeps its state and unsent logs                                                                                                  |
+| `PROMPTD_SYNC_MS`       | `2000`                  | Node: how often it reports and fetches work                                                                                                     |
 | `PROMPTD_PROJECT_DIR`   | the checkout this code lives in | Which repository the update check looks at                                                                                                       |
 
 ## Model
@@ -731,18 +780,22 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/crons`                       | List, with next run time and live-run state                                                                                                                                    |
 | POST             | `/api/crons`                       | Create                                                                                                                                                                         |
 | GET, PUT, DELETE | `/api/crons/:id`                   | Read, update, delete                                                                                                                                                           |
-| POST             | `/api/crons/:id/run`               | Trigger now. 409 if already running, if crons are paused, or if a trigger is already waiting. 202 with `delayed` instead of a run when a watched limit is spent or every slot is taken |
-| POST             | `/api/crons/:id/stop`              | Kill the in-flight run, or drop a waiting trigger (409 if neither)                                                                                                             |
+| POST             | `/api/crons/:id/run`               | Ask the cron's node to run it. 202 with `requested: true`; the node picks it up on its next sync, and may still hold it for usage or a free slot. 409 if already running, if crons are paused, if a trigger is already waiting, or if the node is offline |
+| POST             | `/api/crons/:id/stop`              | Ask the node to kill the in-flight run, or drop a waiting trigger (409 if neither)                                                                                             |
 | GET              | `/api/crons/:id/logs`              | Run history newest first, plus the cron's lifetime totals and per-run averages                                                                                                 |
 | GET              | `/api/crons/:id/logs/:file`        | One log as JSON                                                                                                                                                                |
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
+| GET              | `/api/nodes`                       | Every node that has connected, whether it is online, which is the default, and where the node token is kept                                                                     |
+| DELETE           | `/api/nodes/:id`                   | Forget a node (409 while it is online)                                                                                                                                          |
+| POST             | `/api/node/report`, `/api/node/leave` | Node API, bearer token required: a node's status, log output, run results and events; and its sign-off on shutdown                                                          |
+| GET              | `/api/node/work`                   | Node API, bearer token required: the node's jobs, settings, the pause, and pending Run now and Stop presses                                                                     |
 | GET              | `/api/config`                      | Storage paths, the log and notification retention limits, effort levels, the usage-delay categories, and the default concurrent job limit                                        |
 | GET              | `/api/system`                      | Machine stats: the current reading, the last fifteen minutes behind it, what each meter means, and this machine's cores, memory and storage path                                |
 | GET              | `/api/notifications?before=&limit=` | One page of notifications, newest first, plus the unread count and the cursor for the next page                                                                                 |
 | POST             | `/api/notifications/read`          | Mark notifications read. Body `{"ids":[...]}`; answers with what is still unread                                                                                               |
 | GET              | `/api/health`                      | Liveness, when this process started, how many crons are scheduled, whether they are paused, how many triggers are waiting and how many of those are queued for a slot, how many notifications are unread, `updateAvailable` with the commits behind, and `usage` with a percentage and reset time per subscription limit |
-| GET, PUT         | `/api/settings`                    | Read settings; write `serverName`, `serverColor`, `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs`, `usageDelayThresholds`, `defaultWorkingDirectory`, `defaultPrompt`, `commonCommands` and `defaultWorktreeInclude`                                   |
+| GET, PUT         | `/api/settings`                    | Read settings; write `serverName`, `serverColor`, `selfUpdate`, `updateCheckIntervalHours`, `maxConcurrentJobs`, `usageDelayThresholds`, `defaultNodeId`, `defaultWorkingDirectory`, `defaultPrompt`, `commonCommands` and `defaultWorktreeInclude`                                   |
 | GET              | `/api/queue`                       | The concurrent job limit, what is running under it with each job's average run length, and what is queued behind it with each one's position and estimated start                |
 | GET              | `/api/pause`                       | Pause state, the offered lengths, how many runs are still in flight, and how many triggers this pause has dropped                                                               |
 | POST             | `/api/pause`                       | Hold every schedule. Body `{"option":"30m"\|"1h"\|"3h"\|"restart"}`                                                                                                            |
@@ -764,6 +817,8 @@ As the field changes, a green line below it shows when the expression next fires
 ## Notes
 
 - The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
+- The concurrent job limit and the usage thresholds are one setting each, applied by every node on its own: with two nodes online, twice the limit can run at once. The default limit is the hub machine's processor count.
+- The directory autocomplete lists folders on the hub's machine, which is only right for jobs on the local node. For a job on another machine, type the path.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
 - A pause lives in memory only. Restarting the server clears it, whichever length was chosen. So does a trigger held for usage: a restart comes back with nothing waiting. A one-time execution is the exception that proves the rule — it is on disk, so a restart finds it and, if its moment has passed, runs it.
 - The `executions` folder is not watched. Hand-edit a one-time execution and it takes effect at the next restart, not within seconds; the crons folder is the polled one.

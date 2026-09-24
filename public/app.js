@@ -198,6 +198,13 @@ function hashBase(job) {
   return job?.kind === 'execution' ? '#/one-time' : '#';
 }
 
+function nodeOfflinePill(node) {
+  return el('span', { class: 'pill warn', title: `Node "${node.name ?? 'default'}" is not connected, so nothing starts until it is.` }, [
+    el('span', { class: 'led' }),
+    'node offline',
+  ]);
+}
+
 /**
  * A live run keeps its running badge through a pause and picks up the paused
  * badge when it finishes. A deactivated cron stays deactivated: a pause does
@@ -209,6 +216,7 @@ function statusPill(cron, pause) {
     return el('span', { class: 'pill delayed', title: delayTitle(cron.delayed) }, [el('span', { class: 'led' }), 'delayed']);
   }
   if (!cron.isActive) return el('span', { class: 'pill paused' }, [el('span', { class: 'led' }), 'deactivated']);
+  if (cron.node && !cron.node.online) return nodeOfflinePill(cron.node);
   if (pause?.paused) {
     return el(
       'span',
@@ -232,6 +240,7 @@ function executionPill(execution, pause) {
     return el('span', { class: 'pill delayed', title: delayTitle(execution.delayed) }, [el('span', { class: 'led' }), 'delayed']);
   }
   if (!execution.isActive) return el('span', { class: 'pill paused' }, [el('span', { class: 'led' }), 'deactivated']);
+  if (execution.status === 'scheduled' && execution.node && !execution.node.online) return nodeOfflinePill(execution.node);
   if (execution.status === 'cancelled') {
     return el('span', { class: 'pill warn', title: `Dropped by ${execution.stoppedBy ?? 'the user'} before it ran.` }, [
       el('span', { class: 'led' }),
@@ -566,7 +575,7 @@ function runControl(cron, { small = false, onStarted, pause } = {}) {
           toast(`"${cron.name}" is queued at position ${result.delayed.position + 1}; every slot is taken.`, true);
         } else if (result?.delayed) {
           toast(`"${cron.name}" is waiting on ${delayNames(result.delayed)}.`, true);
-        } else toast(`Started "${cron.name}"`);
+        } else toast(`Starting "${cron.name}"`);
       } catch (err) {
         toast(err.message, true);
         event.target.disabled = false;
@@ -1497,6 +1506,41 @@ function scheduledAtPicker(input) {
   ]);
 }
 
+/** Which node runs the job. Blank follows the default node, so changing the default moves it. */
+function nodePicker(selected) {
+  const select = el('select', { class: 'select mono' });
+  const note = el('div', { class: 'hint', text: 'The machine that runs this job. The default node is set on the Settings page.' });
+  const current = selected ?? '';
+
+  const paint = ({ nodes = [], defaultNodeId = '' }) => {
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const label = (node) => `${node.name}${node.online ? '' : ' (offline)'}`;
+    const fallback = byId.get(defaultNodeId);
+    const options = [
+      { value: '', label: fallback ? `Default node (${label(fallback)})` : 'Default node' },
+      ...nodes.map((node) => ({ value: node.id, label: label(node) })),
+    ];
+    if (current && !byId.has(current)) options.push({ value: current, label: `${current} (not connected)` });
+    select.replaceChildren(
+      ...options.map((option) => el('option', { value: option.value, selected: option.value === current }, option.label)),
+    );
+    select.value = current;
+  };
+
+  paint({});
+  api('/api/nodes')
+    .then(paint)
+    .catch((err) => {
+      note.textContent = `Could not load the nodes: ${err.message}`;
+      note.className = 'hint warn';
+    });
+
+  return {
+    read: () => select.value,
+    field: el('div', { class: 'field' }, [el('label', { text: 'Node' }), select, note]),
+  };
+}
+
 /**
  * One form serves three jobs. Duplicating loads the source cron exactly as
  * editing does, so every field arrives filled in; only the name carries a
@@ -1537,6 +1581,7 @@ async function renderForm(id, duplicateOf) {
   inputs.isActive.checked = cron ? Boolean(cron.isActive) : true;
 
   const worktree = worktreePicker(cron, { id });
+  const node = nodePicker(cron?.nodeId ?? '');
   const model = modelPicker(cron?.model ?? '');
   const effort = effortPicker(cron?.effort ?? '');
   const usageDelay = usageDelayPicker(cron?.usageDelay ?? null);
@@ -1554,6 +1599,7 @@ async function renderForm(id, duplicateOf) {
       name: inputs.name.value,
       description: inputs.description.value,
       cron: inputs.cron.value,
+      nodeId: node.read(),
       workingDirectory: inputs.workingDirectory.value,
       ...worktree.read(),
       model: model.read(),
@@ -1603,6 +1649,7 @@ async function renderForm(id, duplicateOf) {
       field('Name', inputs.name),
       field('Description', inputs.description),
       cronPicker(inputs.cron),
+      node.field,
       directoryPicker(inputs.workingDirectory),
       worktree.field,
       model.field,
@@ -1687,6 +1734,7 @@ async function renderExecutionForm(id, duplicateOf) {
   inputs.isActive.checked = execution ? Boolean(execution.isActive) : true;
 
   const worktree = worktreePicker(execution, { id, oneTime: true });
+  const node = nodePicker(execution?.nodeId ?? '');
   const model = modelPicker(execution?.model ?? '');
   const effort = effortPicker(execution?.effort ?? '');
   const usageDelay = usageDelayPicker(execution?.usageDelay ?? null);
@@ -1707,6 +1755,7 @@ async function renderExecutionForm(id, duplicateOf) {
       // Sent as a full instant rather than the field's bare local string, so
       // the server is not left guessing which clock it was typed on.
       scheduledAt: typed ? new Date(typed).toISOString() : '',
+      nodeId: node.read(),
       workingDirectory: inputs.workingDirectory.value,
       ...worktree.read(),
       model: model.read(),
@@ -1757,6 +1806,7 @@ async function renderExecutionForm(id, duplicateOf) {
       field('Name', inputs.name),
       field('Description', inputs.description),
       scheduledAtPicker(inputs.scheduledAt),
+      node.field,
       directoryPicker(inputs.workingDirectory),
       worktree.field,
       model.field,
@@ -2220,6 +2270,65 @@ async function renderSettings() {
   const readOnly = (label, value) =>
     el('div', { class: 'field' }, [el('label', { text: label }), el('div', { class: 'path-value mono', text: value })]);
 
+  const nodesBody = el('div', {});
+  const tokenFile = el('span', { class: 'mono', text: 'node-token' });
+  const paintNodes = async () => {
+    let state;
+    try {
+      state = await api('/api/nodes');
+    } catch (err) {
+      nodesBody.replaceChildren(el('div', { class: 'hint warn', text: `Could not load the nodes: ${err.message}` }));
+      return;
+    }
+    tokenFile.textContent = state.tokenFile;
+    const describe = (node) =>
+      [
+        node.id,
+        node.hostname,
+        node.commit,
+        node.online ? `${node.running} running, ${node.scheduled} scheduled` : `last seen ${fmtRelative(node.lastSeenAt)}`,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+    const rows = state.nodes.map((node) =>
+      el('div', { class: 'field' }, [
+        el('label', { text: node.isDefault ? `${node.name} (default)` : node.name }),
+        el('div', { class: 'preset-row' }, [
+          el('span', { class: `pill ${node.online ? 'active' : 'paused'}` }, [el('span', { class: 'led' }), node.online ? 'online' : 'offline']),
+          el('span', { class: 'preset-label mono', text: describe(node) }),
+          el('span', { class: 'preset-sep' }),
+          node.isDefault
+            ? null
+            : el('button', {
+                class: 'btn small',
+                text: 'Make default',
+                onclick: async () => {
+                  if (await save({ defaultNodeId: node.id }, `${node.name} is now the default node`)) paintNodes();
+                },
+              }),
+          node.online
+            ? null
+            : el('button', {
+                class: 'btn small danger',
+                text: 'Remove',
+                onclick: async () => {
+                  try {
+                    await api(`/api/nodes/${encodeURIComponent(node.id)}`, { method: 'DELETE' });
+                    toast(`Removed ${node.name}`);
+                    paintNodes();
+                  } catch (err) {
+                    toast(err.message, true);
+                  }
+                },
+              }),
+        ]),
+      ]),
+    );
+    nodesBody.replaceChildren(
+      ...(rows.length ? rows : [el('div', { class: 'hint warn', text: 'No node has connected yet, so nothing runs.' })]),
+    );
+  };
+
   view.replaceChildren(
     el('div', { class: 'breadcrumb' }, [el('a', { href: '#/', text: '← All crons' })]),
     el('div', { class: 'page-head' }, [
@@ -2369,6 +2478,19 @@ async function renderSettings() {
       ]),
     ]),
     el('div', { class: 'card' }, [
+      el('h2', { text: 'Nodes' }),
+      nodesBody,
+      el('div', { class: 'hint' }, [
+        'A node is a machine that runs jobs. Each one fetches its work from this server and reports back every few seconds, ',
+        'so only this server needs to be reachable. A job with no node of its own runs on the default node. ',
+        'To add a Mac, run ',
+        el('span', { class: 'mono', text: 'NODE_ONLY=1 HUB_URL=<this server> NODE_TOKEN=<token> ./scripts/register-app-mac-os.sh' }),
+        ' in a checkout there, with the token from ',
+        tokenFile,
+        ' on this machine.',
+      ]),
+    ]),
+    el('div', { class: 'card' }, [
       el('h2', { text: 'Storage' }),
       readOnly('Storage root', config.storageRoot),
       readOnly('Crons', config.cronsDir),
@@ -2392,8 +2514,12 @@ async function renderSettings() {
 
   check();
   paintQueue();
+  paintNodes();
   // Run activity redraws the queue on its own from here; the page is not rebuilt.
-  repaintQueue = paintQueue;
+  repaintQueue = () => {
+    paintQueue();
+    paintNodes();
+  };
 }
 
 // ---- logs -------------------------------------------------------------

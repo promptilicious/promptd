@@ -43,7 +43,7 @@ export function parseScheduledAt(input) {
  * history. A record with an unreadable date sorts last rather than first, so a
  * hand-edited file cannot push itself to the top of the list.
  */
-function byScheduledAtDesc(a, b) {
+export function byScheduledAtDesc(a, b) {
   const left = Date.parse(a.scheduledAt ?? '') || 0;
   const right = Date.parse(b.scheduledAt ?? '') || 0;
   if (left !== right) return right - left;
@@ -105,6 +105,7 @@ export async function createExecution(input) {
     usageDelay: normalizeUsageDelay(input.usageDelay),
     prompt: input.prompt ?? '',
     isActive: Boolean(input.isActive),
+    nodeId: input.nodeId ?? '',
     status: 'scheduled',
     createdAt: now,
     updatedAt: now,
@@ -144,6 +145,7 @@ export async function updateExecution(id, input) {
     usageDelay: normalizeUsageDelay(input.usageDelay),
     prompt: input.prompt ?? '',
     isActive: Boolean(input.isActive),
+    nodeId: input.nodeId ?? '',
     updatedAt: new Date().toISOString(),
     ...(rescheduled ? { status: 'scheduled', firedAt: null } : {}),
   };

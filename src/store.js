@@ -75,6 +75,7 @@ export async function createCron(input) {
     usageDelay: normalizeUsageDelay(input.usageDelay),
     prompt: input.prompt ?? '',
     isActive: Boolean(input.isActive),
+    nodeId: input.nodeId ?? '',
     createdAt: now,
     updatedAt: now,
     lastRunAt: null,
@@ -101,6 +102,7 @@ export async function updateCron(id, input) {
     usageDelay: normalizeUsageDelay(input.usageDelay),
     prompt: input.prompt ?? '',
     isActive: Boolean(input.isActive),
+    nodeId: input.nodeId ?? '',
     updatedAt: new Date().toISOString(),
   };
   // A rename moves no logs: the folder is the cron's id.

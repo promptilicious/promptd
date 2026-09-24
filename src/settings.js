@@ -53,6 +53,9 @@ export const DEFAULT_SETTINGS = {
   defaultWorktreeInclude: '',
   // Set once the log folders have been renamed from cron names to cron ids.
   logsMigrated: false,
+  // The node that runs a job with no node of its own. Set to the first node that connects.
+  defaultNodeId: '',
+  localNodeAgentCheckedAt: null,
 };
 
 /** Reads settings, writing the defaults file the first time. Unknown keys are kept. */

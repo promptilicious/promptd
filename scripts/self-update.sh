@@ -1,5 +1,5 @@
 #!/bin/bash
-# Applies a pending update and restarts the server.
+# Applies a pending update and restarts the hub and the local node.
 #
 # Started detached by src/updater.js, because the last thing it does is restart
 # the server that launched it. stdout and stderr are already pointed at
@@ -8,6 +8,7 @@ set -uo pipefail
 
 PROJECT_DIR="${PROMPTD_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 LABEL="${PROMPTD_LAUNCHD_LABEL:-local.promptd}"
+NODE_LABEL="${PROMPTD_NODE_LAUNCHD_LABEL:-$LABEL.node}"
 BRANCH=main
 REMOTE=origin
 
@@ -57,18 +58,23 @@ else
   log "dependencies unchanged"
 fi
 
-# Restart. Only launchd can bring the server back up, so if no agent is
-# registered leave the running one alone rather than killing the service.
-if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-  log "restarting $LABEL"
-  if launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>&1; then
-    log "restart requested"
+# Restart. Only launchd can bring a process back up, so an agent that is not
+# registered is left alone rather than killed. The node goes first: the hub is
+# what launched this script.
+restart() {
+  if launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; then
+    log "restarting $1"
+    if launchctl kickstart -k "gui/$(id -u)/$1" 2>&1; then
+      log "restart requested"
+    else
+      log "WARNING: kickstart of $1 failed; restart it by hand"
+    fi
   else
-    log "WARNING: kickstart failed; restart by hand"
+    log "no launchd agent named $1 is registered"
+    log "the new code is on disk but $1 is still running the old one — restart it yourself"
   fi
-else
-  log "no launchd agent named $LABEL is registered"
-  log "the new code is on disk but the running server is still the old one — restart it yourself"
-fi
+}
+restart "$NODE_LABEL"
+restart "$LABEL"
 
 log "=== self-update finished ==="

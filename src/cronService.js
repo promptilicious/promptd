@@ -7,11 +7,21 @@ import { randomUUID } from 'node:crypto';
 import { Cron } from 'croner';
 import { emit } from './events.js';
 import { resolveUserPath } from './paths.js';
-import { getCron, listCrons, logDir, logFileName, patchCron, pruneLogs } from './store.js';
-import { getExecution, listExecutions, patchExecution } from './executions.js';
+import { logFileName } from './store.js';
+import {
+  countRun,
+  getCron,
+  getExecution,
+  jobSettings,
+  listCrons,
+  listExecutions,
+  logDir,
+  patchCron,
+  patchExecution,
+} from './jobCache.js';
 import { TTL_MS as USAGE_CHECK_MS, hasUsageDelay, normalizeUsageDelay, usageBlockers, usageMonitor } from './usage.js';
-import { countRun } from './stats.js';
-import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings } from './settings.js';
+import { DEFAULT_MAX_CONCURRENT_JOBS } from './settings.js';
+import { validateCronExpression } from './schedule.js';
 import { WORKTREE_INCLUDE_FILE, pathInRepo, removeWorktree, writeWorktreeInclude } from './worktree.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
@@ -97,38 +107,6 @@ export async function findJob(id) {
   return null;
 }
 
-/**
- * The durations the Pause triggers for control offers. `ms: null` means "no timer" — the
- * pause is only lifted by cancelling it or by the process restarting, since the
- * pause is never written to disk.
- */
-export const PAUSE_OPTIONS = [
-  { id: '30m', label: '30 minutes', ms: 30 * 60 * 1000 },
-  { id: '1h', label: '1 hour', ms: 60 * 60 * 1000 },
-  { id: '3h', label: '3 hours', ms: 3 * 60 * 60 * 1000 },
-  { id: 'restart', label: 'until restart', ms: null },
-];
-
-/**
- * The effort levels the CLI accepts for `--effort`. An empty effort on a cron
- * means the flag is left off, so the CLI uses whatever it is configured to use.
- */
-export const EFFORT_LEVELS = [
-  { id: 'low', label: 'Low' },
-  { id: 'medium', label: 'Medium' },
-  { id: 'high', label: 'High' },
-  { id: 'xhigh', label: 'Extra high' },
-  { id: 'max', label: 'Max' },
-];
-
-export function isEffortLevel(value) {
-  return EFFORT_LEVELS.some((level) => level.id === value);
-}
-
-export function pauseOption(id) {
-  return PAUSE_OPTIONS.find((option) => option.id === id) ?? null;
-}
-
 function formatRuntime(ms) {
   if (!Number.isFinite(ms)) return 'unknown';
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
@@ -184,29 +162,6 @@ async function cleanUpWorktree(job, cwd) {
 /** git's messages can run to several lines; a notification is one. */
 function oneLine(text) {
   return String(text).replace(/\s+/g, ' ').trim();
-}
-
-export function validateCronExpression(expression) {
-  try {
-    const probe = new Cron(String(expression).trim(), { paused: true });
-    if (!probe.nextRun()) return { ok: false, error: 'expression has no future run times' };
-    probe.stop();
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-}
-
-/** Next fire time for an expression, without scheduling anything. */
-export function previewNextRun(expression) {
-  try {
-    const probe = new Cron(String(expression).trim(), { paused: true });
-    const next = probe.nextRun();
-    probe.stop();
-    return next ? next.toISOString() : null;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -1024,14 +979,14 @@ class CronService {
   async reconcileInterrupted() {
     const stranded = (await listExecutions()).filter((execution) => execution.status === 'running');
     for (const execution of stranded) {
-      console.warn(`[cron] one-time "${execution.name}" was running when the server stopped; marking it interrupted`);
+      console.warn(`[cron] one-time "${execution.name}" was running when the node stopped; marking it interrupted`);
       await patchExecution(execution.id, {
         status: 'done',
         lastRunStatus: 'interrupted',
         // Dated by the run that was cut short, not left on the one before it:
         // a row reading "interrupted" beside "last ran: never" is a puzzle.
         lastRunAt: execution.firedAt ?? execution.lastRunAt ?? null,
-        stoppedBy: 'server restart',
+        stoppedBy: 'node restart',
       }).catch((err) => console.error(`[cron] could not close "${execution.name}": ${err.message}`));
       emit('run:finished', {
         cronId: execution.id,
@@ -1437,11 +1392,6 @@ class CronService {
           : {}),
         ...lifetime,
       }).catch((err) => console.error(`[cron] could not record last run: ${err.message}`));
-      const pruned = await pruneLogs(cron.id).catch((err) => {
-        console.error(`[cron] log cleanup failed for "${cron.name}": ${err.message}`);
-        return 0;
-      });
-      if (pruned) console.log(`[cron] pruned ${pruned} old log(s) for "${cron.name}"`);
       console.log(`[cron] "${cron.name}" ${status} in ${seconds}s -> ${file}`);
       emit('run:finished', { cronId: cron.id, cronName: cron.name, kind, logFile: file, status, seconds: Number(seconds) });
       // The execution has had its run, so the one-shot timer it was armed with
@@ -1471,7 +1421,7 @@ class CronService {
     // is rewritten from the setting on every run, before the child starts. A
     // file that cannot be written is noted in the header; the run still goes.
     if (cron.useWorktree) {
-      const { defaultWorktreeInclude } = await loadSettings();
+      const { defaultWorktreeInclude } = jobSettings();
       worktreeIncludeNote = await writeWorktreeInclude(cwd, String(defaultWorktreeInclude ?? ''))
         .then((result) => {
           if (!result.written) return `not written: ${result.skipped}`;

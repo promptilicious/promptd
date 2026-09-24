@@ -2,13 +2,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { bus, emit } from './events.js';
 import { CRONS_DIR } from './paths.js';
-import { cronService } from './cronService.js';
 
 const INTERVAL_MS = Number(process.env.WATCH_INTERVAL_MS ?? 3000);
 
 // Only these fields make a cron a different cron. Run bookkeeping (lastRunAt and
 // friends) is rewritten after every run, and must not read as an external edit.
-const CONFIG_FIELDS = ['name', 'description', 'cron', 'workingDirectory', 'model', 'effort', 'usageDelay', 'prompt', 'isActive'];
+const CONFIG_FIELDS = ['name', 'description', 'cron', 'workingDirectory', 'model', 'effort', 'usageDelay', 'prompt', 'isActive', 'nodeId'];
 
 function fingerprint(cron) {
   return JSON.stringify(CONFIG_FIELDS.map((field) => cron[field] ?? null));
@@ -133,10 +132,6 @@ class CronFileWatcher {
         .join(', ');
       console.log(`[watch] cron folder changed on disk (${summary})`);
 
-      // Only a valid config change needs the schedules rebuilt.
-      if (added.length || updated.length || removed.length || repaired.length) {
-        await cronService.reload();
-      }
       emit('crons:files-changed', { added, updated, removed, broken: nowBroken, repaired });
       return { added, updated, removed, broken: nowBroken, repaired };
     } finally {

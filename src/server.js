@@ -4,17 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { bus, sseInit, sseSend } from './events.js';
-import { CRONS_DIR, EXECUTIONS_DIR, LOGS_DIR, ROOT, ensureDirs, resolveUserPath } from './paths.js';
+import { CRONS_DIR, EXECUTIONS_DIR, LOGS_DIR, NODE_TOKEN_FILE, ROOT, ensureDirs, resolveUserPath } from './paths.js';
 import { SETTINGS_FILE as SETTINGS_PATH } from './settings.js';
-import {
-  EFFORT_LEVELS,
-  PAUSE_OPTIONS,
-  cronService,
-  isEffortLevel,
-  pauseOption,
-  previewNextRun,
-  validateCronExpression,
-} from './cronService.js';
+import { EFFORT_LEVELS, PAUSE_OPTIONS, isEffortLevel, pauseOption, previewNextRun, validateCronExpression } from './schedule.js';
+import { hub } from './hub.js';
 import {
   PAGE_SIZE as EXECUTIONS_PAGE_SIZE,
   createExecution,
@@ -26,20 +19,11 @@ import {
   updateExecution,
 } from './executions.js';
 import { cronFileWatcher } from './watcher.js';
-import { modelCatalog } from './models.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings, normalizeMaxConcurrentJobs, patchSettings } from './settings.js';
 import { migrateLogDirs } from './logsMigration.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
-import {
-  USAGE_DELAY_CATEGORIES,
-  normalizeUsageDelay,
-  parseUsageThreshold,
-  setUsageThresholds,
-  usageDelayOptions,
-  usageMonitor,
-} from './usage.js';
+import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, parseUsageThreshold, setUsageThresholds, usageDelayOptions } from './usage.js';
 import { lifetimeStats } from './stats.js';
-import { systemMonitor } from './system.js';
 import { MAX_NOTIFICATIONS, NOTIFICATIONS_DIR, PAGE_SIZE, notificationCenter } from './notifications.js';
 import {
   MAX_LOGS_PER_CRON,
@@ -61,6 +45,8 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
 const app = express();
+// Ahead of the page's body parser: a node's report carries log bytes and outgrows its limit.
+app.use('/api/node', hub.router());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(PUBLIC_DIR));
 
@@ -97,6 +83,7 @@ function readForm(body) {
       usageDelay: normalizeUsageDelay(body?.usageDelay),
       prompt: String(body?.prompt ?? ''),
       isActive: Boolean(body?.isActive),
+      nodeId: String(body?.nodeId ?? '').trim(),
     },
   };
 }
@@ -139,26 +126,25 @@ function readExecutionForm(body) {
       usageDelay: normalizeUsageDelay(body?.usageDelay),
       prompt: String(body?.prompt ?? ''),
       isActive: Boolean(body?.isActive),
+      nodeId: String(body?.nodeId ?? '').trim(),
     },
   };
 }
 
 function decorate(cron) {
-  const run = cronService.currentRun(cron.id);
-  const delayed = cronService.delayInfo(cron.id);
-  const nextRunAt = cronService.nextRun(cron.id);
+  const view = hub.jobView(cron);
   return {
     ...cron,
     // Always the full set, so a cron file written before this setting existed
     // still answers every checkbox the form draws.
     usageDelay: normalizeUsageDelay(cron.usageDelay),
-    nextRunAt,
-    isRunning: Boolean(run),
-    currentRun: run,
-    isDelayed: Boolean(delayed),
-    delayed,
-    // A trigger already waiting says so itself; this is about the next one.
-    delayRisk: nextRunAt && !delayed ? cronService.delayOutlook(cron, nextRunAt) : null,
+    node: hub.nodeSummary(cron),
+    nextRunAt: view?.nextRunAt ?? null,
+    isRunning: Boolean(view?.currentRun),
+    currentRun: view?.currentRun ?? null,
+    isDelayed: Boolean(view?.delayed),
+    delayed: view?.delayed ?? null,
+    delayRisk: view?.delayRisk ?? null,
   };
 }
 
@@ -168,22 +154,22 @@ function decorate(cron) {
  * none, whatever its date says.
  */
 function decorateExecution(execution) {
-  const run = cronService.currentRun(execution.id);
-  const delayed = cronService.delayInfo(execution.id);
+  const view = hub.jobView(execution);
   const armed = execution.isActive && execution.status === 'scheduled';
   return {
     ...execution,
     kind: 'execution',
     usageDelay: normalizeUsageDelay(execution.usageDelay),
+    node: hub.nodeSummary(execution),
     nextRunAt: armed ? execution.scheduledAt : null,
     // Its time has passed and nothing has run it. On the page that is the gap
     // between the trigger being missed and the catch-up starting the run.
     isOverdue: armed && Date.parse(execution.scheduledAt ?? '') <= Date.now(),
-    isRunning: Boolean(run),
-    currentRun: run,
-    isDelayed: Boolean(delayed),
-    delayed,
-    delayRisk: armed && !delayed ? cronService.delayOutlook(execution, execution.scheduledAt) : null,
+    isRunning: Boolean(view?.currentRun),
+    currentRun: view?.currentRun ?? null,
+    isDelayed: Boolean(view?.delayed),
+    delayed: view?.delayed ?? null,
+    delayRisk: view?.delayRisk ?? null,
   };
 }
 
@@ -250,14 +236,19 @@ app.post('/api/notifications/read', async (req, res, next) => {
   }
 });
 
-/**
- * Machine stats: the current reading, the last fifteen minutes behind it, and
- * what each meter means. Answered from memory — the service samples on its own
- * timer and pushes each sample over /api/events, so this is only ever read to
- * fill a page that has just opened or reconnected.
- */
+/** The default node's machine stats, from its reports. */
 app.get('/api/system', (_req, res) => {
-  res.json(systemMonitor.state());
+  res.json(hub.systemState());
+});
+
+app.get('/api/nodes', (_req, res) => {
+  res.json({ nodes: hub.listNodes(), defaultNodeId: hub.defaultNodeId(), tokenFile: NODE_TOKEN_FILE });
+});
+
+app.delete('/api/nodes/:id', (req, res) => {
+  const result = hub.forgetNode(req.params.id);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ ok: true });
 });
 
 /**
@@ -378,15 +369,17 @@ app.put('/api/settings', async (req, res, next) => {
       if (typeof req.body.defaultWorktreeInclude !== 'string') return res.status(400).json({ error: 'defaultWorktreeInclude must be a string' });
       patch.defaultWorktreeInclude = req.body.defaultWorktreeInclude;
     }
-    const saved = await patchSettings(patch);
-    // Written first, applied second: the service reads its limit from memory, so
-    // a save that did not reach the disk must not change what is running.
-    if ('maxConcurrentJobs' in patch) cronService.setConcurrencyLimit(saved.maxConcurrentJobs);
-    if ('usageDelayThresholds' in patch) {
-      setUsageThresholds(saved.usageDelayThresholds);
-      // A raised threshold can clear a held trigger now rather than at the next review.
-      cronService.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
+    if ('defaultNodeId' in (req.body ?? {})) {
+      const id = String(req.body.defaultNodeId ?? '').trim();
+      if (!hub.nodes.has(id)) return res.status(400).json({ error: 'defaultNodeId must be a node that has connected' });
+      patch.defaultNodeId = id;
     }
+    const saved = await patchSettings(patch);
+    // Written first, applied second: nodes pick settings up from memory, so a
+    // save that did not reach the disk must not change what is running.
+    hub.setSettings(saved);
+    if ('usageDelayThresholds' in patch) setUsageThresholds(saved.usageDelayThresholds);
+    if ('defaultNodeId' in patch) hub.jobsChanged();
     res.json(saved);
   } catch (err) {
     next(err);
@@ -401,7 +394,7 @@ app.put('/api/settings', async (req, res, next) => {
  * the pause is not. A restart comes back with nothing waiting.
  */
 app.get('/api/queue', (_req, res) => {
-  res.json(cronService.concurrencyInfo());
+  res.json(hub.concurrencyInfo());
 });
 
 /**
@@ -409,19 +402,19 @@ app.get('/api/queue', (_req, res) => {
  * written to disk: a restart is one of the documented ways out of it.
  */
 app.get('/api/pause', (_req, res) => {
-  res.json({ ...cronService.pauseInfo(), options: PAUSE_OPTIONS, update: selfUpdater.state() });
+  res.json({ ...hub.pauseInfo(), options: PAUSE_OPTIONS, update: selfUpdater.state() });
 });
 
 app.post('/api/pause', async (req, res, next) => {
   try {
-    if (cronService.isPausedForUpdate()) {
+    if (hub.isPausedForUpdate()) {
       return res.status(409).json({ error: 'an update is in progress; schedules are already held until it restarts' });
     }
     const option = pauseOption(String(req.body?.option ?? ''));
     if (!option) {
       return res.status(400).json({ error: `option must be one of ${PAUSE_OPTIONS.map((o) => o.id).join(', ')}` });
     }
-    res.json(await cronService.pauseAll({ mode: 'manual', label: option.label, option: option.id, ms: option.ms }));
+    res.json(await hub.pauseAll({ mode: 'manual', label: option.label, option: option.id, ms: option.ms }));
   } catch (err) {
     next(err);
   }
@@ -429,11 +422,11 @@ app.post('/api/pause', async (req, res, next) => {
 
 app.delete('/api/pause', async (_req, res, next) => {
   try {
-    if (cronService.isPausedForUpdate()) {
+    if (hub.isPausedForUpdate()) {
       return res.status(409).json({ error: 'this pause is holding schedules for an update and cannot be cancelled' });
     }
-    if (!cronService.isPaused()) return res.status(409).json({ error: 'not paused' });
-    res.json(await cronService.resumeAll('cancelled by user'));
+    if (!hub.isPaused()) return res.status(409).json({ error: 'not paused' });
+    res.json(await hub.resumeAll('cancelled by user'));
   } catch (err) {
     next(err);
   }
@@ -462,16 +455,15 @@ app.post('/api/update/run', async (_req, res, next) => {
   }
 });
 
-/** Models the installed CLI recognises, for the Model dropdown. */
+/** Models the default node's CLI recognises, for the Model dropdown. */
 app.get('/api/models', (_req, res) => {
-  res.json(modelCatalog.state());
+  res.json(hub.models());
 });
 
 /** Re-runs discovery, e.g. after the CLI is updated. */
 app.post('/api/models/refresh', async (_req, res, next) => {
   try {
-    await modelCatalog.refresh();
-    res.json(modelCatalog.state());
+    res.json(await hub.refreshModels());
   } catch (err) {
     next(err);
   }
@@ -510,7 +502,7 @@ app.post('/api/crons', async (req, res, next) => {
     const { errors, value } = readForm(req.body);
     if (errors.length) return res.status(400).json({ error: errors.join(' ') });
     const cron = await createCron(value);
-    await cronService.reload();
+    hub.jobsChanged();
     res.status(201).json(decorate(cron));
   } catch (err) {
     next(err);
@@ -523,7 +515,7 @@ app.put('/api/crons/:id', async (req, res, next) => {
     if (errors.length) return res.status(400).json({ error: errors.join(' ') });
     const cron = await updateCron(req.params.id, value);
     if (!cron) return res.status(404).json({ error: 'cron not found' });
-    await cronService.reload();
+    hub.jobsChanged();
     res.json(decorate(cron));
   } catch (err) {
     next(err);
@@ -534,7 +526,7 @@ app.delete('/api/crons/:id', async (req, res, next) => {
   try {
     const removed = await deleteCron(req.params.id);
     if (!removed) return res.status(404).json({ error: 'cron not found' });
-    await cronService.reload();
+    hub.jobsChanged();
     res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -572,7 +564,7 @@ app.post('/api/executions', async (req, res, next) => {
     const execution = await createExecution(value);
     // A date already past is armed and run by the same reload that arms the
     // rest, so saving one is how you say "run this now, behind the queue".
-    await cronService.reload();
+    hub.jobsChanged();
     res.status(201).json(decorateExecution(execution));
   } catch (err) {
     next(err);
@@ -585,7 +577,7 @@ app.put('/api/executions/:id', async (req, res, next) => {
     if (errors.length) return res.status(400).json({ error: errors.join(' ') });
     const execution = await updateExecution(req.params.id, value);
     if (!execution) return res.status(404).json({ error: 'execution not found' });
-    await cronService.reload();
+    hub.jobsChanged();
     res.json(decorateExecution(execution));
   } catch (err) {
     next(err);
@@ -596,7 +588,7 @@ app.delete('/api/executions/:id', async (req, res, next) => {
   try {
     const removed = await deleteExecution(req.params.id);
     if (!removed) return res.status(404).json({ error: 'execution not found' });
-    await cronService.reload();
+    hub.jobsChanged();
     res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -614,7 +606,7 @@ app.post('/api/executions/:id/rearm', async (req, res, next) => {
     if (!execution) return res.status(404).json({ error: 'execution not found' });
     if (execution.status === 'running') return res.status(409).json({ error: 'this execution is running' });
     const rearmed = await patchExecution(req.params.id, { status: 'scheduled', firedAt: null, stoppedBy: null });
-    await cronService.reload();
+    hub.jobsChanged();
     res.json(decorateExecution(rearmed));
   } catch (err) {
     next(err);
@@ -625,32 +617,30 @@ app.post('/api/:kind(crons|executions)/:id/run', async (req, res, next) => {
   try {
     const found = await findRecord(req.params.id);
     if (!found) return res.status(404).json({ error: `${noun(req)} not found` });
-    const cron = found.record;
+    const job = found.record;
     // Paused means nothing new starts, by hand or on a schedule — the same rule
-    // the disabled Run now buttons show. The pause covers one-time executions
-    // too: it holds everything this server would otherwise start.
-    if (cronService.isPaused()) {
+    // the disabled Run now buttons show.
+    if (hub.isPaused()) {
       return res.status(409).json({
-        error: cronService.isPausedForUpdate()
+        error: hub.isPausedForUpdate()
           ? 'an update is waiting for runs to finish; nothing new can start'
-          : `everything is paused ${cronService.pauseInfo().label}; cancel the pause to run one`,
+          : `everything is paused ${hub.pauseInfo().label}; cancel the pause to run one`,
       });
     }
-    const waiting = cronService.delayInfo(cron.id);
-    if (waiting) {
+    const node = hub.nodeSummary(job);
+    const view = hub.jobView(job);
+    if (!node.online) return res.status(409).json({ error: `node "${node.name ?? 'default'}" is offline` });
+    if (view?.currentRun) return res.status(409).json({ error: `this ${noun(req)} is already running` });
+    if (view?.delayed) {
       return res.status(409).json({
         error:
-          waiting.hold === 'concurrency'
-            ? `a trigger for this ${noun(req)} is already queued behind the ${waiting.limit} job limit`
+          view.delayed.hold === 'concurrency'
+            ? `a trigger for this ${noun(req)} is already queued behind the ${view.delayed.limit} job limit`
             : `a trigger for this ${noun(req)} is already waiting on usage`,
       });
     }
-    const result = await cronService.trigger(cron.id, 'manual');
-    if (!result) return res.status(409).json({ error: `this ${noun(req)} is already running` });
-    // Run now does not override the usage delay setting: a blocked press becomes
-    // the waiting trigger rather than starting claude anyway.
-    if (result.delayed) return res.status(202).json({ delayed: result.delayed });
-    res.status(202).json(result);
+    hub.command(node.id, 'run', job.id);
+    res.status(202).json({ requested: true, node });
   } catch (err) {
     next(err);
   }
@@ -660,15 +650,12 @@ app.post('/api/:kind(crons|executions)/:id/stop', async (req, res, next) => {
   try {
     const found = await findRecord(req.params.id);
     if (!found) return res.status(404).json({ error: `${noun(req)} not found` });
-    const cron = found.record;
-    // Stop is what the Run now button becomes while a trigger waits on usage, so
-    // it has to end that wait as well as a live run.
-    const cancelled = await cronService.cancelDelay(cron.id, 'user');
-    if (cancelled) return res.status(202).json({ cancelledDelay: cancelled, nextRunAt: cronService.nextRun(cron.id) });
-    const run = await cronService.stop(cron.id, 'user');
-    if (!run) return res.status(409).json({ error: `this ${noun(req)} is not running` });
-    // The schedule is untouched by a stop, so report when it next fires.
-    res.status(202).json({ ...run, nextRunAt: cronService.nextRun(cron.id) });
+    const job = found.record;
+    const node = hub.nodeSummary(job);
+    const view = hub.jobView(job);
+    if (!view?.currentRun && !view?.delayed) return res.status(409).json({ error: `this ${noun(req)} is not running` });
+    hub.command(node.id, 'stop', job.id);
+    res.status(202).json({ requested: true, node, nextRunAt: view.nextRunAt ?? null });
   } catch (err) {
     next(err);
   }
@@ -688,10 +675,11 @@ app.get('/api/:kind(crons|executions)/:id/logs', async (req, res, next) => {
     // Read here rather than on the cron list: the first read scans the log
     // folder, and this is the one page that draws the result.
     const stats = await lifetimeStats(cron, found.kind === 'execution' ? patchExecution : undefined);
+    hub.jobsCache = null;
     res.json({
       cron: found.view(cron),
       stats,
-      logs: logs.map((log) => ({ ...log, isRunning: cronService.isRunningLog(cron.id, log.file) })),
+      logs: logs.map((log) => ({ ...log, isRunning: hub.isRunningLog(cron.id, log.file) })),
     });
   } catch (err) {
     next(err);
@@ -703,7 +691,7 @@ app.get('/api/:kind(crons|executions)/:id/logs/:file', async (req, res, next) =>
     const cron = await findRecord(req.params.id).then((found) => found?.record ?? null);
     if (!cron) return res.status(404).json({ error: `${noun(req)} not found` });
     const text = await readLog(cron.id, req.params.file);
-    res.json({ file: req.params.file, text, isRunning: cronService.isRunningLog(cron.id, req.params.file) });
+    res.json({ file: req.params.file, text, isRunning: hub.isRunningLog(cron.id, req.params.file) });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'log not found' });
     if (err.message === 'invalid log file name') return res.status(400).json({ error: err.message });
@@ -767,7 +755,7 @@ app.get('/api/:kind(crons|executions)/:id/logs/:file/stream', async (req, res, n
   };
 
   const tick = async () => {
-    const live = cronService.isRunningLog(cron.id, req.params.file);
+    const live = hub.isRunningLog(cron.id, req.params.file);
     await pump();
     if (!live && !closed) {
       sseSend(res, 'done', { file: req.params.file });
@@ -803,30 +791,18 @@ app.get('/api/events', (req, res) => {
 let runningCommit = null;
 
 app.get('/api/health', async (_req, res) => {
-  // Usage is cached and never rejects, so it cannot make the health check fail
-  // or hang: the worst case is the reading being up to a minute old.
-  const usage = await usageMonitor.state();
   // The one await that can be slow, and only once: the folder is read at
   // startup, and every poll after that is answered from memory.
   await notificationCenter.ready;
   res.json({
     ok: true,
-    scheduled: cronService.jobs.size,
-    running: cronService.runningCount(),
+    ...hub.health(),
     commit: runningCommit,
     startedAt: STARTED_AT,
-    paused: cronService.isPaused(),
-    delayed: cronService.delayedCount(),
-    queued: cronService.queuedCount(),
-    usageDelayed: cronService.usageDelays().length,
-    concurrencyLimit: cronService.concurrencyLimit,
     // What the limit means when it is 0: the header's jobs meter fills against
     // this rather than against "unlimited", which no bar can draw.
     defaultConcurrencyLimit: DEFAULT_MAX_CONCURRENT_JOBS,
-    armedCrons: cronService.armedCrons,
-    armedExecutions: cronService.armedExecutions,
     unreadNotifications: notificationCenter.unreadCount(),
-    usage,
     ...selfUpdater.availability(),
   });
 });
@@ -841,29 +817,16 @@ await ensureDirs();
 // behind the server coming up: 5000 small files are not worth a slow start.
 notificationCenter.start();
 const bootSettings = await loadSettings(); // writes settings.json with defaults on first run
-// Before anything is armed, so the very first trigger is held by the same limit
-// every later one is.
-cronService.setConcurrencyLimit(bootSettings.maxConcurrentJobs);
 setUsageThresholds(bootSettings.usageDelayThresholds);
-// Before any schedule can write a log: after this the folders are cron ids.
+// Before any node can upload a log: after this the folders are cron ids.
 await migrateLogDirs().catch((err) => console.error(`[logs] migration failed: ${err.message}`));
 runningCommit = await currentCommit();
-// Before anything is armed: a one-time execution left mid-run by a restart is
-// closed as interrupted, so it is not mistaken for a run still in flight.
-await cronService.reconcileInterrupted().catch((err) => console.error(`[cron] reconcile failed: ${err.message}`));
-// Arms both kinds, and runs any one-time execution whose trigger was missed
-// while the server was down.
-await cronService.reload();
+await hub.start(await loadSettings());
 await cronFileWatcher.start();
-// Discovery spawns a probe per candidate model, so let it run behind the server
-// coming up rather than delaying the first page load by several seconds.
-modelCatalog.refresh();
 selfUpdater.start();
-// The stats service does not know what a cron is; it is handed a way to ask, so
-// an alert can say what was running when it fired.
-systemMonitor.start({ runningCrons: () => cronService.runningCrons() });
 
 app.listen(PORT, HOST, () => {
   console.log(`promptd listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
   console.log(`Storage: ${ROOT}`);
+  hub.ensureLocalNodeAgent().catch((err) => console.error(`[hub] local node agent check failed: ${err.message}`));
 });
