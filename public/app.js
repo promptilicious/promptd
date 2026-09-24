@@ -639,7 +639,7 @@ async function renderHome(tab = 'crons') {
 
   const subEl = el('p', { class: 'sub', text: '' });
   const head = el('div', { class: 'page-head' }, [
-    el('div', {}, [el('h1', { text: 'Claude Conductor' }), subEl]),
+    el('div', {}, [el('h1', { text: 'promptd' }), subEl]),
     el('div', { class: 'head-actions' }, [
       pauseControl(pause, pause.options ?? [], () => renderHome(tab).catch(() => {})),
       tab === 'executions'
@@ -2160,8 +2160,8 @@ async function renderSettings() {
       el('div', { class: 'field' }, [serverNameInput]),
       el('div', { class: 'hint' }, [
         'Shown in the header bar as ',
-        el('span', { class: 'mono', text: 'Claude Conductor - <name>' }),
-        ', so two open servers can be told apart. Leave it blank to show Claude Conductor alone.',
+        el('span', { class: 'mono', text: 'promptd - <name>' }),
+        ', so two open servers can be told apart. Leave it blank to show promptd alone.',
       ]),
       el('div', { class: 'card-divider' }),
       el('h3', { text: 'Server Color' }),
@@ -2727,7 +2727,7 @@ function setUpdateBadge(available, behind = 0) {
 /** The header bar names the server, so two open ones can be told apart. */
 function setServerName(name) {
   if (!brandNameEl) return;
-  brandNameEl.textContent = name ? `Claude Conductor - ${name}` : 'Claude Conductor';
+  brandNameEl.textContent = name ? `promptd - ${name}` : 'promptd';
 }
 
 /** The Server Color swatches. The first is the stylesheet's own accent, saved as blank. */

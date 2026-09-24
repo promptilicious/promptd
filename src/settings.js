@@ -23,7 +23,7 @@ export function normalizeMaxConcurrentJobs(input) {
 }
 
 export const DEFAULT_SETTINGS = {
-  // Shown after "Claude Conductor" in the header bar. Blank shows the name alone.
+  // Shown after "promptd" in the header bar. Blank shows the name alone.
   serverName: '',
   // The accent and the band across the header bar, as #rrggbb. Blank is the default orange.
   serverColor: '',

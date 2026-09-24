@@ -9,8 +9,8 @@ import { cronService } from './cronService.js';
 
 // Normally the checkout this file lives in; overridable so the update path can
 // be exercised against a scratch repository.
-export const PROJECT_DIR = process.env.CONDUCTOR_PROJECT_DIR
-  ? path.resolve(process.env.CONDUCTOR_PROJECT_DIR)
+export const PROJECT_DIR = process.env.PROMPTD_PROJECT_DIR
+  ? path.resolve(process.env.PROMPTD_PROJECT_DIR)
   : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Nested with the run logs rather than loose in the storage root.
 export const UPDATE_LOG = path.join(LOGS_DIR, 'update.log');
@@ -284,8 +284,8 @@ class SelfUpdater {
       stdio: ['ignore', logFd, logFd],
       env: {
         ...process.env,
-        CONDUCTOR_PROJECT_DIR: PROJECT_DIR,
-        CONDUCTOR_LAUNCHD_LABEL: process.env.CONDUCTOR_LAUNCHD_LABEL ?? 'local.claude-conductor',
+        PROMPTD_PROJECT_DIR: PROJECT_DIR,
+        PROMPTD_LAUNCHD_LABEL: process.env.PROMPTD_LAUNCHD_LABEL ?? 'local.promptd',
       },
     });
     // A successful update restarts us, so the restart kills this process before

@@ -1,6 +1,6 @@
-# Claude Conductor
+# promptd
 
-Schedule Claude prompts and watch them run. A small Node.js server holds a set of crons and one-time executions, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/claude-conductor`.
+Schedule Claude prompts and watch them run. A small Node.js server holds a set of crons and one-time executions, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/promptd`.
 
 - Two tabs on the home page: **Crons**, which run on a schedule, and **One-time Execution**, which run once at a date you pick.
 - Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
@@ -42,7 +42,7 @@ Overrides, if you need them:
 | -------- | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
 | `PORT`   | `4321`                   | Port the server listens on                                                                                   |
 | `HOST`   | `127.0.0.1`              | Bind address. `0.0.0.0` accepts connections from your network — read [Network access](#network-access) first |
-| `LABEL`  | `local.claude-conductor` | launchd service name                                                                                         |
+| `LABEL`  | `local.promptd` | launchd service name                                                                                         |
 | `FORCE`  | unset                    | Replace an already-registered agent                                                                          |
 
 ```bash
@@ -73,7 +73,7 @@ To go back to this machine only, re-register with the default:
 FORCE=1 ./scripts/register-app-mac-os.sh
 ```
 
-> **⚠️ Warning — no password, no authentication.** Claude Conductor has no login, no accounts, and no access control of any kind. Once it is bound to `0.0.0.0`, anyone who can reach the port can add a cron, run an arbitrary Claude prompt in any directory this Mac can read, browse your filesystem through the directory autocomplete, and read every past run's output. It spends your Claude quota doing it.
+> **⚠️ Warning — no password, no authentication.** promptd has no login, no accounts, and no access control of any kind. Once it is bound to `0.0.0.0`, anyone who can reach the port can add a cron, run an arbitrary Claude prompt in any directory this Mac can read, browse your filesystem through the directory autocomplete, and read every past run's output. It spends your Claude quota doing it.
 >
 > Protecting it is on you. Keep it on a network you control, and treat exposure as your risk to accept:
 >
@@ -90,13 +90,13 @@ FORCE=1 ./scripts/register-app-mac-os.sh
 The script writes this; there is no need to do it yourself unless you want to change something it does not expose:
 
 ```bash
-mkdir -p ~/Library/Logs/claude-conductor
-cat > ~/Library/LaunchAgents/local.claude-conductor.plist <<EOF
+mkdir -p ~/Library/Logs/promptd
+cat > ~/Library/LaunchAgents/local.promptd.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>local.claude-conductor</string>
+  <key>Label</key><string>local.promptd</string>
   <key>ProgramArguments</key>
   <array>
     <string>$(which node)</string>
@@ -113,8 +113,8 @@ cat > ~/Library/LaunchAgents/local.claude-conductor.plist <<EOF
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$HOME/Library/Logs/claude-conductor/server.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/claude-conductor/server.log</string>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/promptd/server.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/promptd/server.log</string>
 </dict>
 </plist>
 EOF
@@ -123,7 +123,7 @@ EOF
 Run that from the project directory, since it uses `$PWD`. Then register and start:
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-conductor.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.promptd.plist
 ```
 
 That starts it now and at every login. Open http://127.0.0.1:4321.
@@ -134,12 +134,12 @@ Set `HOST` to `0.0.0.0` in that plist to accept connections from your network �
 
 | Task                        | Command                                                                                                           |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Start (and enable at login) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-conductor.plist`                            |
-| Stop (and disable at login) | `launchctl bootout gui/$(id -u)/local.claude-conductor`                                                           |
-| Restart after changing code | `launchctl kickstart -k gui/$(id -u)/local.claude-conductor`                                                      |
-| Is it running?              | `launchctl print gui/$(id -u)/local.claude-conductor \| grep -E "state =\|pid ="`                                 |
-| Server log                  | `tail -f ~/Library/Logs/claude-conductor/server.log`                                                              |
-| Remove entirely             | `launchctl bootout gui/$(id -u)/local.claude-conductor && rm ~/Library/LaunchAgents/local.claude-conductor.plist` |
+| Start (and enable at login) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.promptd.plist`                            |
+| Stop (and disable at login) | `launchctl bootout gui/$(id -u)/local.promptd`                                                           |
+| Restart after changing code | `launchctl kickstart -k gui/$(id -u)/local.promptd`                                                      |
+| Is it running?              | `launchctl print gui/$(id -u)/local.promptd \| grep -E "state =\|pid ="`                                 |
+| Server log                  | `tail -f ~/Library/Logs/promptd/server.log`                                                              |
+| Remove entirely             | `launchctl bootout gui/$(id -u)/local.promptd && rm ~/Library/LaunchAgents/local.promptd.plist` |
 
 `bootout` both stops the server and stops it coming back at login, so it is the pair to `bootstrap` rather than a temporary pause. Editing the plist requires a `bootout` then `bootstrap`; `kickstart -k` only restarts the process with the plist launchd already has.
 
@@ -310,7 +310,7 @@ The **⚙** button at the right of the header opens a page for everything below.
 }
 ```
 
-`serverName` is shown in the header bar as `Claude Conductor - <name>`, so two open servers can be told apart; it is trimmed, and blank shows `Claude Conductor` alone. `serverColor` is a `#rrggbb` color that replaces the orange accent and colors the band across the top of every page, so each server can wear its own; the Settings page offers eight presets and a custom picker, and blank is the default orange. `maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. `defaultWorkingDirectory` is where the Working Directory field of a new cron or one-time execution starts, `~/` unless you change it; a blank value is saved as `~/`, and no saved job moves when it changes. `defaultWorktreeInclude` is the text written as `.worktreeinclude` to the root of the git repository a job's working directory is in, before each run of a job with **Use worktree** ticked, overwriting any file already there. It goes at the root even when the working directory is a subfolder, because that is the only place Claude Code reads it; nothing is written while it is empty. Claude Code copies the ignored files it lists, such as `.env`, into each new worktree. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
+`serverName` is shown in the header bar as `promptd - <name>`, so two open servers can be told apart; it is trimmed, and blank shows `promptd` alone. `serverColor` is a `#rrggbb` color that replaces the orange accent and colors the band across the top of every page, so each server can wear its own; the Settings page offers eight presets and a custom picker, and blank is the default orange. `maxConcurrentJobs` defaults to this machine's processor count and is covered in [Limiting concurrent jobs](#limiting-concurrent-jobs). `usageDelayThresholds` holds a whole percentage from 1 to 100 per limit and is covered in [Delaying a cron for usage](#delaying-a-cron-for-usage); `PUT /api/settings` takes any subset of the four. `defaultWorkingDirectory` is where the Working Directory field of a new cron or one-time execution starts, `~/` unless you change it; a blank value is saved as `~/`, and no saved job moves when it changes. `defaultWorktreeInclude` is the text written as `.worktreeinclude` to the root of the git repository a job's working directory is in, before each run of a job with **Use worktree** ticked, overwriting any file already there. It goes at the root even when the working directory is a subfolder, because that is the only place Claude Code reads it; nothing is written while it is empty. Claude Code copies the ignored files it lists, such as `.env`, into each new worktree. The first two are yours to set, from the Settings page, by editing the file, or with `PUT /api/settings`. The `last*` fields are the server's bookkeeping, and are what make "once a day" hold across restarts. A file that will not parse is left alone and the defaults are used, so a bad edit cannot wedge the server.
 
 The check runs on the interval either way. `selfUpdate` decides only whether what it finds gets applied: with it off, the server still fetches and compares, and an available update shows as an amber **Update available** badge in the header that links to this page. Nothing is pulled and no cron is paused until you press **Update now**.
 
@@ -370,12 +370,12 @@ The checker refuses rather than guesses, and says why in the server log and in `
 
 ### The restart needs the launchd agent
 
-Only launchd can bring the server back after it stops, so the updater restarts the service registered under `local.claude-conductor` (override with `CONDUCTOR_LAUNCHD_LABEL`). See [Start at login](#start-at-login-macos).
+Only launchd can bring the server back after it stops, so the updater restarts the service registered under `local.promptd` (override with `PROMPTD_LAUNCHD_LABEL`). An agent registered before the rename to promptd, under `local.claude-conductor`, is restarted too. See [Start at login](#start-at-login-macos).
 
 If no such agent is registered — you are running `npm start` in a terminal, say — the update is still pulled, but the running server is left alone and the log says so:
 
 ```
-[…] no launchd agent named local.claude-conductor is registered
+[…] no launchd agent named local.promptd is registered
 […] the new code is on disk but the running server is still the old one — restart it yourself
 ```
 
@@ -385,8 +385,10 @@ Killing a server that nothing would restart would be worse than leaving it on ol
 
 The paths in use are listed on the Settings page, under **Storage**.
 
+Storage lived in `~/.claude/claude-conductor` before the rename to promptd. If that folder exists and `~/.claude/promptd` does not, the server moves it over on its first start.
+
 ```
-~/.claude/claude-conductor/
+~/.claude/promptd/
 ├── crons/
 │   └── <uuid>.json                 # one file per cron
 ├── executions/
@@ -658,12 +660,12 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | ------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `PORT`                    | `4321`                          | HTTP port                                                                                                                                        |
 | `HOST`                    | `127.0.0.1`                     | Bind address. Localhost only by default; `0.0.0.0` accepts connections from your network, with the caveats in [Network access](#network-access). |
-| `CONDUCTOR_HOME`          | `~/.claude/claude-conductor`    | Storage root                                                                                                                                     |
+| `PROMPTD_HOME`          | `~/.claude/promptd`    | Storage root                                                                                                                                     |
 | `CLAUDE_BIN`              | `claude`                        | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`.                                                                 |
 | `WATCH_INTERVAL_MS`       | `3000`                          | How often the crons folder is polled for outside changes. `0` disables it.                                                                       |
 | `SYSTEM_SAMPLE_MS`        | `5000`                          | How often machine stats are sampled. `0` disables the service and its meters. Floored at `1000`.                                                 |
-| `CONDUCTOR_LAUNCHD_LABEL` | `local.claude-conductor`        | The launchd service the updater restarts                                                                                                         |
-| `CONDUCTOR_PROJECT_DIR`   | the checkout this code lives in | Which repository the update check looks at                                                                                                       |
+| `PROMPTD_LAUNCHD_LABEL` | `local.promptd`        | The launchd service the updater restarts                                                                                                         |
+| `PROMPTD_PROJECT_DIR`   | the checkout this code lives in | Which repository the update check looks at                                                                                                       |
 
 ## Model
 

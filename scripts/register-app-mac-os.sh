@@ -1,5 +1,5 @@
 #!/bin/bash
-# Registers Claude Conductor as a macOS LaunchAgent so it starts at login.
+# Registers promptd as a macOS LaunchAgent so it starts at login.
 #
 # Run once, from anywhere:
 #   ./scripts/register-app-mac-os.sh
@@ -9,13 +9,13 @@
 #   HOST=0.0.0.0                    bind address; 0.0.0.0 accepts connections
 #                                   from your whole network. The app has no
 #                                   password — see the README before using it.
-#   LABEL=local.claude-conductor    launchd service name
+#   LABEL=local.promptd    launchd service name
 #   FORCE=1                         re-register if it is already registered
 set -uo pipefail
 
 PORT="${PORT:-4321}"
 HOST="${HOST:-127.0.0.1}"
-LABEL="${LABEL:-local.claude-conductor}"
+LABEL="${LABEL:-local.promptd}"
 FORCE="${FORCE:-0}"
 
 # 0.0.0.0 and :: listen on every interface; anything else is reachable at itself.
@@ -26,7 +26,7 @@ esac
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="$HOME/Library/Logs/claude-conductor"
+LOG_DIR="$HOME/Library/Logs/promptd"
 LOG_FILE="$LOG_DIR/server.log"
 DOMAIN="gui/$(id -u)"
 
@@ -35,7 +35,7 @@ info() { printf '  • %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31mFailed:\033[0m %s\n' "$*" >&2; exit 1; }
 
-printf '\nRegistering Claude Conductor with launchd\n\n'
+printf '\nRegistering promptd with launchd\n\n'
 
 [ "$(uname -s)" = "Darwin" ] || die "this script is for macOS; on Linux use a systemd user unit instead"
 
@@ -57,7 +57,7 @@ case "$HOST" in
     ;;
   *)
     warn "binding $HOST — reachable from your network."
-    warn "Claude Conductor has no password. Anyone who can reach this port can run"
+    warn "promptd has no password. Anyone who can reach this port can run"
     warn "arbitrary Claude prompts in any directory this Mac can read. Only do this on"
     warn "a network you trust, and see 'Network access' in the README."
     ;;

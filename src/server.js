@@ -850,6 +850,6 @@ selfUpdater.start();
 systemMonitor.start({ runningCrons: () => cronService.runningCrons() });
 
 app.listen(PORT, HOST, () => {
-  console.log(`Claude Conductor listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
+  console.log(`promptd listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
   console.log(`Storage: ${ROOT}`);
 });

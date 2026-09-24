@@ -2,10 +2,10 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-// Override with CONDUCTOR_HOME for testing or a non-default storage location.
-export const ROOT = process.env.CONDUCTOR_HOME
-  ? path.resolve(process.env.CONDUCTOR_HOME)
-  : path.join(os.homedir(), '.claude', 'claude-conductor');
+// Override with PROMPTD_HOME for testing or a non-default storage location.
+export const ROOT = process.env.PROMPTD_HOME
+  ? path.resolve(process.env.PROMPTD_HOME)
+  : path.join(os.homedir(), '.claude', 'promptd');
 
 // One folder per model.
 export const CRONS_DIR = path.join(ROOT, 'crons');
@@ -32,7 +32,18 @@ export function resolveUserPath(input) {
   return path.resolve(path.join(os.homedir(), raw));
 }
 
+// Where storage lived before the project was renamed to promptd.
+const LEGACY_ROOT = path.join(os.homedir(), '.claude', 'claude-conductor');
+
 export async function ensureDirs() {
+  // Carries an install from before the rename over to the new folder, once.
+  if (!process.env.PROMPTD_HOME) {
+    const exists = (dir) => fs.access(dir).then(() => true, () => false);
+    if (!(await exists(ROOT)) && (await exists(LEGACY_ROOT))) {
+      await fs.rename(LEGACY_ROOT, ROOT);
+      console.log(`[storage] moved ${LEGACY_ROOT} to ${ROOT}`);
+    }
+  }
   await fs.mkdir(CRONS_DIR, { recursive: true });
   await fs.mkdir(EXECUTIONS_DIR, { recursive: true });
   await fs.mkdir(LOGS_DIR, { recursive: true });
