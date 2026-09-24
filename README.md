@@ -370,7 +370,7 @@ The checker refuses rather than guesses, and says why in the server log and in `
 
 ### The restart needs the launchd agent
 
-Only launchd can bring the server back after it stops, so the updater restarts the service registered under `local.promptd` (override with `PROMPTD_LAUNCHD_LABEL`). An agent registered before the rename to promptd, under `local.claude-conductor`, is restarted too. See [Start at login](#start-at-login-macos).
+Only launchd can bring the server back after it stops, so the updater restarts the service registered under `local.promptd` (override with `PROMPTD_LAUNCHD_LABEL`). See [Start at login](#start-at-login-macos).
 
 If no such agent is registered — you are running `npm start` in a terminal, say — the update is still pulled, but the running server is left alone and the log says so:
 
@@ -384,8 +384,6 @@ Killing a server that nothing would restart would be worse than leaving it on ol
 ## Storage layout
 
 The paths in use are listed on the Settings page, under **Storage**.
-
-Storage lived in `~/.claude/claude-conductor` before the rename to promptd. If that folder exists and `~/.claude/promptd` does not, the server moves it over on its first start.
 
 ```
 ~/.claude/promptd/

@@ -59,11 +59,6 @@ fi
 
 # Restart. Only launchd can bring the server back up, so if no agent is
 # registered leave the running one alone rather than killing the service.
-# Agents registered before the rename to promptd still run under the old label.
-if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 \
-  && launchctl print "gui/$(id -u)/local.claude-conductor" >/dev/null 2>&1; then
-  LABEL=local.claude-conductor
-fi
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   log "restarting $LABEL"
   if launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>&1; then
