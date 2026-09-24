@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Lightweight web UI to schedule and run Claude prompts on a cron",
+  "description": "Lightweight web UI to schedule, manage, and run Claude prompts",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

@@ -1,6 +1,6 @@
 # promptd
 
-Schedule Claude prompts and watch them run. A small Node.js server holds a set of crons and one-time executions, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/promptd`.
+A lightweight web UI to schedule, manage, and run Claude prompts, either as a cron that repeats on a schedule or as a one-time execution at a date and time you pick. A small Node.js server holds a set of crons and one-time executions, spawns `claude -p` on each one's schedule, and streams the output to a web page that updates as it happens. No database: every cron and every log line is a plain file under `~/.claude/promptd`.
 
 - Two tabs on the home page: **Crons**, which run on a schedule, and **One-time Execution**, which run once at a date you pick.
 - Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
