@@ -1242,6 +1242,14 @@ input.narrow {
   flex-wrap: wrap;
 }
 
+/* A long common command is cut short on its button; the title carries all of it. */
+.command-button {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .preset-sep {
   width: 1px;
   height: 20px;

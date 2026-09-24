@@ -1035,11 +1035,12 @@ function cronPicker(input) {
 }
 
 /**
- * Where a new job's Working Directory and Prompt fields start, from the Settings
- * page. A settings read that fails falls back to home and a blank prompt rather
- * than blocking the form.
+ * What the job forms take from the Settings page: where a new job's Working
+ * Directory and Prompt fields start, and the common commands. A settings read
+ * that fails falls back to home, a blank prompt and no commands rather than
+ * blocking the form.
  */
-async function newJobDefaults() {
+async function jobFormSettings() {
   const settings = await api('/api/settings').catch(() => ({}));
   return {
     workingDirectory:
@@ -1047,7 +1048,44 @@ async function newJobDefaults() {
         ? settings.defaultWorkingDirectory
         : '~/',
     prompt: typeof settings.defaultPrompt === 'string' ? settings.defaultPrompt : '',
+    commands:
+      typeof settings.commonCommands === 'string'
+        ? settings.commonCommands
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .sort((a, b) => a.localeCompare(b))
+        : [],
   };
+}
+
+/**
+ * A button per common command, under the Prompt field. Clicking one copies the
+ * command to the clipboard for pasting into the prompt. Nothing is drawn when
+ * there are no commands.
+ */
+function commandButtons(commands) {
+  if (!commands.length) return null;
+  return el(
+    'div',
+    { class: 'preset-row' },
+    commands.map((command) =>
+      el('button', {
+        type: 'button',
+        class: 'btn small mono command-button',
+        text: command,
+        title: command,
+        onclick: async () => {
+          try {
+            await navigator.clipboard.writeText(command);
+            toast(`Command copied to clipboard: ${command}`);
+          } catch (err) {
+            toast(`Could not copy to clipboard: ${err.message}`, true);
+          }
+        },
+      }),
+    ),
+  );
 }
 
 /**
@@ -1467,7 +1505,7 @@ function scheduledAtPicker(input) {
 async function renderForm(id, duplicateOf) {
   const sourceId = id ?? duplicateOf;
   const cron = sourceId ? await api(`/api/crons/${sourceId}`) : null;
-  const defaults = cron ? null : await newJobDefaults();
+  const defaults = await jobFormSettings();
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   const inputs = {
@@ -1571,6 +1609,7 @@ async function renderForm(id, duplicateOf) {
       effort.field,
       usageDelay.field,
       field('Prompt', inputs.prompt),
+      commandButtons(defaults.commands),
       el('label', { class: 'check' }, [inputs.isActive, 'Is Active']),
       el('div', { class: 'form-actions' }, [
         el('button', { class: 'btn primary', type: 'submit', text: 'Save' }),
@@ -1591,7 +1630,7 @@ async function renderForm(id, duplicateOf) {
 async function renderExecutionForm(id, duplicateOf) {
   const sourceId = id ?? duplicateOf;
   const execution = sourceId ? await api(`/api/executions/${sourceId}`) : null;
-  const defaults = execution ? null : await newJobDefaults();
+  const defaults = await jobFormSettings();
   const errorBox = el('div', { class: 'error', hidden: 'hidden' });
 
   /**
@@ -1724,6 +1763,7 @@ async function renderExecutionForm(id, duplicateOf) {
       effort.field,
       usageDelay.field,
       field('Prompt', inputs.prompt),
+      commandButtons(defaults.commands),
       el('label', { class: 'check' }, [inputs.isActive, 'Is Active']),
       el('div', { class: 'form-actions' }, [
         el('button', { class: 'btn primary', type: 'submit', text: 'Save' }),
@@ -1999,6 +2039,24 @@ async function renderSettings() {
   defaultPrompt.addEventListener('change', () =>
     save({ defaultPrompt: defaultPrompt.value }, defaultPrompt.value.trim() ? 'Default prompt saved' : 'Default prompt cleared'),
   );
+
+  // ---- common commands ----
+  const commonCommands = el('textarea', {
+    class: 'compact mono',
+    placeholder: '/review\n/babysit-pr',
+    'aria-label': 'Common commands',
+    text: typeof settings.commonCommands === 'string' ? settings.commonCommands : '',
+  });
+  // Not through save(): the server sorts the lines, and the box shows what it kept.
+  commonCommands.addEventListener('change', async () => {
+    try {
+      const saved = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ commonCommands: commonCommands.value }) });
+      commonCommands.value = saved.commonCommands;
+      toast(saved.commonCommands ? 'Common commands saved' : 'Common commands cleared');
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
 
   // ---- worktrees ----
   const worktreeInclude = el('textarea', {
@@ -2280,6 +2338,14 @@ async function renderSettings() {
         'Where the Prompt field of a new cron or one-time execution starts. ',
         'Editing or duplicating a job keeps the prompt it already has, and changing this rewrites no saved job. ',
         'Leave it blank to start new jobs with an empty prompt.',
+      ]),
+      el('div', { class: 'card-divider' }),
+      el('h3', { text: 'Common commands' }),
+      el('div', { class: 'field' }, [commonCommands]),
+      el('div', { class: 'hint' }, [
+        'One per line. Each becomes a button under the Prompt field of the cron and one-time execution forms, ',
+        'and clicking it copies the command to the clipboard for pasting into the prompt. ',
+        'Saving sorts the lines and drops blank ones, and the buttons follow the same order.',
       ]),
       el('div', { class: 'card-divider' }),
       el('h3', { text: 'Default .worktreeinclude' }),

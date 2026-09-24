@@ -364,6 +364,16 @@ app.put('/api/settings', async (req, res, next) => {
       if (typeof req.body.defaultPrompt !== 'string') return res.status(400).json({ error: 'defaultPrompt must be a string' });
       patch.defaultPrompt = req.body.defaultPrompt;
     }
+    if ('commonCommands' in (req.body ?? {})) {
+      if (typeof req.body.commonCommands !== 'string') return res.status(400).json({ error: 'commonCommands must be a string' });
+      // Saved sorted, one per line, with blank lines dropped.
+      patch.commonCommands = req.body.commonCommands
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b))
+        .join('\n');
+    }
     if ('defaultWorktreeInclude' in (req.body ?? {})) {
       if (typeof req.body.defaultWorktreeInclude !== 'string') return res.status(400).json({ error: 'defaultWorktreeInclude must be a string' });
       patch.defaultWorktreeInclude = req.body.defaultWorktreeInclude;

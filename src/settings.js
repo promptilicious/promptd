@@ -45,6 +45,9 @@ export const DEFAULT_SETTINGS = {
   defaultWorkingDirectory: '~/',
   // Where the Prompt field of a new cron or one-time execution starts.
   defaultPrompt: '',
+  // One per line; each is a button under the Prompt field of the job forms that
+  // copies it to the clipboard.
+  commonCommands: '',
   // Written as .worktreeinclude to the root of a job's git repository when it runs
   // in a worktree, naming the ignored files Claude Code copies into new ones.
   defaultWorktreeInclude: '',
