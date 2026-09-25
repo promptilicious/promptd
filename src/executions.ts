@@ -1,7 +1,7 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { EXECUTIONS_DIR } from './paths.js';
+
+import { db } from './db.js';
+import { executionToRow, rowToExecution } from './jobRows.js';
 import { normalizeUsageDelay } from './usage.js';
 import type { Execution, ExecutionInput, ExecutionStatus } from './types.js';
 
@@ -17,9 +17,8 @@ export interface ExecutionPage {
  *
  * Everything a cron carries applies — working directory, model, effort, the
  * usage delay, the prompt prefix, the pause — and the only difference is when it
- * fires. They live in their own folder so the cron file watcher has nothing
- * extra to poll, and they write their logs into the same logs folder as crons,
- * each under its own id.
+ * fires. They write their logs into the same logs folder as crons, each under
+ * its own id.
  */
 
 /** One screenful for the home page's "load older" button. */
@@ -33,10 +32,6 @@ export const PAGE_SIZE = 10;
  * dropped while it waited on usage — neither re-fires on its own.
  */
 export const STATUSES: ExecutionStatus[] = ['scheduled', 'running', 'done', 'cancelled'];
-
-function executionFile(id: string): string {
-  return path.join(EXECUTIONS_DIR, `${id}.json`);
-}
 
 /** A date the browser's datetime-local field produced, or null if it is not one. */
 export function parseScheduledAt(input: unknown): Date | null {
@@ -62,43 +57,22 @@ export function byScheduledAtDesc(
 }
 
 export async function listExecutions(): Promise<Execution[]> {
-  let names: string[];
-  try {
-    names = await fs.readdir(EXECUTIONS_DIR);
-  } catch {
-    return [];
-  }
-  const executions: Execution[] = [];
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
-    try {
-      const raw = await fs.readFile(path.join(EXECUTIONS_DIR, name), 'utf8');
-      const execution = JSON.parse(raw) as Execution;
-      execution.id ||= name.replace(/\.json$/, '');
-      executions.push(execution);
-    } catch (err) {
-      console.error(`[executions] skipping unreadable execution ${name}: ${(err as Error).message}`);
-    }
-  }
-  return executions.sort(byScheduledAtDesc);
+  const rows = await db().selectFrom('executions').selectAll().execute();
+  return rows.map(rowToExecution).sort(byScheduledAtDesc);
 }
 
 export async function getExecution(id: string): Promise<Execution | null> {
-  try {
-    return JSON.parse(await fs.readFile(executionFile(id), 'utf8')) as Execution;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw err;
-  }
+  const row = await db().selectFrom('executions').selectAll().where('id', '=', id).executeTakeFirst();
+  return row ? rowToExecution(row) : null;
 }
 
-/** Temp file then rename, so a crash never leaves half a JSON file behind. */
+export async function insertExecution(execution: Execution): Promise<void> {
+  await db().insertInto('executions').values(executionToRow(execution)).execute();
+}
+
 async function writeExecution(execution: Execution): Promise<void> {
-  const target = executionFile(execution.id);
-  const tmp = `${target}.${process.pid}.tmp`;
-  await fs.mkdir(EXECUTIONS_DIR, { recursive: true });
-  await fs.writeFile(tmp, `${JSON.stringify(execution, null, 2)}\n`, 'utf8');
-  await fs.rename(tmp, target);
+  const { id, ...columns } = executionToRow(execution);
+  await db().updateTable('executions').set(columns).where('id', '=', id).execute();
 }
 
 export async function createExecution(input: ExecutionInput): Promise<Execution> {
@@ -126,7 +100,7 @@ export async function createExecution(input: ExecutionInput): Promise<Execution>
     lastRunLog: null,
     stoppedBy: null,
   };
-  await writeExecution(execution);
+  await insertExecution(execution);
   return execution;
 }
 
@@ -174,13 +148,8 @@ export async function patchExecution(id: string, patch: Partial<Execution>): Pro
 }
 
 export async function deleteExecution(id: string): Promise<boolean> {
-  try {
-    await fs.unlink(executionFile(id));
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw err;
-  }
+  const result = await db().deleteFrom('executions').where('id', '=', id).executeTakeFirst();
+  return Number(result.numDeletedRows) > 0;
 }
 
 /**

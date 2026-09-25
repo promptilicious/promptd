@@ -1,8 +1,7 @@
-import fsp from 'node:fs/promises';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { db } from './db.js';
+import type { NotificationTable } from './db.js';
 import { bus, emit } from './events.js';
-import { ROOT } from './paths.js';
 import type { RunningJobSummary } from './system.js';
 import type { BusEvent, JobKind, UsageBlocker } from './types.js';
 
@@ -15,11 +14,10 @@ export interface NotificationRecord {
   cronId: string | null;
   cronName: string | null;
   jobKind: JobKind;
-  file: string;
   writing?: Promise<void> | null;
 }
 
-export type NotificationView = Omit<NotificationRecord, 'file' | 'writing'>;
+export type NotificationView = Omit<NotificationRecord, 'writing'>;
 
 export interface NotificationPage {
   items: NotificationView[];
@@ -61,11 +59,6 @@ type DescribableEvent = BusEvent & {
   summary?: string;
   running?: RunningJobSummary[];
   reasons?: UsageBlocker[];
-  added?: string[];
-  updated?: string[];
-  removed?: string[];
-  repaired?: string[];
-  broken?: Array<{ file: string }>;
 };
 
 /**
@@ -73,7 +66,7 @@ type DescribableEvent = BusEvent & {
  *
  * The page already toasts these as they happen, but a toast is gone in a few
  * seconds and nobody watches a dashboard all day. This writes the same events
- * down — one small JSON file each, under the storage root — so the answer to
+ * down — one row each, in the database — so the answer to
  * "what did I miss overnight" is a scroll rather than a log dig.
  *
  * Read state is the point of the whole thing, so most kinds arrive already
@@ -81,20 +74,27 @@ type DescribableEvent = BusEvent & {
  * a person would want to have been told — a run that failed, a trigger held for
  * usage, anything the updater did.
  */
-export const NOTIFICATIONS_DIR = path.join(ROOT, 'notifications');
-
-/** Past this the oldest are deleted as new ones land, file and all. */
+/** Past this the oldest are deleted as new ones land. */
 export const MAX_NOTIFICATIONS = 5000;
 
 /** One screenful for the drawer's infinite scroll. */
 export const PAGE_SIZE = 20;
 
-/** Files are read this many at a time at startup, so 5000 of them do not open 5000 handles. */
-const LOAD_CONCURRENCY = 64;
+function toRow(record: NotificationRecord): NotificationTable {
+  return {
+    id: record.id,
+    at: record.at,
+    kind: record.kind,
+    message: record.message,
+    read: record.read ? 1 : 0,
+    cronId: record.cronId,
+    cronName: record.cronName,
+    jobKind: record.jobKind,
+  };
+}
 
-/** `2026-09-15T22-31-33.059Z-4f3c21aa.json`, which sorts chronologically. */
-function fileName(record: Pick<NotificationRecord, 'at' | 'id'>): string {
-  return `${record.at.replace(/:/g, '-')}-${record.id.slice(0, 8)}.json`;
+function fromRow(row: NotificationTable): NotificationRecord {
+  return { ...row, read: Boolean(row.read), jobKind: row.jobKind === 'execution' ? 'execution' : 'cron' };
 }
 
 /**
@@ -124,9 +124,6 @@ function blockerNames(event: DescribableEvent): string {
 /**
  * What one event is worth recording as, or null for the ones that are signals
  * rather than news — a redraw hint, a stats sample, this module's own events.
- *
- * Returns one notification or several: a batch of file changes is several
- * separate things happening, and reads better as one line each.
  *
  * The wording matches the toasts the page shows for the same events. Those are
  * written in the client and these on the server, so the two are kept in step by
@@ -251,19 +248,6 @@ function describe(event: DescribableEvent): NotificationDraft | NotificationDraf
         read: false,
         message: `${event.label}: ${event.summary}. ${runningSummary(event.running)}`,
       };
-    case 'crons:files-changed': {
-      const out: NotificationDraft[] = [];
-      for (const cronName of event.added ?? []) out.push({ kind: 'cron', read: true, message: `Cron file added: "${cronName}", now scheduled` });
-      for (const cronName of event.updated ?? []) out.push({ kind: 'cron', read: true, message: `Cron file updated: "${cronName}", rescheduled` });
-      for (const cronName of event.removed ?? []) out.push({ kind: 'cron', read: true, message: `Cron file deleted: "${cronName}", unscheduled` });
-      for (const cronName of event.repaired ?? []) out.push({ kind: 'cron', read: true, message: `Cron file fixed: "${cronName}", rescheduled` });
-      // A file that will not parse is running its last saved version, which is
-      // worth noticing before it drifts further from what is on disk.
-      for (const item of event.broken ?? []) {
-        out.push({ kind: 'cron-broken', read: false, message: `${item.file} is not valid JSON; still running its last saved version` });
-      }
-      return out;
-    }
     default:
       return null;
   }
@@ -305,38 +289,14 @@ class NotificationCenter {
   }
 
   public async load(): Promise<number> {
-    await fsp.mkdir(NOTIFICATIONS_DIR, { recursive: true }).catch(() => {});
-    const names = (await fsp.readdir(NOTIFICATIONS_DIR).catch(() => []))
-      .filter((name) => name.endsWith('.json'))
-      .sort()
-      .reverse();
-
-    // Anything past the cap is deleted here rather than read. A prune
+    const rows = await db().selectFrom('notifications').selectAll().orderBy('at', 'desc').execute();
+    // Anything past the cap is deleted here rather than kept. A prune
     // interrupted by a restart, or one whose delete lost a race with its own
-    // write, leaves files behind; this is what stops them accumulating.
-    for (const stale of names.splice(MAX_NOTIFICATIONS)) {
-      await fsp.rm(path.join(NOTIFICATIONS_DIR, stale), { force: true }).catch(() => {});
+    // write, leaves rows behind; this is what stops them accumulating.
+    for (const stale of rows.splice(MAX_NOTIFICATIONS)) {
+      await db().deleteFrom('notifications').where('id', '=', stale.id).execute().catch(() => {});
     }
-
-    const loaded: NotificationRecord[] = [];
-    for (let index = 0; index < names.length; index += LOAD_CONCURRENCY) {
-      const batch = await Promise.all(
-        names.slice(index, index + LOAD_CONCURRENCY).map(async (name): Promise<NotificationRecord | null> => {
-          const raw = await fsp.readFile(path.join(NOTIFICATIONS_DIR, name), 'utf8').catch(() => null);
-          if (!raw) return null;
-          try {
-            const record = JSON.parse(raw) as NotificationRecord | null;
-            // A file with no timestamp cannot be ordered, so it is left on disk
-            // and ignored rather than shown in the wrong place.
-            return record?.id && record?.at ? { ...record, read: Boolean(record.read), file: name } : null;
-          } catch {
-            return null;
-          }
-        }),
-      );
-      for (const record of batch) if (record) loaded.push(record);
-    }
-    this.items = [...this.items, ...loaded];
+    this.items = [...this.items, ...rows.map(fromRow)];
     return this.items.length;
   }
 
@@ -364,7 +324,6 @@ class NotificationCenter {
       // Which page the drawer's link should open: a cron's logs or an execution's.
       jobKind,
     } as NotificationRecord;
-    record.file = fileName(record);
     this.items.unshift(record);
     const pruned = this.items.length > MAX_NOTIFICATIONS ? this.items.splice(MAX_NOTIFICATIONS) : [];
     emit('notification:new', { notification: this.view(record), unread: this.unreadCount() });
@@ -437,9 +396,9 @@ class NotificationCenter {
     };
   }
 
-  /** The file name and the in-flight write are ours, not the reader's. */
+  /** The in-flight write is ours, not the reader's. */
   public view(record: NotificationRecord): NotificationView {
-    const { file, writing, ...rest } = record;
+    const { writing, ...rest } = record;
     return rest;
   }
 
@@ -452,9 +411,9 @@ class NotificationCenter {
   /**
    * Writes one record, and remembers the write while it is in flight.
    *
-   * A burst of notifications can prune a record before its own file has been
+   * A burst of notifications can prune a record before its own row has been
    * written, and a delete that lands first deletes nothing — the write then
-   * recreates the file and it is there for good. `writing` is what `remove`
+   * inserts the row and it is there for good. `writing` is what `remove`
    * waits on so that cannot happen.
    */
   public async persist(record: NotificationRecord): Promise<void> {
@@ -466,20 +425,21 @@ class NotificationCenter {
 
   public async write(record: NotificationRecord): Promise<void> {
     try {
-      await fsp.mkdir(NOTIFICATIONS_DIR, { recursive: true });
-      const target = path.join(NOTIFICATIONS_DIR, record.file);
-      const tmp = `${target}.${process.pid}.tmp`;
-      await fsp.writeFile(tmp, `${JSON.stringify(this.view(record), null, 2)}\n`, 'utf8');
-      await fsp.rename(tmp, target);
+      const { id, ...columns } = toRow(record);
+      await db()
+        .insertInto('notifications')
+        .values({ id, ...columns })
+        .onConflict((conflict) => conflict.column('id').doUpdateSet(columns))
+        .execute();
     } catch (err) {
-      console.error(`[notifications] could not write ${record.file}: ${(err as Error).message}`);
+      console.error(`[notifications] could not write ${record.id}: ${(err as Error).message}`);
     }
   }
 
   public async remove(record: NotificationRecord): Promise<void> {
     // Never delete ahead of the write that would put it back.
     await record.writing?.catch(() => {});
-    await fsp.rm(path.join(NOTIFICATIONS_DIR, record.file), { force: true }).catch(() => {});
+    await db().deleteFrom('notifications').where('id', '=', record.id).execute().catch(() => {});
   }
 }
 

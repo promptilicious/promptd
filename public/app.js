@@ -1882,6 +1882,11 @@ function watchUpdate(status, updateButton, updateLog) {
   poll();
 }
 
+function databaseLabel(database) {
+  if (!database) return 'the database';
+  return database.dialect === 'postgres' ? `Postgres at ${database.location}` : `SQLite at ${database.location}`;
+}
+
 async function renderSettings() {
   // Health comes along for the boot time: it is the one fact on this page that
   // belongs to the running process rather than to a file on disk.
@@ -2334,7 +2339,7 @@ async function renderSettings() {
     el('div', { class: 'page-head' }, [
       el('div', {}, [
         el('h1', { text: 'Settings' }),
-        el('p', { class: 'sub', text: `Stored in ${settings.settingsFile}` }),
+        el('p', { class: 'sub', text: `Stored in ${databaseLabel(settings.database)}` }),
       ]),
     ]),
     el('div', { class: 'card' }, [
@@ -2493,20 +2498,19 @@ async function renderSettings() {
     el('div', { class: 'card' }, [
       el('h2', { text: 'Storage' }),
       readOnly('Storage root', config.storageRoot),
-      readOnly('Crons', config.cronsDir),
-      readOnly('One-time executions', config.executionsDir),
+      readOnly('Database', databaseLabel(config.database)),
       readOnly('Logs', `${config.logsDir} (newest ${config.maxLogsPerCron} runs kept per cron)`),
       readOnly(
         'Notifications',
         Number.isFinite(notifications.total)
-          ? `${config.notificationsDir} (${notifications.total} stored, ${notifications.unread} unread)`
-          : config.notificationsDir,
+          ? `${notifications.total} stored, ${notifications.unread} unread`
+          : 'in the database',
       ),
       readOnly('Project folder', settings.projectDir),
       readOnly('Update log', settings.updateLog),
       el('div', { class: 'hint' }, [
-        'Every cron, every log line and every notification is a plain file under the storage root. ',
-        'Editing a cron by hand is fine: the folder is watched. ',
+        'Crons, one-time executions, settings and notifications are kept in the database; run logs are plain files under the storage root. ',
+        'Set DATABASE_URL to a postgres:// address to use Postgres instead of the SQLite file. ',
         `The newest ${config.maxNotifications} notifications are kept, and the oldest are deleted as new ones arrive.`,
       ]),
     ]),
@@ -2901,22 +2905,11 @@ function connectEvents() {
     refreshCurrentView();
   });
 
-  // Cron files changed on disk outside the app: one toast per file, then redraw.
   // A one-time execution whose trigger was missed: the catch-up is starting it
   // now, which is worth saying out loud since nobody asked for it just then.
   events.addEventListener('execution:overdue', (event) => {
     const payload = JSON.parse(event.data);
     toast(`One-time "${payload.cronName}" missed its trigger by ${payload.lateBy}; running now`);
-    refreshCurrentView();
-  });
-
-  events.addEventListener('crons:files-changed', (event) => {
-    const { added = [], updated = [], removed = [], broken = [], repaired = [] } = JSON.parse(event.data);
-    for (const name of added) toast(`Cron file added: "${name}", now scheduled`);
-    for (const name of updated) toast(`Cron file updated: "${name}", rescheduled`);
-    for (const name of removed) toast(`Cron file deleted: "${name}", unscheduled`, true);
-    for (const item of broken) toast(`${item.file} is not valid JSON; still running its last saved version`, true);
-    for (const name of repaired) toast(`Cron file fixed: "${name}", rescheduled`);
     refreshCurrentView();
   });
 

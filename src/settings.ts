@@ -1,11 +1,11 @@
-import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { db } from './db.js';
 import { ROOT } from './paths.js';
 import type { Settings } from './types.js';
 import { DEFAULT_USAGE_THRESHOLDS, normalizeUsageThresholds } from './usage.js';
 
-export const SETTINGS_FILE = path.join(ROOT, 'settings.json');
+export const LEGACY_SETTINGS_FILE = path.join(ROOT, 'settings.json');
 
 /**
  * How many runs may be in flight at once, out of the box.
@@ -59,31 +59,44 @@ export const DEFAULT_SETTINGS: Settings = {
   localNodeAgentCheckedAt: null,
 };
 
-/** Reads settings, writing the defaults file the first time. Unknown keys are kept. */
-export async function loadSettings(): Promise<Settings> {
+function parseValue(text: string): unknown {
   try {
-    const parsed = JSON.parse(await fsp.readFile(SETTINGS_FILE, 'utf8')) as Partial<Settings> | null;
-    // Filled per key, so a hand edit that drops one threshold keeps the other three.
-    return { ...DEFAULT_SETTINGS, ...parsed, usageDelayThresholds: normalizeUsageThresholds(parsed?.usageDelayThresholds) };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      await saveSettings(DEFAULT_SETTINGS);
-      console.log(`[settings] wrote defaults to ${SETTINGS_FILE}`);
-      return { ...DEFAULT_SETTINGS };
-    }
-    // A broken file is left alone rather than overwritten — it may be a bad hand edit.
-    console.error(`[settings] ${SETTINGS_FILE} is unreadable (${(err as Error).message}); using defaults`);
-    return { ...DEFAULT_SETTINGS };
+    return JSON.parse(text);
+  } catch {
+    return undefined;
   }
 }
 
+/** Reads settings, writing the defaults the first time. Unknown keys are kept. */
+export async function loadSettings(): Promise<Settings> {
+  const rows = await db().selectFrom('settings').selectAll().execute();
+  if (!rows.length) {
+    await saveSettings(DEFAULT_SETTINGS);
+    console.log('[settings] wrote defaults');
+    return { ...DEFAULT_SETTINGS };
+  }
+  const stored: Partial<Settings> = Object.fromEntries(rows.map((row) => [row.key, parseValue(row.value)]));
+  // Filled per key, so a stored value that drops one threshold keeps the other three.
+  return { ...DEFAULT_SETTINGS, ...stored, usageDelayThresholds: normalizeUsageThresholds(stored.usageDelayThresholds) };
+}
+
+async function writeKeys(values: Partial<Settings>): Promise<void> {
+  const rows = Object.entries(values).map(([key, value]) => ({ key, value: JSON.stringify(value ?? null) }));
+  if (!rows.length) return;
+  await db()
+    .insertInto('settings')
+    .values(rows)
+    .onConflict((conflict) => conflict.column('key').doUpdateSet((eb) => ({ value: eb.ref('excluded.value') })))
+    .execute();
+}
+
 export async function saveSettings(settings: Settings): Promise<Settings> {
-  const tmp = `${SETTINGS_FILE}.${process.pid}.tmp`;
-  await fsp.writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
-  await fsp.rename(tmp, SETTINGS_FILE);
+  await writeKeys(settings);
   return settings;
 }
 
+/** Writes only the keys given, so two saves of different settings cannot undo each other. */
 export async function patchSettings(patch: Partial<Settings>): Promise<Settings> {
-  return saveSettings({ ...(await loadSettings()), ...patch });
+  await writeKeys(patch);
+  return loadSettings();
 }

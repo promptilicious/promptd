@@ -1,7 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CRONS_DIR, LOGS_DIR } from './paths.js';
+import { db } from './db.js';
+import { cronToRow, rowToCron } from './jobRows.js';
+import { LOGS_DIR } from './paths.js';
 import { normalizeUsageDelay } from './usage.js';
 import type { Cron, CronInput } from './types.js';
 
@@ -25,47 +27,23 @@ export function safeName(name: unknown): string {
   return cleaned || 'unnamed';
 }
 
-function cronFile(id: string): string {
-  return path.join(CRONS_DIR, `${id}.json`);
-}
-
 export async function listCrons(): Promise<Cron[]> {
-  let names: string[];
-  try {
-    names = await fs.readdir(CRONS_DIR);
-  } catch {
-    return [];
-  }
-  const crons: Cron[] = [];
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
-    try {
-      const raw = await fs.readFile(path.join(CRONS_DIR, name), 'utf8');
-      const cron = JSON.parse(raw) as Cron;
-      cron.id ||= name.replace(/\.json$/, '');
-      crons.push(cron);
-    } catch (err) {
-      console.error(`[store] skipping unreadable cron ${name}: ${(err as Error).message}`);
-    }
-  }
-  return crons.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const rows = await db().selectFrom('crons').selectAll().orderBy('name').execute();
+  return rows.map(rowToCron).sort((a, b) => String(a.name).localeCompare(String(b.name)));
 }
 
 export async function getCron(id: string): Promise<Cron | null> {
-  try {
-    return JSON.parse(await fs.readFile(cronFile(id), 'utf8')) as Cron;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw err;
-  }
+  const row = await db().selectFrom('crons').selectAll().where('id', '=', id).executeTakeFirst();
+  return row ? rowToCron(row) : null;
 }
 
-/** Temp file then rename, so a crash never leaves half a JSON file behind. */
+export async function insertCron(cron: Cron): Promise<void> {
+  await db().insertInto('crons').values(cronToRow(cron)).execute();
+}
+
 async function writeCron(cron: Cron): Promise<void> {
-  const target = cronFile(cron.id);
-  const tmp = `${target}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(cron, null, 2)}\n`, 'utf8');
-  await fs.rename(tmp, target);
+  const { id, ...columns } = cronToRow(cron);
+  await db().updateTable('crons').set(columns).where('id', '=', id).execute();
 }
 
 export async function createCron(input: CronInput): Promise<Cron> {
@@ -90,7 +68,7 @@ export async function createCron(input: CronInput): Promise<Cron> {
     lastRunStatus: null,
     lastRunLog: null,
   };
-  await writeCron(cron);
+  await insertCron(cron);
   return cron;
 }
 
@@ -128,13 +106,8 @@ export async function patchCron(id: string, patch: Partial<Cron>): Promise<Cron 
 }
 
 export async function deleteCron(id: string): Promise<boolean> {
-  try {
-    await fs.unlink(cronFile(id));
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw err;
-  }
+  const result = await db().deleteFrom('crons').where('id', '=', id).executeTakeFirst();
+  return Number(result.numDeletedRows) > 0;
 }
 
 // ---- logs -------------------------------------------------------------

@@ -64,10 +64,10 @@ printf '\nRegistering promptd with launchd\n\n'
 # --- what launchd will need to run ------------------------------------
 
 NODE_BIN="$(command -v node || true)"
-[ -n "$NODE_BIN" ] || die "node is not on your PATH. Install Node 18 or newer, then run this again."
+[ -n "$NODE_BIN" ] || die "node is not on your PATH. Install Node 20 or newer, then run this again."
 NODE_BIN="$(cd "$(dirname "$NODE_BIN")" && pwd)/$(basename "$NODE_BIN")"
 NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-[ "$NODE_MAJOR" -ge 18 ] 2>/dev/null || die "Node 18 or newer is required, found $("$NODE_BIN" -v 2>/dev/null || echo none)"
+[ "$NODE_MAJOR" -ge 20 ] 2>/dev/null || die "Node 20 or newer is required, found $("$NODE_BIN" -v 2>/dev/null || echo none)"
 ok "node $("$NODE_BIN" -v) at $NODE_BIN"
 
 [ -f "$PROJECT_DIR/src/server.js" ] && [ -f "$PROJECT_DIR/src/node.js" ] || die "$PROJECT_DIR does not look like the project (no src/server.js or src/node.js)"
