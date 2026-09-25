@@ -3,11 +3,19 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CRONS_DIR, LOGS_DIR } from './paths.js';
 import { normalizeUsageDelay } from './usage.js';
+import type { Cron, CronInput } from './types.js';
+
+export interface LogFile {
+  file: string;
+  startedAt: string | null;
+  size: number;
+  modifiedAt: string;
+}
 
 export const MAX_LOGS_PER_CRON = 50;
 
 /** Filesystem-safe version of a user supplied name. */
-export function safeName(name) {
+export function safeName(name: unknown): string {
   const cleaned = String(name)
     .trim()
     .replace(/[^A-Za-z0-9._ -]/g, '-')
@@ -17,52 +25,52 @@ export function safeName(name) {
   return cleaned || 'unnamed';
 }
 
-function cronFile(id) {
+function cronFile(id: string): string {
   return path.join(CRONS_DIR, `${id}.json`);
 }
 
-export async function listCrons() {
-  let names = [];
+export async function listCrons(): Promise<Cron[]> {
+  let names: string[];
   try {
     names = await fs.readdir(CRONS_DIR);
   } catch {
     return [];
   }
-  const crons = [];
+  const crons: Cron[] = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     try {
       const raw = await fs.readFile(path.join(CRONS_DIR, name), 'utf8');
-      const cron = JSON.parse(raw);
+      const cron = JSON.parse(raw) as Cron;
       cron.id ||= name.replace(/\.json$/, '');
       crons.push(cron);
     } catch (err) {
-      console.error(`[store] skipping unreadable cron ${name}: ${err.message}`);
+      console.error(`[store] skipping unreadable cron ${name}: ${(err as Error).message}`);
     }
   }
   return crons.sort((a, b) => String(a.name).localeCompare(String(b.name)));
 }
 
-export async function getCron(id) {
+export async function getCron(id: string): Promise<Cron | null> {
   try {
-    return JSON.parse(await fs.readFile(cronFile(id), 'utf8'));
+    return JSON.parse(await fs.readFile(cronFile(id), 'utf8')) as Cron;
   } catch (err) {
-    if (err.code === 'ENOENT') return null;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
 }
 
 /** Temp file then rename, so a crash never leaves half a JSON file behind. */
-async function writeCron(cron) {
+async function writeCron(cron: Cron): Promise<void> {
   const target = cronFile(cron.id);
   const tmp = `${target}.${process.pid}.tmp`;
   await fs.writeFile(tmp, `${JSON.stringify(cron, null, 2)}\n`, 'utf8');
   await fs.rename(tmp, target);
 }
 
-export async function createCron(input) {
+export async function createCron(input: CronInput): Promise<Cron> {
   const now = new Date().toISOString();
-  const cron = {
+  const cron: Cron = {
     id: randomUUID(),
     name: input.name,
     description: input.description ?? '',
@@ -86,10 +94,10 @@ export async function createCron(input) {
   return cron;
 }
 
-export async function updateCron(id, input) {
+export async function updateCron(id: string, input: CronInput): Promise<Cron | null> {
   const existing = await getCron(id);
   if (!existing) return null;
-  const cron = {
+  const cron: Cron = {
     ...existing,
     name: input.name,
     description: input.description ?? '',
@@ -111,20 +119,20 @@ export async function updateCron(id, input) {
 }
 
 /** Records the outcome of a run on the cron itself, so the home page can show "last ran". */
-export async function patchCron(id, patch) {
+export async function patchCron(id: string, patch: Partial<Cron>): Promise<Cron | null> {
   const existing = await getCron(id);
   if (!existing) return null;
-  const cron = { ...existing, ...patch };
+  const cron: Cron = { ...existing, ...patch };
   await writeCron(cron);
   return cron;
 }
 
-export async function deleteCron(id) {
+export async function deleteCron(id: string): Promise<boolean> {
   try {
     await fs.unlink(cronFile(id));
     return true;
   } catch (err) {
-    if (err.code === 'ENOENT') return false;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
 }
@@ -137,22 +145,22 @@ export async function deleteCron(id) {
  * escape the logs folder. Folders written by older versions are renamed on boot
  * by migrateLogDirs.
  */
-export function logDir(cronId) {
+export function logDir(cronId: string): string {
   return path.join(LOGS_DIR, safeName(cronId));
 }
 
-export function logPath(cronId, file) {
+export function logPath(cronId: string, file: string): string {
   const base = path.basename(file);
   if (base !== file || !/^[\w.:+-]+\.txt$/.test(base)) throw new Error('invalid log file name');
   return path.join(logDir(cronId), base);
 }
 
 /** Log file names sort lexicographically in start-time order. */
-export function logFileName(startedAt) {
+export function logFileName(startedAt: Date): string {
   return `${startedAt.toISOString().replace(/:/g, '-')}.txt`;
 }
 
-export function startedAtFromLogFile(file) {
+export function startedAtFromLogFile(file: string): string | null {
   const stamp = file.replace(/\.txt$/, '');
   const iso = stamp.replace(/T(\d{2})-(\d{2})-(\d{2})/, 'T$1:$2:$3');
   const date = new Date(iso);
@@ -160,14 +168,14 @@ export function startedAtFromLogFile(file) {
 }
 
 /** Newest first. */
-export async function listLogs(cronId) {
-  let names = [];
+export async function listLogs(cronId: string): Promise<LogFile[]> {
+  let names: string[];
   try {
     names = await fs.readdir(logDir(cronId));
   } catch {
     return [];
   }
-  const logs = [];
+  const logs: LogFile[] = [];
   for (const name of names.filter((n) => n.endsWith('.txt'))) {
     const stat = await fs.stat(path.join(logDir(cronId), name)).catch(() => null);
     if (!stat) continue;
@@ -181,12 +189,12 @@ export async function listLogs(cronId) {
   return logs.sort((a, b) => b.file.localeCompare(a.file));
 }
 
-export async function readLog(cronId, file) {
+export async function readLog(cronId: string, file: string): Promise<string> {
   return fs.readFile(logPath(cronId, file), 'utf8');
 }
 
 /** Keeps the newest MAX_LOGS_PER_CRON runs for one cron, deleting the rest. */
-export async function pruneLogs(cronId, keep = MAX_LOGS_PER_CRON) {
+export async function pruneLogs(cronId: string, keep = MAX_LOGS_PER_CRON): Promise<number> {
   const logs = await listLogs(cronId);
   const stale = logs.slice(keep);
   for (const log of stale) {

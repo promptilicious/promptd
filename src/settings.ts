@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ROOT } from './paths.js';
+import type { Settings } from './types.js';
 import { DEFAULT_USAGE_THRESHOLDS, normalizeUsageThresholds } from './usage.js';
 
 export const SETTINGS_FILE = path.join(ROOT, 'settings.json');
@@ -16,13 +17,13 @@ export const SETTINGS_FILE = path.join(ROOT, 'settings.json');
 export const DEFAULT_MAX_CONCURRENT_JOBS = os.cpus().length || 1;
 
 /** A whole number of jobs, or null when the input is not one. 0 is unlimited. */
-export function normalizeMaxConcurrentJobs(input) {
+export function normalizeMaxConcurrentJobs(input: unknown): number | null {
   const value = Number(input);
   if (!Number.isFinite(value) || value < 0) return null;
   return Math.floor(value);
 }
 
-export const DEFAULT_SETTINGS = {
+export const DEFAULT_SETTINGS: Settings = {
   // Shown after "promptd" in the header bar. Blank shows the name alone.
   serverName: '',
   // The accent and the band across the header bar, as #rrggbb. Blank is the default orange.
@@ -59,30 +60,30 @@ export const DEFAULT_SETTINGS = {
 };
 
 /** Reads settings, writing the defaults file the first time. Unknown keys are kept. */
-export async function loadSettings() {
+export async function loadSettings(): Promise<Settings> {
   try {
-    const parsed = JSON.parse(await fsp.readFile(SETTINGS_FILE, 'utf8'));
+    const parsed = JSON.parse(await fsp.readFile(SETTINGS_FILE, 'utf8')) as Partial<Settings> | null;
     // Filled per key, so a hand edit that drops one threshold keeps the other three.
     return { ...DEFAULT_SETTINGS, ...parsed, usageDelayThresholds: normalizeUsageThresholds(parsed?.usageDelayThresholds) };
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       await saveSettings(DEFAULT_SETTINGS);
       console.log(`[settings] wrote defaults to ${SETTINGS_FILE}`);
       return { ...DEFAULT_SETTINGS };
     }
     // A broken file is left alone rather than overwritten — it may be a bad hand edit.
-    console.error(`[settings] ${SETTINGS_FILE} is unreadable (${err.message}); using defaults`);
+    console.error(`[settings] ${SETTINGS_FILE} is unreadable (${(err as Error).message}); using defaults`);
     return { ...DEFAULT_SETTINGS };
   }
 }
 
-export async function saveSettings(settings) {
+export async function saveSettings(settings: Settings): Promise<Settings> {
   const tmp = `${SETTINGS_FILE}.${process.pid}.tmp`;
   await fsp.writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
   await fsp.rename(tmp, SETTINGS_FILE);
   return settings;
 }
 
-export async function patchSettings(patch) {
+export async function patchSettings(patch: Partial<Settings>): Promise<Settings> {
   return saveSettings({ ...(await loadSettings()), ...patch });
 }

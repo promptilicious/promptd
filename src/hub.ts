@@ -12,6 +12,27 @@ import { listCrons, logPath, patchCron, pruneLogs } from './store.js';
 import { STATUSES, getExecution, listExecutions, patchExecution } from './executions.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, patchSettings } from './settings.js';
 import { HISTORY_WINDOW_MS, SAMPLE_INTERVAL_MS, SYSTEM_METRICS } from './system.js';
+import type {
+  BusEvent,
+  CommandResult,
+  ConcurrencyInfo,
+  Cron,
+  Execution,
+  JobPatch,
+  JobView,
+  LogChunk,
+  ModelCatalogState,
+  NodeCommand,
+  NodeCommandType,
+  NodeCounts,
+  NodeSettings,
+  NodeStatus,
+  PauseInfo,
+  PauseState,
+  Settings,
+  SystemSample,
+  UsageReading,
+} from './types.js';
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REGISTER_SCRIPT = path.join(PROJECT_DIR, 'scripts', 'register-app-mac-os.sh');
@@ -33,20 +54,99 @@ const BOOKKEEPING_FIELDS = new Set([
   'stoppedBy',
 ]);
 
-const NO_USAGE = { ok: false, reason: 'no node is online to read usage', windows: [], checkedAt: null, stale: false };
+const NO_USAGE: UsageReading = { ok: false, reason: 'no node is online to read usage', windows: [], checkedAt: null, stale: false };
 
-function sum(nodes, read) {
+export interface HubNode {
+  id: string;
+  name: string;
+  hostname: string | null;
+  platform: string | null;
+  commit: string | null;
+  startedAt?: string | null;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  instance: string | null;
+  status: NodeStatus | null;
+  samples: SystemSample[];
+  commands: NodeCommand[];
+}
+
+export type OnlineHubNode = HubNode & { status: NodeStatus };
+
+type SavedNode = Pick<HubNode, 'commit' | 'firstSeenAt' | 'hostname' | 'id' | 'lastSeenAt' | 'name' | 'platform'>;
+
+export interface NodeListing {
+  id: string;
+  name: string;
+  hostname: string | null;
+  platform: string | null;
+  commit: string | null;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  startedAt: string | null;
+  online: boolean;
+  isDefault: boolean;
+  running: number;
+  scheduled: number;
+}
+
+export interface NodeSummary {
+  id: string | null;
+  name: string | null;
+  online: boolean;
+}
+
+export type ForgetResult = { ok: true } | { ok: false; status: number; error: string };
+
+interface JobsCache {
+  at: number;
+  crons: Cron[];
+  executions: Execution[];
+}
+
+type ReportedEvent = BusEvent & { sample?: SystemSample; cronId?: string };
+
+export class HubError extends Error {
+  public status: number;
+
+  public constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function errorCode(err: unknown): unknown {
+  return typeof err === 'object' && err !== null && 'code' in err ? err.code : undefined;
+}
+
+function errorMessage(err: unknown): unknown {
+  return typeof err === 'object' && err !== null && 'message' in err ? err.message : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;
+}
+
+function sum<T>(nodes: T[], read: (node: T) => unknown): number {
   return nodes.reduce((total, node) => total + (Number(read(node)) || 0), 0);
 }
 
-function sameSecret(given, expected) {
+function sameSecret(given: unknown, expected: unknown): boolean {
   const a = Buffer.from(String(given));
   const b = Buffer.from(String(expected));
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
 class Hub {
-  constructor() {
+  private token: string | null;
+  public nodes: Map<string, HubNode>;
+  private settings: Partial<Settings>;
+  private pauseState: PauseState | null;
+  private pauseTimer: ReturnType<typeof setTimeout> | null;
+  public jobsCache: JobsCache | null;
+  private saveTimer: ReturnType<typeof setTimeout> | null;
+
+  public constructor() {
     this.token = null;
     this.nodes = new Map();
     this.settings = {};
@@ -56,25 +156,25 @@ class Hub {
     this.saveTimer = null;
   }
 
-  async start(settings) {
+  public async start(settings: Settings): Promise<void> {
     this.settings = settings;
     this.token = await this.ensureToken();
     await this.loadNodes();
-    bus.on('event', (event) => {
+    bus.on('event', (event: BusEvent) => {
       if (event.type === 'crons:changed' || event.type === 'crons:files-changed') this.jobsCache = null;
     });
   }
 
-  setSettings(settings) {
+  public setSettings(settings: Settings): void {
     this.settings = settings;
   }
 
-  async ensureToken() {
+  private async ensureToken(): Promise<string> {
     try {
       const existing = (await fsp.readFile(NODE_TOKEN_FILE, 'utf8')).trim();
       if (existing) return existing;
     } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
+      if (errorCode(err) !== 'ENOENT') throw err;
     }
     const token = randomBytes(32).toString('hex');
     await fsp.writeFile(NODE_TOKEN_FILE, `${token}\n`, { mode: 0o600 });
@@ -82,17 +182,17 @@ class Hub {
     return token;
   }
 
-  async loadNodes() {
+  private async loadNodes(): Promise<void> {
     try {
-      for (const saved of JSON.parse(await fsp.readFile(NODES_FILE, 'utf8'))) {
+      for (const saved of JSON.parse(await fsp.readFile(NODES_FILE, 'utf8')) as SavedNode[]) {
         this.nodes.set(saved.id, { ...saved, instance: null, status: null, samples: [], commands: [] });
       }
     } catch (err) {
-      if (err.code !== 'ENOENT') console.error(`[hub] could not read ${NODES_FILE}: ${err.message}`);
+      if (errorCode(err) !== 'ENOENT') console.error(`[hub] could not read ${NODES_FILE}: ${errorMessage(err)}`);
     }
   }
 
-  saveNodes() {
+  private saveNodes(): void {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
@@ -109,48 +209,48 @@ class Hub {
       fsp
         .writeFile(tmp, `${JSON.stringify(rows, null, 2)}\n`, 'utf8')
         .then(() => fsp.rename(tmp, NODES_FILE))
-        .catch((err) => console.error(`[hub] could not save ${NODES_FILE}: ${err.message}`));
+        .catch((err: unknown) => console.error(`[hub] could not save ${NODES_FILE}: ${errorMessage(err)}`));
     }, 1000);
     this.saveTimer.unref?.();
   }
 
 
-  isOnline(node) {
-    return Boolean(node?.status) && Date.now() - Date.parse(node.lastSeenAt) < OFFLINE_AFTER_MS;
+  private isOnline(node: HubNode | undefined | null): node is OnlineHubNode {
+    return Boolean(node?.status) && Date.now() - Date.parse(node!.lastSeenAt) < OFFLINE_AFTER_MS;
   }
 
-  onlineNodes() {
+  private onlineNodes(): OnlineHubNode[] {
     return [...this.nodes.values()].filter((node) => this.isOnline(node));
   }
 
-  defaultNodeId() {
+  public defaultNodeId(): string {
     return this.settings.defaultNodeId || '';
   }
 
-  defaultNode() {
+  private defaultNode(): OnlineHubNode | null {
     const node = this.nodes.get(this.defaultNodeId());
     return this.isOnline(node) ? node : null;
   }
 
-  nodeIdFor(job) {
+  private nodeIdFor(job: Cron | Execution): string {
     return job.nodeId || this.defaultNodeId();
   }
 
-  jobView(job) {
+  public jobView(job: Cron | Execution): JobView | null {
     const node = this.nodes.get(this.nodeIdFor(job));
     if (!this.isOnline(node)) return null;
     return node.status.jobs?.[job.id] ?? null;
   }
 
-  nodeSummary(job) {
+  public nodeSummary(job: Cron | Execution): NodeSummary {
     const id = this.nodeIdFor(job);
     const node = this.nodes.get(id);
     return { id: id || null, name: node?.name ?? id ?? null, online: this.isOnline(node) };
   }
 
-  listNodes() {
+  public listNodes(): NodeListing[] {
     return [...this.nodes.values()]
-      .map((node) => ({
+      .map((node): NodeListing => ({
         id: node.id,
         name: node.name,
         hostname: node.hostname,
@@ -167,7 +267,7 @@ class Hub {
       .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.name.localeCompare(b.name));
   }
 
-  forgetNode(id) {
+  public forgetNode(id: string): ForgetResult {
     const node = this.nodes.get(id);
     if (!node) return { ok: false, status: 404, error: 'node not found' };
     if (this.isOnline(node)) return { ok: false, status: 409, error: 'this node is online; stop it before removing it' };
@@ -176,24 +276,24 @@ class Hub {
     return { ok: true };
   }
 
-  isRunningLog(jobId, file) {
+  public isRunningLog(jobId: string, file: string): boolean {
     return this.onlineNodes().some((node) => node.status.activeLogs?.some((log) => log.jobId === jobId && log.file === file));
   }
 
-  command(nodeId, type, jobId = null) {
+  public command(nodeId: string, type: NodeCommandType, jobId: string | null = null): NodeCommand | null {
     const node = this.nodes.get(nodeId);
     if (!this.isOnline(node)) return null;
-    const command = { id: randomUUID(), type, jobId, at: new Date().toISOString() };
+    const command: NodeCommand = { id: randomUUID(), type, jobId, at: new Date().toISOString() };
     node.commands.push(command);
     return command;
   }
 
-  jobsChanged() {
+  public jobsChanged(): void {
     this.jobsCache = null;
     emit('crons:changed');
   }
 
-  async allJobs() {
+  private async allJobs(): Promise<JobsCache> {
     if (this.jobsCache && Date.now() - this.jobsCache.at < JOBS_CACHE_MS) return this.jobsCache;
     const [crons, executions] = await Promise.all([listCrons(), listExecutions()]);
     this.jobsCache = { at: Date.now(), crons, executions };
@@ -201,7 +301,7 @@ class Hub {
   }
 
 
-  router() {
+  public router(): express.Router {
     const router = express.Router();
     router.use(express.json({ limit: '20mb' }));
     router.use((req, res, next) => {
@@ -213,7 +313,7 @@ class Hub {
     router.post('/report', (req, res, next) => {
       this.ingest(req.body ?? {})
         .then((answer) => res.json(answer))
-        .catch((err) => (err.status ? res.status(err.status).json({ error: err.message }) : next(err)));
+        .catch((err: unknown) => (err instanceof HubError ? res.status(err.status).json({ error: err.message }) : next(err)));
     });
     router.post('/leave', (req, res) => {
       const node = this.nodes.get(String(req.get('x-promptd-node') ?? ''));
@@ -227,38 +327,39 @@ class Hub {
     router.get('/work', (req, res, next) => {
       this.work(String(req.get('x-promptd-node') ?? ''), String(req.get('x-promptd-instance') ?? ''))
         .then((work) => res.json(work))
-        .catch((err) => (err.status ? res.status(err.status).json({ error: err.message }) : next(err)));
+        .catch((err: unknown) => (err instanceof HubError ? res.status(err.status).json({ error: err.message }) : next(err)));
     });
     return router;
   }
 
-  claim(identity) {
+  private claim(input: unknown): HubNode {
+    const identity = asRecord(input);
     const id = String(identity?.id ?? '').trim();
     const instance = String(identity?.instance ?? '').trim();
-    if (!id || !instance) throw Object.assign(new Error('node id and instance are required'), { status: 400 });
+    if (!id || !instance) throw new HubError('node id and instance are required', 400);
     const now = new Date().toISOString();
     let node = this.nodes.get(id);
     if (node && this.isOnline(node) && node.instance && node.instance !== instance) {
-      throw Object.assign(new Error(`another process is already syncing as node "${id}"; give this one its own PROMPTD_NODE_ID`), { status: 409 });
+      throw new HubError(`another process is already syncing as node "${id}"; give this one its own PROMPTD_NODE_ID`, 409);
     }
     if (!node) {
-      node = { id, firstSeenAt: now, instance: null, status: null, samples: [], commands: [] };
+      node = { id, firstSeenAt: now, instance: null, status: null, samples: [], commands: [] } as unknown as HubNode;
       this.nodes.set(id, node);
-      console.log(`[hub] new node "${identity.name ?? id}" (${id})`);
+      console.log(`[hub] new node "${identity!.name ?? id}" (${id})`);
     }
     if (node.instance !== instance) {
       if (node.instance) console.log(`[hub] node "${id}" restarted`);
       node.samples = [];
       // The previous process may have carried these out without living to report it.
-      const bornAt = Date.parse(identity.startedAt ?? '') || Date.now();
+      const bornAt = Date.parse((identity!.startedAt ?? '') as string) || Date.now();
       node.commands = node.commands.filter((command) => Date.parse(command.at) > bornAt);
     }
     Object.assign(node, {
-      name: String(identity.name ?? id),
-      hostname: identity.hostname ?? null,
-      platform: identity.platform ?? null,
-      commit: identity.commit ?? null,
-      startedAt: identity.startedAt ?? null,
+      name: String(identity!.name ?? id),
+      hostname: (identity!.hostname ?? null) as string | null,
+      platform: (identity!.platform ?? null) as string | null,
+      commit: (identity!.commit ?? null) as string | null,
+      startedAt: (identity!.startedAt ?? null) as string | null,
       instance,
       lastSeenAt: now,
     });
@@ -266,52 +367,52 @@ class Hub {
     return node;
   }
 
-  async ingest(body) {
+  private async ingest(body: Record<string, unknown>): Promise<{ ok: true; logOffsets: Record<string, number> }> {
     const node = this.claim(body.node);
     if (!this.defaultNodeId()) {
       this.settings = await patchSettings({ defaultNodeId: node.id });
       console.log(`[hub] "${node.name}" is the default node`);
     }
 
-    const logOffsets = {};
-    for (const chunk of Array.isArray(body.logs) ? body.logs : []) {
+    const logOffsets: Record<string, number> = {};
+    for (const chunk of (Array.isArray(body.logs) ? body.logs : []) as LogChunk[]) {
       const key = `${chunk.jobId}/${chunk.file}`;
-      logOffsets[key] = await this.writeLogChunk(chunk).catch((err) => {
-        console.error(`[hub] could not store log ${key} from "${node.id}": ${err.message}`);
+      logOffsets[key] = await this.writeLogChunk(chunk).catch((err: unknown) => {
+        console.error(`[hub] could not store log ${key} from "${node.id}": ${errorMessage(err)}`);
         return chunk.offset;
       });
     }
 
     const previous = node.status;
-    node.status = body.status ?? node.status;
+    node.status = (body.status as NodeStatus | null | undefined) ?? node.status;
     await this.applyPatches(node, Array.isArray(body.patches) ? body.patches : [], previous);
 
-    const answered = new Set((Array.isArray(body.commandResults) ? body.commandResults : []).map((result) => result.id));
-    for (const result of body.commandResults ?? []) {
+    const answered = new Set(((Array.isArray(body.commandResults) ? body.commandResults : []) as CommandResult[]).map((result) => result.id));
+    for (const result of (body.commandResults ?? []) as CommandResult[]) {
       if (!result.ok) console.error(`[hub] node "${node.id}" could not carry out a command: ${result.error}`);
     }
     const cutoff = Date.now() - COMMAND_TTL_MS;
     node.commands = node.commands.filter((command) => !answered.has(command.id) && Date.parse(command.at) > cutoff);
 
     let queueChanged = false;
-    for (const event of Array.isArray(body.events) ? body.events : []) {
+    for (const event of (Array.isArray(body.events) ? body.events : []) as ReportedEvent[]) {
       if (event?.type === 'pause:changed') continue;
       if (event?.type === 'queue:changed') {
         queueChanged = true;
         continue;
       }
       if (event?.type === 'system:sample') {
-        node.samples.push(event.sample);
+        node.samples.push(event.sample as SystemSample);
         const oldest = Date.now() - HISTORY_WINDOW_MS;
-        while (node.samples.length && Date.parse(node.samples[0].at) < oldest) node.samples.shift();
+        while (node.samples.length && Date.parse(node.samples[0]!.at) < oldest) node.samples.shift();
         if (node.id !== this.defaultNodeId()) continue;
       }
       if (event?.type === 'run:finished' && event.cronId) {
-        pruneLogs(event.cronId).catch((err) => console.error(`[hub] log cleanup failed for ${event.cronId}: ${err.message}`));
+        pruneLogs(event.cronId).catch((err: unknown) => console.error(`[hub] log cleanup failed for ${event.cronId}: ${errorMessage(err)}`));
       }
       bus.emit('event', { ...event, nodeId: node.id, nodeName: node.name });
     }
-    if (queueChanged) emit('queue:changed', this.concurrencyInfo());
+    if (queueChanged) emit('queue:changed', { ...this.concurrencyInfo() });
     return { ok: true, logOffsets };
   }
 
@@ -320,7 +421,7 @@ class Hub {
    * the hub now holds. A retry of a chunk already written lands on the same
    * bytes; a chunk past the end is refused, and the answer rewinds the node.
    */
-  async writeLogChunk({ jobId, file, offset, data }) {
+  public async writeLogChunk({ jobId, file, offset, data }: LogChunk): Promise<number> {
     const target = logPath(String(jobId), String(file));
     await fsp.mkdir(path.dirname(target), { recursive: true });
     const size = await fsp
@@ -344,7 +445,7 @@ class Hub {
    * Only run bookkeeping, and only for jobs this node runs or was running: a node
    * holds a token, not the right to rewrite another machine's prompts.
    */
-  async applyPatches(node, patches, previousStatus) {
+  private async applyPatches(node: HubNode, patches: JobPatch[], previousStatus: NodeStatus | null): Promise<void> {
     if (!patches.length) return;
     const { crons, executions } = await this.allJobs();
     const owned = new Set(
@@ -356,8 +457,8 @@ class Hub {
     let wrote = false;
     for (const entry of patches) {
       if (!owned.has(entry?.id)) continue;
-      const fields = Object.fromEntries(Object.entries(entry.patch ?? {}).filter(([key]) => BOOKKEEPING_FIELDS.has(key)));
-      if ('status' in fields && !STATUSES.includes(fields.status)) delete fields.status;
+      const fields: Partial<Cron & Execution> = Object.fromEntries(Object.entries(entry.patch ?? {}).filter(([key]) => BOOKKEEPING_FIELDS.has(key)));
+      if ('status' in fields && !(STATUSES as readonly unknown[]).includes(fields.status)) delete fields.status;
       // The node's copy can be a sync behind: a date saved on the hub mid-run has
       // already put the record back to scheduled, and closing it would undo that.
       if (entry.kind === 'execution' && fields.status === 'done') {
@@ -369,19 +470,26 @@ class Hub {
       }
       if (!Object.keys(fields).length) continue;
       const write = entry.kind === 'execution' ? patchExecution : patchCron;
-      await write(entry.id, fields).catch((err) => console.error(`[hub] could not record ${entry.id} from "${node.id}": ${err.message}`));
+      await write(entry.id, fields).catch((err: unknown) => console.error(`[hub] could not record ${entry.id} from "${node.id}": ${errorMessage(err)}`));
       wrote = true;
     }
     if (wrote) this.jobsCache = null;
   }
 
-  async work(nodeId, instance) {
+  private async work(nodeId: string, instance: string): Promise<{
+    node: { id: string; isDefault: boolean };
+    crons: Cron[];
+    executions: Execution[];
+    settings: Partial<NodeSettings>;
+    pause: PauseState | null;
+    commands: NodeCommand[];
+  }> {
     const node = this.nodes.get(nodeId);
     if (!node || node.instance !== instance) {
-      throw Object.assign(new Error('report before asking for work'), { status: 409 });
+      throw new HubError('report before asking for work', 409);
     }
     const { crons, executions } = await this.allJobs();
-    const mine = (job) => this.nodeIdFor(job) === node.id;
+    const mine = (job: Cron | Execution): boolean => this.nodeIdFor(job) === node.id;
     const commands = node.commands.slice();
     return {
       node: { id: node.id, isDefault: node.id === this.defaultNodeId() },
@@ -398,24 +506,24 @@ class Hub {
   }
 
 
-  isPaused() {
+  public isPaused(): boolean {
     return this.pauseState !== null;
   }
 
-  isPausedForUpdate() {
+  public isPausedForUpdate(): boolean {
     return this.pauseState?.mode === 'update';
   }
 
-  runningCount() {
+  public runningCount(): number {
     return sum(this.onlineNodes(), (node) => node.status.counts?.running);
   }
 
   /** True once every online node has fetched the pause and stopped starting runs. */
-  everyNodeHolding() {
+  public everyNodeHolding(): boolean {
     return this.onlineNodes().every((node) => node.status.pause?.paused);
   }
 
-  pauseInfo() {
+  public pauseInfo(): PauseInfo {
     const nodes = this.onlineNodes();
     const runningCount = this.runningCount();
     if (!this.pauseState) {
@@ -437,7 +545,17 @@ class Hub {
     };
   }
 
-  async pauseAll({ mode = 'manual', label, option = null, ms = null }) {
+  public async pauseAll({
+    mode = 'manual',
+    label,
+    option = null,
+    ms = null,
+  }: {
+    mode?: PauseState['mode'];
+    label: string;
+    option?: string | null;
+    ms?: number | null;
+  }): Promise<PauseInfo> {
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = null;
     const startedAt = new Date();
@@ -450,16 +568,16 @@ class Hub {
     };
     if (ms) {
       this.pauseTimer = setTimeout(() => {
-        this.resumeAll('timer expired').catch((err) => console.error(`[hub] resume failed: ${err.message}`));
+        this.resumeAll('timer expired').catch((err: unknown) => console.error(`[hub] resume failed: ${errorMessage(err)}`));
       }, ms);
       this.pauseTimer.unref?.();
     }
     console.log(`[hub] paused ${label} (${mode})`);
-    emit('pause:changed', this.pauseInfo());
+    emit('pause:changed', { ...this.pauseInfo() });
     return this.pauseInfo();
   }
 
-  async resumeAll(reason = 'cancelled') {
+  public async resumeAll(reason = 'cancelled'): Promise<PauseInfo> {
     if (!this.pauseState) return this.pauseInfo();
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = null;
@@ -472,15 +590,27 @@ class Hub {
 
 
   /** Each node enforces its own limit, so the fleet's is their total, or none when any node has none. */
-  concurrencyLimit(nodes = this.onlineNodes()) {
+  private concurrencyLimit(nodes: OnlineHubNode[] = this.onlineNodes()): number {
     if (!nodes.length) return this.settings.maxConcurrentJobs ?? DEFAULT_MAX_CONCURRENT_JOBS;
     const limits = nodes.map((node) => Number(node.status.counts?.concurrencyLimit) || 0);
     return limits.includes(0) ? 0 : limits.reduce((a, b) => a + b, 0);
   }
 
-  health() {
+  public health(): {
+    scheduled: number;
+    running: number;
+    paused: boolean;
+    delayed: number;
+    queued: number;
+    usageDelayed: number;
+    concurrencyLimit: number;
+    armedCrons: number;
+    armedExecutions: number;
+    usage: UsageReading;
+    nodes: { total: number; online: number };
+  } {
     const nodes = this.onlineNodes();
-    const count = (key) => sum(nodes, (node) => node.status.counts?.[key]);
+    const count = (key: keyof NodeCounts): number => sum(nodes, (node) => node.status.counts?.[key]);
     return {
       scheduled: count('scheduled'),
       running: count('running'),
@@ -496,10 +626,12 @@ class Hub {
     };
   }
 
-  concurrencyInfo() {
+  public concurrencyInfo(): ConcurrencyInfo {
     const nodes = this.onlineNodes();
-    const infos = nodes.map((node) => ({ node, info: node.status.concurrency ?? {} }));
-    const tag = (node) => (row) => ({ ...row, nodeId: node.id, nodeName: node.name });
+    const infos = nodes.map((node): { node: OnlineHubNode; info: Partial<ConcurrencyInfo> } => ({ node, info: node.status.concurrency ?? {} }));
+    const tag =
+      (node: OnlineHubNode) =>
+      <T extends object>(row: T): T & { nodeId: string; nodeName: string } => ({ ...row, nodeId: node.id, nodeName: node.name });
     const slots = infos.map(({ info }) => info.nextSlotAt).filter(Boolean).sort();
     return {
       limit: this.concurrencyLimit(nodes),
@@ -515,7 +647,7 @@ class Hub {
     };
   }
 
-  systemState() {
+  public systemState(): Record<string, unknown> {
     const node = this.defaultNode();
     if (!node?.status.system) {
       return {
@@ -533,11 +665,11 @@ class Hub {
     return { ...node.status.system, latest: node.samples.at(-1) ?? node.status.system.latest ?? null, samples: node.samples };
   }
 
-  models() {
+  public models(): ModelCatalogState {
     return this.defaultNode()?.status.models ?? { models: [], discoveredAt: null, loading: false, error: 'no node is online to ask' };
   }
 
-  async refreshModels() {
+  public async refreshModels(): Promise<ModelCatalogState> {
     const before = this.models().discoveredAt;
     for (const node of this.onlineNodes()) this.command(node.id, 'refreshModels');
     const deadline = Date.now() + MODEL_REFRESH_WAIT_MS;
@@ -556,14 +688,14 @@ class Hub {
    * and none for the node, so after the update that brings this code nothing
    * would run its jobs.
    */
-  async ensureLocalNodeAgent() {
+  public async ensureLocalNodeAgent(): Promise<void> {
     if (process.platform !== 'darwin' || this.settings.localNodeAgentCheckedAt) return;
     const label = process.env.PROMPTD_LAUNCHD_LABEL ?? 'local.promptd';
     const hubPlist = path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
     if (process.ppid !== 1 || !fs.existsSync(hubPlist)) return;
     const nodeLabel = process.env.PROMPTD_NODE_LAUNCHD_LABEL ?? `${label}.node`;
-    const registered = await new Promise((resolve) => {
-      execFile('launchctl', ['print', `gui/${process.getuid()}/${nodeLabel}`], (err) => resolve(!err));
+    const registered = await new Promise<boolean>((resolve) => {
+      execFile('launchctl', ['print', `gui/${process.getuid!()}/${nodeLabel}`], (err) => resolve(!err));
     });
     if (!registered) {
       console.log(`[hub] no launchd agent for the local node; registering ${nodeLabel}`);
@@ -572,7 +704,7 @@ class Hub {
         stdio: 'inherit',
         env: { ...process.env, NODE_ONLY: '1', LABEL: label, NODE_LABEL: nodeLabel },
       });
-      const code = await new Promise((resolve) => child.on('exit', resolve));
+      const code = await new Promise<number | null>((resolve) => child.on('exit', resolve));
       if (code !== 0) {
         console.error(`[hub] registering the local node agent failed (exit ${code}); run ${REGISTER_SCRIPT} by hand`);
         return;

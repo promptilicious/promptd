@@ -3,7 +3,9 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import type { ChildProcess, ChildProcessByStdio } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import type { Readable } from 'node:stream';
 import { Cron } from 'croner';
 import { emit } from './events.js';
 import { resolveUserPath } from './paths.js';
@@ -23,6 +25,89 @@ import { TTL_MS as USAGE_CHECK_MS, hasUsageDelay, normalizeUsageDelay, usageBloc
 import { DEFAULT_MAX_CONCURRENT_JOBS } from './settings.js';
 import { validateCronExpression } from './schedule.js';
 import { WORKTREE_INCLUDE_FILE, pathInRepo, removeWorktree, writeWorktreeInclude } from './worktree.js';
+import type {
+  BusyJob,
+  Cron as CronRecord,
+  ConcurrencyInfo,
+  DelayEntry,
+  DelayOutlook,
+  Execution,
+  ExecutionStatus,
+  Job,
+  JobBase,
+  JobKind,
+  LifetimeStats,
+  PauseInfo,
+  PauseState,
+  RunInfo,
+  RunSource,
+  RunStatus,
+  RunWait,
+  UsageBlocker,
+} from './types.js';
+
+export type UsageHold = DelayEntry & { hold: 'usage' };
+
+export type SlotHold = DelayEntry & { hold: 'concurrency'; limit: number; waits: RunWait[] };
+
+export type HeldTrigger = UsageHold | SlotHold;
+
+export type QueuedTrigger = SlotHold & {
+  position: number;
+  queueLength: number;
+  runningCount: number;
+  resumeAt: string | null;
+};
+
+export type TriggerResult = (RunInfo & { delayed?: undefined }) | { delayed: HeldTrigger };
+
+interface CliStreamEvent {
+  type?: string;
+  content_block?: { type?: string };
+  delta?: { type?: string; text?: string };
+}
+
+interface CliEvent {
+  type?: string;
+  event?: CliStreamEvent;
+  result?: unknown;
+  is_error?: boolean;
+  api_error_status?: string | number | null;
+  subtype?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+  modelUsage?: Record<string, unknown>;
+  total_cost_usd?: number;
+  duration_ms?: number;
+}
+
+interface KindStore {
+  get(id: string): Promise<CronRecord | Execution | null>;
+  patch(id: string, fields: Partial<CronRecord> & Partial<Execution>): Promise<unknown>;
+}
+
+interface RunHandle {
+  child: ChildProcess;
+  stream: fs.WriteStream;
+  killTimer: NodeJS.Timeout | null;
+}
+
+type WorktreeIncludeOutcome = { written: string; text: string; skipped?: undefined } | { written?: undefined; skipped: string };
+
+interface JobProfile {
+  name: string;
+  averageRuntimeMs: number | null;
+}
+
+type TimedRun = RunInfo & { averageRuntimeMs: number };
+
+function isFiniteNumber(value: unknown): value is number {
+  return Number.isFinite(value);
+}
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -66,7 +151,7 @@ const PROMPT_PREFIX =
  * `subfolder` is where the job's working directory sits in its repository. A
  * worktree session starts at the top of its copy, not in that folder.
  */
-function worktreeNotice(job, subfolder) {
+function worktreeNotice(job: Pick<JobBase, 'cleanupWorktree'>, subfolder: string | null): string {
   return [
     'Worktree: you are running in a git worktree. Keep all changes, commands and subagents inside it.',
     subfolder ? `This job's folder is ${subfolder} within the worktree.` : null,
@@ -80,7 +165,7 @@ function worktreeNotice(job, subfolder) {
 }
 
 /** The prompt as the CLI receives it: the preamble, the worktree notice if any, then what the job says. */
-function promptFor(job, notice = null) {
+function promptFor(job: Pick<JobBase, 'prompt'>, notice: string | null = null): string {
   const prompt = job.prompt ?? '';
   return [PROMPT_PREFIX, notice, prompt.trim() ? prompt : null].filter(Boolean).join('\n\n');
 }
@@ -93,13 +178,13 @@ function promptFor(job, notice = null) {
  * stop and statistics block apply to both. Everything below therefore works on
  * a "job" — a record carrying `kind` — rather than on a cron.
  */
-const KINDS = {
+const KINDS: Record<JobKind, KindStore> = {
   cron: { get: getCron, patch: patchCron },
   execution: { get: getExecution, patch: patchExecution },
 };
 
 /** Reads one job by id, whichever folder it lives in. Ids are unique across both. */
-export async function findJob(id) {
+export async function findJob(id: string): Promise<Job | null> {
   const cron = await getCron(id);
   if (cron) return { ...cron, kind: 'cron' };
   const execution = await getExecution(id);
@@ -107,8 +192,8 @@ export async function findJob(id) {
   return null;
 }
 
-function formatRuntime(ms) {
-  if (!Number.isFinite(ms)) return 'unknown';
+function formatRuntime(ms: number | undefined): string {
+  if (!isFiniteNumber(ms)) return 'unknown';
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   const minutes = Math.floor(ms / 60000);
   const seconds = Math.round((ms % 60000) / 1000);
@@ -116,7 +201,7 @@ function formatRuntime(ms) {
 }
 
 /** Builds the run's statistics block from the CLI's result event. */
-function statsBlock(result, afterCost = []) {
+function statsBlock(result: CliEvent, afterCost: string[] = []): string {
   const usage = result?.usage ?? {};
   const input = usage.input_tokens ?? 0;
   const output = usage.output_tokens ?? 0;
@@ -124,7 +209,7 @@ function statsBlock(result, afterCost = []) {
   const total = input + output + cache;
   const models = Object.keys(result?.modelUsage ?? {});
   const cost = typeof result?.total_cost_usd === 'number' ? `$${result.total_cost_usd.toFixed(4)}` : 'unknown';
-  const count = (n) => n.toLocaleString('en-US');
+  const count = (n: number): string => n.toLocaleString('en-US');
 
   return [
     '',
@@ -144,23 +229,23 @@ function statsBlock(result, afterCost = []) {
  * happened in a line for the log. Never throws: a failed clean up is reported,
  * and the run's own outcome stands.
  */
-async function cleanUpWorktree(job, cwd) {
+async function cleanUpWorktree(job: Job, cwd: string): Promise<string> {
   if (!job.cleanupWorktree) return 'not cleaned up: Clean up worktree after execution is off';
   const started = Date.now();
   try {
-    const result = await removeWorktree(cwd, job.id);
+    const result: { cleaned?: string; skipped?: string } = await removeWorktree(cwd, job.id);
     if (!result.cleaned) return `not cleaned up: ${result.skipped}`;
     return `cleaned up in ${((Date.now() - started) / 1000).toFixed(1)}s: ${result.cleaned}`;
   } catch (err) {
-    console.error(`[cron] worktree clean up failed for "${job.name}": ${err.message}`);
+    console.error(`[cron] worktree clean up failed for "${job.name}": ${err instanceof Error ? err.message : String(err)}`);
     // Left behind, the worktree is found again by the next run, or by nobody.
-    emit('worktree:cleanup-failed', { cronId: job.id, cronName: job.name, kind: job.kind ?? 'cron', error: oneLine(err.message) });
-    return `error: ${err.message}`;
+    emit('worktree:cleanup-failed', { cronId: job.id, cronName: job.name, kind: job.kind ?? 'cron', error: oneLine(err instanceof Error ? err.message : String(err)) });
+    return `error: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 
 /** git's messages can run to several lines; a notification is one. */
-function oneLine(text) {
+function oneLine(text: unknown): string {
   return String(text).replace(/\s+/g, ' ').trim();
 }
 
@@ -170,14 +255,14 @@ function oneLine(text) {
  * on an account with no monthly boundary to read — returns null, and the review
  * poll decides instead of a timer.
  */
-function resumeTime(blockers) {
+function resumeTime(blockers: UsageBlocker[]): string | null | undefined {
   if (!blockers.length) return null;
   if (blockers.some((blocker) => !blocker.resetsAt)) return null;
   return blockers.map((blocker) => blocker.resetsAt).sort().at(-1);
 }
 
 /** "Session, Weekly" — the limits a trigger is waiting on, for a log or a badge. */
-function blockerNames(blockers) {
+function blockerNames(blockers: UsageBlocker[]): string {
   return blockers.map((blocker) => blocker.label).join(', ');
 }
 
@@ -189,7 +274,7 @@ function blockerNames(blockers) {
  * nothing at the moment it is wanted. A job with no completed run behind it has
  * no average, and a made-up number would be worse than saying nothing.
  */
-function averageRuntimeMs(job) {
+function averageRuntimeMs(job: LifetimeStats): number | null {
   const runs = Number(job?.lifetimeRuns);
   const seconds = Number(job?.lifetimeRuntimeSeconds);
   if (!Number.isFinite(runs) || runs <= 0 || !Number.isFinite(seconds) || seconds <= 0) return null;
@@ -197,12 +282,32 @@ function averageRuntimeMs(job) {
 }
 
 /** "4 running jobs" / "1 running job" — what a queued trigger is behind. */
-function runningPhrase(count) {
+function runningPhrase(count: number): string {
   return `${count} running job${count === 1 ? '' : 's'}`;
 }
 
 class CronService {
-  constructor() {
+  public jobs: Map<string, Cron>;
+  public armedCrons: number;
+  public armedExecutions: number;
+  public running: Map<string, RunInfo>;
+  private handles: Map<string, RunHandle>;
+  private pauseState: PauseState | null;
+  private pauseTimer: NodeJS.Timeout | null;
+  private delayed: Map<string, HeldTrigger>;
+  private delayTimer: NodeJS.Timeout | null;
+  private reviewing: boolean;
+  private droppedDuringPause: Map<string, number>;
+  private starting: Set<string>;
+  private reloading: Promise<number> | null;
+  private catchingUp: boolean;
+  private completions: Map<string, Promise<RunStatus>>;
+  public concurrencyLimit: number;
+  private pendingStarts: number;
+  private draining: boolean;
+  private profiles: Map<string, JobProfile>;
+
+  public constructor() {
     /** @type {Map<string, Cron>} cron id -> scheduled job */
     this.jobs = new Map();
     /** Crons with a live schedule, and one-time executions still waiting for theirs. */
@@ -291,22 +396,22 @@ class CronService {
     this.profiles = new Map();
   }
 
-  isPaused() {
+  public isPaused(): boolean {
     return this.pauseState !== null;
   }
 
   /** An update pause is the one kind the user cannot cancel. */
-  isPausedForUpdate() {
+  public isPausedForUpdate(): boolean {
     return this.pauseState?.mode === 'update';
   }
 
   /** How many runs are still in flight; what an update waits to reach zero. */
-  runningCount() {
+  public runningCount(): number {
     return this.running.size;
   }
 
   /** JSON-safe pause state for the API and the status badges. */
-  pauseInfo() {
+  public pauseInfo(): PauseInfo {
     if (!this.pauseState) {
       return { paused: false, mode: null, label: null, badge: null, until: null, startedAt: null, remainingMs: null, cancellable: false, runningCount: this.running.size, droppedCount: 0 };
     }
@@ -331,7 +436,17 @@ class CronService {
    * Holds every schedule. Runs already in flight are left alone — they keep
    * their running badge and finish on their own.
    */
-  async pauseAll({ mode = 'manual', label, option = null, ms = null }) {
+  public async pauseAll({
+    mode = 'manual',
+    label,
+    option = null,
+    ms = null,
+  }: {
+    mode?: PauseState['mode'];
+    label: string;
+    option?: string | null;
+    ms?: number | null;
+  }): Promise<PauseInfo> {
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = null;
 
@@ -349,7 +464,7 @@ class CronService {
     await this.reload(); // stops every job; reload leaves them stopped while paused
     if (ms) {
       this.pauseTimer = setTimeout(() => {
-        this.resumeAll('timer expired').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+        this.resumeAll('timer expired').catch((err: unknown) => console.error(`[cron] resume failed: ${err instanceof Error ? err.message : String(err)}`));
       }, ms);
       this.pauseTimer.unref?.();
     }
@@ -359,7 +474,7 @@ class CronService {
   }
 
   /** Lifts a pause and re-arms whatever is still active on disk. */
-  async resumeAll(reason = 'cancelled') {
+  public async resumeAll(reason = 'cancelled'): Promise<PauseInfo> {
     if (!this.pauseState) return this.pauseInfo();
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = null;
@@ -370,9 +485,9 @@ class CronService {
     emit('pause:changed', { ...this.pauseInfo(), resumedFrom: previous.label, reason });
     // A trigger whose usage cleared during the pause was held by the pause, not
     // by usage. Do not make it wait out another review interval.
-    this.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
+    this.reviewDelays().catch((err: unknown) => console.error(`[cron] usage delay review failed: ${err instanceof Error ? err.message : String(err)}`));
     // Same for the queue: the slots were free the whole time the pause held it.
-    this.drainQueue().catch((err) => console.error(`[cron] queue drain failed: ${err.message}`));
+    this.drainQueue().catch((err: unknown) => console.error(`[cron] queue drain failed: ${err instanceof Error ? err.message : String(err)}`));
     return this.pauseInfo();
   }
 
@@ -385,7 +500,7 @@ class CronService {
    * place in the queue and the time it might start both move as runs finish, so
    * they are worked out at the moment they are asked for.
    */
-  delayInfo(cronId) {
+  public delayInfo(cronId: string): HeldTrigger | QueuedTrigger | null {
     const entry = this.delayed.get(cronId) ?? null;
     if (!entry || entry.hold !== 'concurrency') return entry;
     const queue = this.queued();
@@ -402,18 +517,18 @@ class CronService {
     };
   }
 
-  isDelayed(cronId) {
+  public isDelayed(cronId: string): boolean {
     return this.delayed.has(cronId);
   }
 
   /** How many triggers are waiting, on usage or on a free slot. Never counted as running. */
-  delayedCount() {
+  public delayedCount(): number {
     return this.delayed.size;
   }
 
   /** The triggers held by a usage limit, which are the ones the review timer is for. */
-  usageDelays() {
-    return [...this.delayed.values()].filter((entry) => entry.hold !== 'concurrency');
+  public usageDelays(): UsageHold[] {
+    return [...this.delayed.values()].filter((entry): entry is UsageHold => entry.hold !== 'concurrency');
   }
 
   /**
@@ -427,7 +542,7 @@ class CronService {
    * limit which has just reset can read as spent for up to another refresh
    * window; the trigger waits that out.
    */
-  async blockersFor(cron) {
+  private async blockersFor(cron: JobBase): Promise<UsageBlocker[]> {
     const delay = normalizeUsageDelay(cron.usageDelay);
     if (!hasUsageDelay(delay)) return [];
     let reading = await usageMonitor.state();
@@ -445,9 +560,9 @@ class CronService {
    * something else, so a queue it goes back into puts it where it was rather
    * than at the back.
    */
-  hold(cron, source, blockers, arrivedAt = null) {
+  private hold(cron: Job, source: RunSource, blockers: UsageBlocker[], arrivedAt: string | null = null): UsageHold {
     const now = new Date().toISOString();
-    const entry = {
+    const entry: UsageHold = {
       cronId: cron.id,
       cronName: cron.name,
       kind: cron.kind ?? 'cron',
@@ -471,7 +586,7 @@ class CronService {
    * or on a free slot. This is what Stop does to a delayed cron: the schedule is
    * untouched, so the next trigger is checked afresh like any other.
    */
-  async cancelDelay(cronId, cancelledBy = 'user') {
+  public async cancelDelay(cronId: string, cancelledBy = 'user'): Promise<HeldTrigger | null> {
     const entry = this.delayed.get(cronId);
     if (!entry) return null;
     this.delayed.delete(cronId);
@@ -484,8 +599,8 @@ class CronService {
     // on and its failure reported — answering "cancelled" over a write that
     // silently failed is how the cancel gets undone a few seconds later.
     if (entry.kind === 'execution') {
-      const written = await patchExecution(cronId, { status: 'cancelled', stoppedBy: cancelledBy }).catch((err) => {
-        console.error(`[cron] could not cancel "${entry.cronName}": ${err.message}`);
+      const written = await patchExecution(cronId, { status: 'cancelled', stoppedBy: cancelledBy }).catch((err: unknown) => {
+        console.error(`[cron] could not cancel "${entry.cronName}": ${err instanceof Error ? err.message : String(err)}`);
         return null;
       });
       if (!written) throw new Error('the waiting trigger was dropped, but the execution could not be marked cancelled; it may run again');
@@ -495,15 +610,15 @@ class CronService {
     return entry;
   }
 
-  startDelayReview() {
+  private startDelayReview(): void {
     if (this.delayTimer) return;
     this.delayTimer = setInterval(() => {
-      this.reviewDelays().catch((err) => console.error(`[cron] usage delay review failed: ${err.message}`));
+      this.reviewDelays().catch((err: unknown) => console.error(`[cron] usage delay review failed: ${err instanceof Error ? err.message : String(err)}`));
     }, DELAY_REVIEW_MS);
     this.delayTimer.unref?.();
   }
 
-  stopDelayReview() {
+  private stopDelayReview(): void {
     if (this.delayTimer) clearInterval(this.delayTimer);
     this.delayTimer = null;
   }
@@ -519,7 +634,7 @@ class CronService {
    * its limit resetting rather than within seconds of it, which is the price of
    * not getting the account rate limited.
    */
-  async reviewDelays() {
+  public async reviewDelays(): Promise<void> {
     if (this.reviewing) return;
     if (!this.usageDelays().length) {
       this.stopDelayReview();
@@ -589,12 +704,12 @@ class CronService {
    * Slots taken right now: the runs in flight plus the triggers on their way to
    * being one.
    */
-  activeCount() {
+  private activeCount(): number {
     return this.running.size + this.pendingStarts;
   }
 
   /** How many triggers are queued behind the limit. */
-  queuedCount() {
+  public queuedCount(): number {
     return this.queued().length;
   }
 
@@ -606,9 +721,9 @@ class CronService {
    * to the place it had rather than to the back of the line. That is what keeps
    * the queue running jobs in the order they fired.
    */
-  queued() {
+  private queued(): SlotHold[] {
     return [...this.delayed.values()]
-      .filter((entry) => entry.hold === 'concurrency')
+      .filter((entry): entry is SlotHold => entry.hold === 'concurrency')
       .sort((a, b) => Date.parse(a.arrivedAt) - Date.parse(b.arrivedAt));
   }
 
@@ -621,17 +736,17 @@ class CronService {
    * has no average and is left out — which can only make these later than what
    * happens, never earlier.
    */
-  slotEstimates() {
+  private slotEstimates(): string[] {
     const now = Date.now();
     return [...this.running.values()]
-      .filter((run) => Number.isFinite(run.averageRuntimeMs))
+      .filter((run): run is TimedRun => Number.isFinite(run.averageRuntimeMs))
       .map((run) => now + Math.max(0, run.averageRuntimeMs - (now - Date.parse(run.startedAt))))
       .sort((a, b) => a - b)
       .map((at) => new Date(at).toISOString());
   }
 
   /** The earliest a queued trigger could start, or null when nothing can be said. */
-  nextSlotAt() {
+  private nextSlotAt(): string | null {
     return this.slotEstimates()[0] ?? null;
   }
 
@@ -639,18 +754,18 @@ class CronService {
    * Applies the saved limit. Raising it lets whatever is queued go at once;
    * lowering it never stops a run already going — it only holds the next ones.
    */
-  setConcurrencyLimit(limit) {
+  public setConcurrencyLimit(limit: number): number {
     const value = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : DEFAULT_MAX_CONCURRENT_JOBS;
     if (value === this.concurrencyLimit) return this.concurrencyLimit;
     this.concurrencyLimit = value;
     console.log(`[cron] concurrent job limit is now ${value === 0 ? 'unlimited' : value}`);
-    this.drainQueue().catch((err) => console.error(`[cron] queue drain failed: ${err.message}`));
+    this.drainQueue().catch((err: unknown) => console.error(`[cron] queue drain failed: ${err instanceof Error ? err.message : String(err)}`));
     emit('queue:changed', this.concurrencyInfo());
     return this.concurrencyLimit;
   }
 
   /** The limit, what is running under it and what is waiting. JSON-safe. */
-  concurrencyInfo() {
+  public concurrencyInfo(): ConcurrencyInfo {
     return {
       limit: this.concurrencyLimit,
       defaultLimit: DEFAULT_MAX_CONCURRENT_JOBS,
@@ -668,9 +783,9 @@ class CronService {
         startedAt: run.startedAt,
         // Null for a job with no finished run behind it, which is also why it
         // contributes nothing to the estimate above.
-        averageRuntimeSeconds: Number.isFinite(run.averageRuntimeMs) ? run.averageRuntimeMs / 1000 : null,
+        averageRuntimeSeconds: isFiniteNumber(run.averageRuntimeMs) ? run.averageRuntimeMs / 1000 : null,
       })),
-      queued: this.queued().map((entry) => this.delayInfo(entry.cronId)),
+      queued: this.queued().map((entry) => this.delayInfo(entry.cronId) as QueuedTrigger),
     };
   }
 
@@ -681,9 +796,9 @@ class CronService {
    * and the notification drawer then have one kind of waiting trigger to draw
    * rather than two.
    */
-  holdForSlot(job, source, waits = [], arrivedAt = null) {
+  private holdForSlot(job: Job, source: RunSource, waits: RunWait[] = [], arrivedAt: string | null = null): QueuedTrigger {
     const now = new Date().toISOString();
-    const entry = {
+    const entry: SlotHold = {
       cronId: job.id,
       cronName: job.name,
       kind: job.kind ?? 'cron',
@@ -699,7 +814,7 @@ class CronService {
       waits,
     };
     this.delayed.set(job.id, entry);
-    const info = this.delayInfo(job.id);
+    const info = this.delayInfo(job.id) as QueuedTrigger;
     console.log(
       `[cron] "${job.name}" ${source} trigger queued at position ${info.position + 1} behind ${runningPhrase(this.running.size)}`,
     );
@@ -714,7 +829,7 @@ class CronService {
    * trigger whose usage limit just cleared all come through here, so there is a
    * single place the limit is enforced.
    */
-  async admit(job, source, waits = [], arrivedAt = null) {
+  private async admit(job: Job, source: RunSource, waits: RunWait[] = [], arrivedAt: string | null = null): Promise<TriggerResult> {
     const limit = this.concurrencyLimit;
     if (limit > 0 && this.activeCount() >= limit) {
       return { delayed: this.holdForSlot(job, source, waits, arrivedAt) };
@@ -738,7 +853,7 @@ class CronService {
    * entry is only taken out of the queue once it is certain to start, so a slot
    * lost while the record is read leaves it exactly where it was in line.
    */
-  async drainQueue() {
+  private async drainQueue(): Promise<number> {
     if (this.draining) return 0;
     this.draining = true;
     let started = 0;
@@ -809,7 +924,7 @@ class CronService {
    * unscheduled. A run finishing now triggers one of these too, which is an
    * arbitrary moment and can land inside an API-driven one.
    */
-  reload() {
+  public reload(): Promise<number> {
     this.reloading = (this.reloading ?? Promise.resolve())
       // One rebuild failing must not poison the queue behind it.
       .catch(() => {})
@@ -817,7 +932,7 @@ class CronService {
     return this.reloading;
   }
 
-  async rebuild() {
+  private async rebuild(): Promise<number> {
     for (const job of this.jobs.values()) job.stop();
     this.jobs.clear();
     this.armedCrons = 0;
@@ -832,8 +947,8 @@ class CronService {
         continue;
       }
       const job = new Cron(String(cron.cron).trim(), { name: cron.id }, () => {
-        this.trigger(cron.id, 'schedule').catch((err) =>
-          console.error(`[cron] "${cron.name}" failed to start: ${err.message}`),
+        this.trigger(cron.id, 'schedule').catch((err: unknown) =>
+          console.error(`[cron] "${cron.name}" failed to start: ${err instanceof Error ? err.message : String(err)}`),
         );
       });
       this.jobs.set(cron.id, job);
@@ -861,7 +976,7 @@ class CronService {
       // Left to a microtask so this rebuild — and the pause or boot step that
       // asked for it — finishes before anything starts writing logs.
       queueMicrotask(() => {
-        this.runOverdue().catch((err) => console.error(`[cron] overdue catch-up failed: ${err.message}`));
+        this.runOverdue().catch((err: unknown) => console.error(`[cron] overdue catch-up failed: ${err instanceof Error ? err.message : String(err)}`));
       });
     }
     return this.jobs.size;
@@ -876,8 +991,8 @@ class CronService {
    * on the spot — which is what makes a missed trigger survive a restart, and
    * what makes a pause that swallowed a trigger run it when the pause lifts.
    */
-  armExecutions(executions) {
-    const overdue = [];
+  private armExecutions(executions: Execution[]): Execution[] {
+    const overdue: Execution[] = [];
     for (const execution of executions) {
       if (!execution.isActive || execution.status !== 'scheduled') continue;
       const at = Date.parse(execution.scheduledAt ?? '');
@@ -890,8 +1005,8 @@ class CronService {
         continue;
       }
       const job = new Cron(new Date(at), { name: execution.id }, () => {
-        this.trigger(execution.id, 'schedule').catch((err) =>
-          console.error(`[cron] one-time "${execution.name}" failed to start: ${err.message}`),
+        this.trigger(execution.id, 'schedule').catch((err: unknown) =>
+          console.error(`[cron] one-time "${execution.name}" failed to start: ${err instanceof Error ? err.message : String(err)}`),
         );
       });
       this.jobs.set(execution.id, job);
@@ -919,10 +1034,10 @@ class CronService {
    * Every run still goes through `trigger`, so the pause, the usage delay and
    * the already-running check all apply.
    */
-  async runOverdue() {
+  private async runOverdue(): Promise<number> {
     if (this.catchingUp) return 0;
     this.catchingUp = true;
-    const attempted = new Set();
+    const attempted = new Set<string>();
     let ran = 0;
     try {
       for (;;) {
@@ -938,12 +1053,12 @@ class CronService {
         });
         if (!due.length) return ran;
         // Oldest miss first: the list comes back newest first.
-        const execution = due.at(-1);
+        const execution = due.at(-1)!;
         attempted.add(execution.id);
 
-        const late = formatRuntime(now - Date.parse(execution.scheduledAt));
-        const result = await this.trigger(execution.id, 'missed').catch((err) => {
-          console.error(`[cron] one-time "${execution.name}" catch-up failed: ${err.message}`);
+        const late = formatRuntime(now - Date.parse(execution.scheduledAt!));
+        const result = await this.trigger(execution.id, 'missed').catch((err: unknown) => {
+          console.error(`[cron] one-time "${execution.name}" catch-up failed: ${err instanceof Error ? err.message : String(err)}`);
           return null;
         });
         // Announced only once something is actually going. A catch-up parked on
@@ -976,7 +1091,7 @@ class CronService {
    * something destructive because the machine rebooted is worse than leaving it
    * for the Run now button. Called once at boot, before anything is armed.
    */
-  async reconcileInterrupted() {
+  public async reconcileInterrupted(): Promise<number> {
     const stranded = (await listExecutions()).filter((execution) => execution.status === 'running');
     for (const execution of stranded) {
       console.warn(`[cron] one-time "${execution.name}" was running when the node stopped; marking it interrupted`);
@@ -987,7 +1102,7 @@ class CronService {
         // a row reading "interrupted" beside "last ran: never" is a puzzle.
         lastRunAt: execution.firedAt ?? execution.lastRunAt ?? null,
         stoppedBy: 'node restart',
-      }).catch((err) => console.error(`[cron] could not close "${execution.name}": ${err.message}`));
+      }).catch((err: unknown) => console.error(`[cron] could not close "${execution.name}": ${err instanceof Error ? err.message : String(err)}`));
       emit('run:finished', {
         cronId: execution.id,
         cronName: execution.name,
@@ -1001,7 +1116,7 @@ class CronService {
     return stranded.length;
   }
 
-  nextRun(cronId) {
+  public nextRun(cronId: string): string | null {
     const job = this.jobs.get(cronId);
     const next = job?.nextRun();
     return next ? next.toISOString() : null;
@@ -1015,7 +1130,7 @@ class CronService {
    * the job waits on that is spent and will not have cleared by then, and the
    * jobs expected to fill every concurrent slot at that moment.
    */
-  delayOutlook(job, at) {
+  public delayOutlook(job: JobBase, at: string): DelayOutlook | null {
     const due = Math.max(Date.parse(at), Date.now());
     if (!Number.isFinite(due)) return null;
     const usage = this.usageOutlook(job, due);
@@ -1028,7 +1143,7 @@ class CronService {
    * spent at `due`. Never a lookup of its own, for the reason `blockersFor`
    * gives, and a reset only frees the run once a usage check has seen it.
    */
-  usageOutlook(job, due) {
+  private usageOutlook(job: JobBase, due: number): UsageBlocker[] {
     const delay = normalizeUsageDelay(job.usageDelay);
     if (!hasUsageDelay(delay)) return [];
     return usageBlockers(usageMonitor.reading(), delay).filter(
@@ -1046,15 +1161,15 @@ class CronService {
    * with no finished run to average is taken to still be going, since nothing
    * says it will be done.
    */
-  concurrencyOutlook(jobId, due) {
+  private concurrencyOutlook(jobId: string, due: number): DelayOutlook['concurrency'] {
     const limit = this.concurrencyLimit;
     if (limit <= 0) return null;
-    const busy = new Map();
+    const busy = new Map<string, BusyJob>();
 
     for (const run of this.running.values()) {
       if (run.cronId === jobId) continue;
-      const hasAverage = Number.isFinite(run.averageRuntimeMs);
-      const endsAt = hasAverage ? Date.parse(run.startedAt) + run.averageRuntimeMs : Infinity;
+      const hasAverage = isFiniteNumber(run.averageRuntimeMs);
+      const endsAt = hasAverage ? Date.parse(run.startedAt) + (run.averageRuntimeMs as number) : Infinity;
       if (endsAt <= due) continue;
       busy.set(run.cronId, {
         name: run.cronName,
@@ -1069,7 +1184,7 @@ class CronService {
       const startsAt = slots[position] ? Date.parse(slots[position]) : null;
       const average = this.profiles.get(entry.cronId)?.averageRuntimeMs;
       // Only one expected to have started and finished by then gives its slot back.
-      if (startsAt !== null && Number.isFinite(average) && startsAt + average <= due) return;
+      if (startsAt !== null && isFiniteNumber(average) && startsAt + average <= due) return;
       busy.set(entry.cronId, { name: entry.cronName, state: 'queued' });
     });
 
@@ -1077,7 +1192,7 @@ class CronService {
     for (const [id, schedule] of this.jobs) {
       if (id === jobId || busy.has(id)) continue;
       const profile = this.profiles.get(id);
-      const reach = Number.isFinite(profile?.averageRuntimeMs) ? profile.averageRuntimeMs : SAME_MOMENT_MS;
+      const reach = isFiniteNumber(profile?.averageRuntimeMs) ? profile.averageRuntimeMs : SAME_MOMENT_MS;
       // croner answers the first run strictly after the date it is given.
       const start = schedule.nextRun(new Date(Math.max(now, due - reach) - 1));
       if (!start || start.getTime() > due) continue;
@@ -1085,18 +1200,18 @@ class CronService {
         name: profile?.name ?? id,
         state: 'scheduled',
         startsAt: start.toISOString(),
-        averageRuntimeSeconds: Number.isFinite(profile?.averageRuntimeMs) ? profile.averageRuntimeMs / 1000 : null,
+        averageRuntimeSeconds: isFiniteNumber(profile?.averageRuntimeMs) ? profile.averageRuntimeMs / 1000 : null,
       });
     }
 
     return busy.size >= limit ? { limit, busy: [...busy.values()] } : null;
   }
 
-  isRunning(cronId) {
+  public isRunning(cronId: string): boolean {
     return this.running.has(cronId);
   }
 
-  currentRun(cronId) {
+  public currentRun(cronId: string): RunInfo | null {
     return this.running.get(cronId) ?? null;
   }
 
@@ -1106,17 +1221,17 @@ class CronService {
    * Read by the machine-stat alerts: an alert that says the CPU is pinned is
    * half an answer, and this is the other half.
    */
-  runningCrons() {
+  public runningCrons(): Array<{ name: string; kind: JobKind; startedAt: string }> {
     return [...this.running.values()].map((run) => ({ name: run.cronName, kind: run.kind, startedAt: run.startedAt }));
   }
 
   /** True while a specific log file is being written by a live run. */
-  isRunningLog(cronId, file) {
+  public isRunningLog(cronId: string, file: string): boolean {
     return this.running.get(cronId)?.logFile === file;
   }
 
   /** Reads the job fresh from disk, then runs it unless it is already in flight. */
-  async trigger(cronId, source = 'manual') {
+  public async trigger(cronId: string, source: RunSource = 'manual'): Promise<TriggerResult | null> {
     if (this.starting.has(cronId)) {
       console.warn(`[cron] ${cronId} is already starting; dropping the ${source} trigger`);
       return null;
@@ -1130,7 +1245,7 @@ class CronService {
   }
 
   /** The body of `trigger`, run once per id at a time. */
-  async startTrigger(cronId, source) {
+  private async startTrigger(cronId: string, source: RunSource): Promise<TriggerResult | null> {
     const cron = await findJob(cronId);
     if (!cron) throw new Error('cron not found');
     // A one-time execution fires once. Its timer can outlive its run — Run now
@@ -1183,7 +1298,7 @@ class CronService {
     // arriving while the first waits is lost rather than stacked behind it, so
     // a cron that sits out a long reset does not come back and fire a backlog.
     if (this.delayed.has(cronId)) {
-      const waiting = this.delayed.get(cronId);
+      const waiting = this.delayed.get(cronId)!;
       const reason =
         waiting.hold === 'concurrency'
           ? `a trigger is already queued behind the ${waiting.limit} job limit`
@@ -1206,7 +1321,7 @@ class CronService {
    * Kills the in-flight run for a cron. The schedule is left alone, so an active
    * cron stays armed and fires again at its next trigger.
    */
-  async stop(cronId, stoppedBy = 'user') {
+  public async stop(cronId: string, stoppedBy = 'user'): Promise<RunInfo | null> {
     const run = this.running.get(cronId);
     const handle = this.handles.get(cronId);
     if (!run || !handle) return null;
@@ -1218,16 +1333,16 @@ class CronService {
     // so too — the log is pruned eventually, the record is what the list reads.
     handle.stream.write(`\n--- stop requested by ${stoppedBy} at ${new Date().toISOString()} ---\n`);
     if (run.kind === 'execution') {
-      await patchExecution(cronId, { stoppedBy }).catch((err) =>
-        console.error(`[cron] could not record the abort of "${run.cronName}": ${err.message}`),
+      await patchExecution(cronId, { stoppedBy }).catch((err: unknown) =>
+        console.error(`[cron] could not record the abort of "${run.cronName}": ${err instanceof Error ? err.message : String(err)}`),
       );
     }
 
     // claude may have children of its own, so signal the whole process group.
     const { pid } = handle.child;
-    const signal = (sig) => {
+    const signal = (sig: NodeJS.Signals): void => {
       try {
-        process.kill(-pid, sig);
+        process.kill(-Number(pid), sig);
       } catch {
         try {
           handle.child.kill(sig);
@@ -1257,7 +1372,7 @@ class CronService {
    * usage limit, a full set of slots, or both in turn — and is written into the
    * log header so the run says why it started when it did.
    */
-  async execute(cron, source, waits = []) {
+  private async execute(cron: Job, source: RunSource, waits: RunWait[] = []): Promise<RunInfo> {
     const kind = cron.kind ?? 'cron';
     const { get, patch } = KINDS[kind];
     const startedAt = new Date();
@@ -1275,7 +1390,7 @@ class CronService {
     // knows which one to remove.
     const worktreeArgs = cron.useWorktree ? ['--worktree', cron.id] : [];
 
-    const run = {
+    const run: RunInfo = {
       runId: randomUUID(),
       cronId: cron.id,
       cronName: cron.name,
@@ -1296,13 +1411,13 @@ class CronService {
     this.running.set(cron.id, run);
     // Settled by `finish`, once the log is closed and the record written. What
     // the overdue catch-up waits on so it starts one run at a time.
-    let settle;
-    this.completions.set(cron.id, new Promise((resolve) => {
+    let settle: (status: RunStatus) => void;
+    this.completions.set(cron.id, new Promise<RunStatus>((resolve) => {
       settle = resolve;
     }));
     if (kind === 'execution') {
-      await patch(cron.id, { status: 'running', firedAt: startedAt.toISOString(), stoppedBy: null }).catch((err) =>
-        console.error(`[cron] could not mark "${cron.name}" running: ${err.message}`),
+      await patch(cron.id, { status: 'running', firedAt: startedAt.toISOString(), stoppedBy: null }).catch((err: unknown) =>
+        console.error(`[cron] could not mark "${cron.name}" running: ${err instanceof Error ? err.message : String(err)}`),
       );
     }
 
@@ -1311,25 +1426,25 @@ class CronService {
     // is written; a run that fails before then keeps this.
     let worktreeIncludeNote = cron.useWorktree ? 'not written' : 'not written: Use worktree is off';
     // The file as written, shown in full above the prompt. Null leaves the section out.
-    let worktreeIncludeText = null;
+    let worktreeIncludeText: string | null = null;
     // What the prompt was told about the worktree, shown above the prompt. Null leaves it out.
-    let worktreeNoticeText = null;
+    let worktreeNoticeText: string | null = null;
 
     // Written once the child exists, so the header can carry its pid.
-    const writeHeader = (pid) => {
+    const writeHeader = (pid: number | null | undefined): void => {
       stream.write(
         [
           `=== ${cron.name} ===`,
           `started    ${startedAt.toISOString()}`,
           `pid        ${pid ?? '(not started)'}`,
           `trigger    ${source}`,
-          kind === 'execution' ? `scheduled  ${cron.scheduledAt} (one-time)` : `schedule   ${cron.cron}`,
+          cron.kind === 'execution' ? `scheduled  ${cron.scheduledAt} (one-time)` : `schedule   ${cron.cron}`,
           `directory  ${cwd}`,
           `model      ${cron.model?.trim() || '(CLI default)'}`,
           `effort     ${cron.effort?.trim() || '(CLI default)'}`,
           ...waits.map(
             (wait) =>
-              `${(wait.kind === 'usage' ? 'held' : 'queued').padEnd(11)}waited ${formatRuntime(startedAt - new Date(wait.since))} for ${wait.detail}`,
+              `${(wait.kind === 'usage' ? 'held' : 'queued').padEnd(11)}waited ${formatRuntime(startedAt.getTime() - new Date(wait.since).getTime())} for ${wait.detail}`,
           ),
           `Use worktree      ${Boolean(cron.useWorktree)}`,
           `Cleanup worktree  ${Boolean(cron.cleanupWorktree)}`,
@@ -1346,17 +1461,17 @@ class CronService {
     };
 
     // Filled in from the CLI's final result event, when the run gets that far.
-    let resultEvent = null;
+    let resultEvent: CliEvent | null = null;
 
-    const finish = async (status, detail) => {
+    const finish = async (status: RunStatus, detail: string): Promise<void> => {
       const endedAt = new Date();
-      const seconds = ((endedAt - startedAt) / 1000).toFixed(1);
+      const seconds = ((endedAt.getTime() - startedAt.getTime()) / 1000).toFixed(1);
       // Every way a run ends comes through here once the child has exited, so
       // nothing is still writing in the folder being removed. The run keeps its
       // slot until this is done, so its next trigger cannot race the removal.
       const cleanupLine = `Worktree cleanup: ${await cleanUpWorktree(cron, cwd)}`;
       stream.write(resultEvent ? statsBlock(resultEvent, [cleanupLine]) : `\n${cleanupLine}\n`);
-      await new Promise((resolve) => {
+      await new Promise<void>((resolve) => {
         stream.end(`\n--- ${status} after ${seconds}s${detail ? ` (${detail})` : ''} ---\n`, resolve);
       });
       const handle = this.handles.get(cron.id);
@@ -1365,16 +1480,16 @@ class CronService {
       this.running.delete(cron.id);
       // A slot has just come free. Whatever is queued goes now rather than
       // waiting on the rest of this run's bookkeeping.
-      this.drainQueue().catch((err) => console.error(`[cron] queue drain failed: ${err.message}`));
+      this.drainQueue().catch((err: unknown) => console.error(`[cron] queue drain failed: ${err instanceof Error ? err.message : String(err)}`));
       // Read fresh rather than trusting the copy this run started with: a long
       // run can outlive the page visit that initialized these counters.
-      const current = (await get(cron.id).catch(() => null)) ?? cron;
+      const current: JobBase & { status?: ExecutionStatus } = (await get(cron.id).catch(() => null)) ?? cron;
       const lifetime = await countRun(current, {
         status,
         seconds: Number(seconds),
         costUsd: resultEvent?.total_cost_usd,
-      }).catch((err) => {
-        console.error(`[cron] could not total lifetime stats: ${err.message}`);
+      }).catch((err: unknown) => {
+        console.error(`[cron] could not total lifetime stats: ${err instanceof Error ? err.message : String(err)}`);
         return {};
       });
       // A one-time execution has now had its one run. It stays in the list as
@@ -1391,7 +1506,7 @@ class CronService {
           ? { status: 'done', stoppedBy: run.stopping ? run.stoppedBy : null }
           : {}),
         ...lifetime,
-      }).catch((err) => console.error(`[cron] could not record last run: ${err.message}`));
+      }).catch((err: unknown) => console.error(`[cron] could not record last run: ${err instanceof Error ? err.message : String(err)}`));
       console.log(`[cron] "${cron.name}" ${status} in ${seconds}s -> ${file}`);
       emit('run:finished', { cronId: cron.id, cronName: cron.name, kind, logFile: file, status, seconds: Number(seconds) });
       // The execution has had its run, so the one-shot timer it was armed with
@@ -1399,7 +1514,7 @@ class CronService {
       // counted as scheduled that the guard above would only refuse later — and
       // to arm the new date if the record was rescheduled while it ran.
       if (kind === 'execution') {
-        await this.reload().catch((err) => console.error(`[cron] reload after run failed: ${err.message}`));
+        await this.reload().catch((err: unknown) => console.error(`[cron] reload after run failed: ${err instanceof Error ? err.message : String(err)}`));
       }
       this.completions.delete(cron.id);
       settle(status);
@@ -1423,20 +1538,20 @@ class CronService {
     if (cron.useWorktree) {
       const { defaultWorktreeInclude } = jobSettings();
       worktreeIncludeNote = await writeWorktreeInclude(cwd, String(defaultWorktreeInclude ?? ''))
-        .then((result) => {
+        .then((result: WorktreeIncludeOutcome) => {
           if (!result.written) return `not written: ${result.skipped}`;
           worktreeIncludeText = result.text;
           return `wrote ${result.written}`;
         })
-        .catch((err) => {
-          console.error(`[cron] could not write ${WORKTREE_INCLUDE_FILE} for "${cron.name}": ${err.message}`);
-          emit('worktree:include-failed', { cronId: cron.id, cronName: cron.name, kind, error: oneLine(err.message) });
-          return `error: ${err.message}`;
+        .catch((err: unknown) => {
+          console.error(`[cron] could not write ${WORKTREE_INCLUDE_FILE} for "${cron.name}": ${err instanceof Error ? err.message : String(err)}`);
+          emit('worktree:include-failed', { cronId: cron.id, cronName: cron.name, kind, error: oneLine(err instanceof Error ? err.message : String(err)) });
+          return `error: ${err instanceof Error ? err.message : String(err)}`;
         });
       worktreeNoticeText = worktreeNotice(cron, await pathInRepo(cwd));
     }
 
-    let child;
+    let child: ChildProcessByStdio<null, Readable, Readable>;
     try {
       child = spawn(CLAUDE_BIN, ['-p', promptFor(cron, worktreeNoticeText), ...CLAUDE_ARGS, ...modelArgs, ...effortArgs, ...worktreeArgs], {
         cwd,
@@ -1447,13 +1562,13 @@ class CronService {
       });
     } catch (err) {
       writeHeader(null);
-      stream.write(`could not start ${CLAUDE_BIN}: ${err.message}\n`);
+      stream.write(`could not start ${CLAUDE_BIN}: ${err instanceof Error ? err.message : String(err)}\n`);
       emit('run:started', run);
       await finish('failed', 'spawn error');
       return run;
     }
 
-    run.pid = child.pid;
+    run.pid = child.pid as number | null;
     writeHeader(child.pid);
     this.handles.set(cron.id, { child, stream, killTimer: null });
 
@@ -1464,18 +1579,18 @@ class CronService {
     let textTail = ''; // last two characters of assistant text, to size the break before the next block
     let textBlockOpened = false;
 
-    const writeText = (text) => {
+    const writeText = (text: string): void => {
       sawText = true;
       textTail = (textTail + text).slice(-2);
       stream.write(text);
     };
 
-    const handleLine = (line) => {
+    const handleLine = (line: string): void => {
       const trimmed = line.trim();
       if (!trimmed) return;
-      let event;
+      let event: CliEvent;
       try {
-        event = JSON.parse(trimmed);
+        event = JSON.parse(trimmed) as CliEvent;
       } catch {
         stream.write(`${line}\n`); // not JSON (a CLI warning); keep it verbatim
         return;
@@ -1504,7 +1619,7 @@ class CronService {
     };
 
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
+    child.stdout.on('data', (chunk: string) => {
       pending += chunk;
       const lines = pending.split('\n');
       pending = lines.pop() ?? ''; // hold the incomplete tail for the next chunk
@@ -1528,7 +1643,7 @@ class CronService {
         : signal
           ? `signal ${signal}`
           : `exit code ${code}`;
-      finish(status, detail).catch((err) => console.error(`[cron] finish failed: ${err.message}`));
+      finish(status, detail).catch((err: unknown) => console.error(`[cron] finish failed: ${err instanceof Error ? err.message : String(err)}`));
     });
 
     console.log(`[cron] "${cron.name}" started (pid ${child.pid}, ${source}) -> ${file}`);

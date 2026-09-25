@@ -31,7 +31,7 @@ export const NODE_LOGS_DIR = path.join(NODE_HOME, 'logs');
  * wherever the server happened to be started — that is what a user typing in the
  * Working Directory field means, and it keeps suggestions honest.
  */
-export function resolveUserPath(input) {
+export function resolveUserPath(input: unknown): string | null {
   const raw = String(input ?? '').trim();
   if (!raw) return null;
   if (raw === '~') return os.homedir();
@@ -40,7 +40,7 @@ export function resolveUserPath(input) {
   return path.resolve(path.join(os.homedir(), raw));
 }
 
-export async function ensureDirs() {
+export async function ensureDirs(): Promise<void> {
   await fs.mkdir(CRONS_DIR, { recursive: true });
   await fs.mkdir(EXECUTIONS_DIR, { recursive: true });
   await fs.mkdir(LOGS_DIR, { recursive: true });

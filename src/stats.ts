@@ -1,6 +1,28 @@
 import fsp from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { listLogs, logDir, patchCron } from './store.js';
+import type { JobBase, LifetimeStats } from './types.js';
+
+export interface LogStats {
+  status: string | null;
+  seconds: number | null;
+  costUsd: number | null;
+}
+
+export interface RunOutcome {
+  status: string | null;
+  seconds?: number | null;
+  costUsd?: number | null;
+}
+
+export interface LifetimeSummary {
+  runs: number;
+  costUsd: number;
+  runtimeSeconds: number;
+  averageCostUsd: number | null;
+  averageRuntimeSeconds: number | null;
+}
 
 /**
  * Lifetime totals per cron: how many runs it has completed, what they cost, and
@@ -12,7 +34,7 @@ import { listLogs, logDir, patchCron } from './store.js';
  * a floor rather than a true lifetime figure — anything already pruned is gone —
  * and every run after it is counted exactly once, as it finishes.
  */
-export const LIFETIME_FIELDS = ['lifetimeRuns', 'lifetimeCostUsd', 'lifetimeRuntimeSeconds'];
+export const LIFETIME_FIELDS: Array<keyof LifetimeStats> = ['lifetimeRuns', 'lifetimeCostUsd', 'lifetimeRuntimeSeconds'];
 
 /**
  * A finished log keeps its statistics block and its footer at the very end, so
@@ -22,16 +44,18 @@ export const LIFETIME_FIELDS = ['lifetimeRuns', 'lifetimeCostUsd', 'lifetimeRunt
 const TAIL_BYTES = 4096;
 
 /** Money to the cent-fraction the CLI reports; seconds to a tenth, as logged. */
-const round4 = (value) => Math.round(value * 1e4) / 1e4;
-const round1 = (value) => Math.round(value * 10) / 10;
+const round4 = (value: number): number => Math.round(value * 1e4) / 1e4;
+const round1 = (value: number): number => Math.round(value * 10) / 10;
 
-export function hasLifetimeStats(cron) {
+export function hasLifetimeStats<T extends LifetimeStats>(
+  cron: T | null | undefined,
+): cron is T & Required<LifetimeStats> {
   return LIFETIME_FIELDS.every((field) => Number.isFinite(cron?.[field]));
 }
 
 /** The last bytes of a file, or null when it cannot be read. */
-async function readTail(file) {
-  let handle;
+async function readTail(file: string): Promise<string | null> {
+  let handle: FileHandle | undefined;
   try {
     handle = await fsp.open(file, 'r');
     const { size } = await handle.stat();
@@ -55,7 +79,7 @@ async function readTail(file) {
  * A log with no footer belongs to a run that has not finished — it is not a
  * completed execution, and `status` is null to say so.
  */
-export function readLogStats(tail) {
+export function readLogStats(tail: string | null | undefined): LogStats {
   const outcome = [...String(tail ?? '').matchAll(/^--- (\w+) after ([\d.]+)s/gm)].at(-1);
   const cost = [...String(tail ?? '').matchAll(/^Cost: \$([\d.]+)\s*$/gm)].at(-1);
   return {
@@ -75,7 +99,7 @@ export function readLogStats(tail) {
  * thing. A run still being written has no footer and is skipped: it is counted
  * by its own finish instead, which is what keeps it from landing twice.
  */
-export async function backfillStats(cronId) {
+export async function backfillStats(cronId: string): Promise<Required<LifetimeStats>> {
   const totals = { lifetimeRuns: 0, lifetimeCostUsd: 0, lifetimeRuntimeSeconds: 0 };
   for (const log of await listLogs(cronId)) {
     const stats = readLogStats(await readTail(path.join(logDir(cronId), log.file)));
@@ -97,13 +121,16 @@ export async function backfillStats(cronId) {
  * left to add. Otherwise a successful run adds itself, and a failed or stopped
  * one changes nothing.
  */
-export async function countRun(cron, { status, seconds, costUsd }) {
+export async function countRun<T extends LifetimeStats & Pick<JobBase, 'id'>>(
+  cron: T,
+  { status, seconds, costUsd }: RunOutcome,
+): Promise<LifetimeStats> {
   if (!hasLifetimeStats(cron)) return backfillStats(cron.id);
   if (status !== 'succeeded') return {};
   return {
     lifetimeRuns: cron.lifetimeRuns + 1,
-    lifetimeCostUsd: round4(cron.lifetimeCostUsd + (Number.isFinite(costUsd) ? costUsd : 0)),
-    lifetimeRuntimeSeconds: round1(cron.lifetimeRuntimeSeconds + (Number.isFinite(seconds) ? seconds : 0)),
+    lifetimeCostUsd: round4(cron.lifetimeCostUsd + (Number.isFinite(costUsd) ? (costUsd as number) : 0)),
+    lifetimeRuntimeSeconds: round1(cron.lifetimeRuntimeSeconds + (Number.isFinite(seconds) ? (seconds as number) : 0)),
   };
 }
 
@@ -117,12 +144,15 @@ export async function countRun(cron, { status, seconds, costUsd }) {
  * completed runs, and are null when there have been none — a cron that has never
  * finished a run has no average cost, and 0 would be a different claim.
  */
-export async function lifetimeStats(cron, patch = patchCron) {
-  let totals = cron;
+export async function lifetimeStats(
+  cron: LifetimeStats & Pick<JobBase, 'id' | 'name'>,
+  patch: (id: string, totals: LifetimeStats) => Promise<unknown> = patchCron,
+): Promise<LifetimeSummary> {
+  let totals = cron as Required<LifetimeStats>;
   if (!hasLifetimeStats(cron)) {
     totals = await backfillStats(cron.id);
     await patch(cron.id, totals).catch((err) =>
-      console.error(`[stats] could not record lifetime totals for "${cron.name}": ${err.message}`),
+      console.error(`[stats] could not record lifetime totals for "${cron.name}": ${(err as Error).message}`),
     );
   }
   const runs = totals.lifetimeRuns;

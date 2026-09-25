@@ -1,8 +1,82 @@
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { emit } from './events.js';
 import { ROOT } from './paths.js';
+import type { JobKind, SystemSample } from './types.js';
+
+export type SystemMetricId = 'cpu' | 'disk' | 'io' | 'memory';
+
+export interface SystemMetric {
+  id: SystemMetricId;
+  label: string;
+  title: string;
+  unit: string;
+  kind: 'percent' | 'rate';
+  warning?: number;
+  critical?: number;
+  minScale?: number;
+  detail: string;
+}
+
+export interface SystemAlertReading {
+  value: number;
+  breached: boolean;
+  cleared: boolean;
+  summary: string;
+}
+
+export interface RunningJobSummary {
+  name: string;
+  kind: JobKind;
+  startedAt: string;
+}
+
+interface MemoryReading {
+  usedBytes: number;
+  totalBytes: number;
+}
+
+interface DiskUsage {
+  usedBytes: number;
+  freeBytes: number;
+  totalBytes: number;
+}
+
+interface IoReading {
+  value: number | null;
+  detail: { transfersPerSecond: number } | null;
+  note: string | null;
+}
+
+export interface SystemDetail {
+  cpu?: { cores: number; loadAverage: number };
+  memory?: MemoryReading | null;
+  io?: { transfersPerSecond: number } | null;
+  disk?: (DiskUsage & { path: string }) | null;
+}
+
+export type SystemNotes = Partial<Record<SystemMetricId, string | null>>;
+
+export type SystemState = {
+  enabled: boolean;
+  intervalMs: number;
+  windowMs: number;
+  metrics: SystemMetric[];
+  host: {
+    platform: NodeJS.Platform;
+    hostname: string;
+    cores: number;
+    cpuModel: string | null;
+    totalMemoryBytes: number;
+    storagePath: string;
+  };
+  detail: SystemDetail;
+  notes: SystemNotes;
+  latest: SystemSample | null;
+  samples: SystemSample[];
+};
 
 /**
  * Machine stats for the header: how busy this computer is while it runs your
@@ -31,7 +105,7 @@ export const HISTORY_WINDOW_MS = 15 * 60 * 1000;
  * never less than `minScale` so an idle disk does not draw a full bar off a
  * 0.2 MB/s blip.
  */
-export const SYSTEM_METRICS = [
+export const SYSTEM_METRICS: SystemMetric[] = [
   {
     id: 'cpu',
     label: 'CPU',
@@ -91,21 +165,21 @@ export const SYSTEM_METRICS = [
 export const ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 
 /** The mean of one metric over the last `ms`, or null without a full window. */
-function meanOver(samples, id, ms, intervalMs) {
+function meanOver(samples: SystemSample[], id: SystemMetricId, ms: number, intervalMs: number): number | null {
   const needed = Math.max(1, Math.round(ms / intervalMs));
   const recent = samples.slice(-needed);
   if (recent.length < needed) return null;
-  const values = recent.map((sample) => sample[id]).filter((value) => Number.isFinite(value));
+  const values = recent.map((sample) => sample[id]).filter((value): value is number => Number.isFinite(value));
   // A gap in the window is not a low reading; it is no reading, and no verdict.
   return values.length === needed ? values.reduce((sum, value) => sum + value, 0) / needed : null;
 }
 
 /** The middle value, which a burst cannot drag the way it drags a mean. */
-function median(values) {
+function median(values: number[]): number | null {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  return sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
 export const SYSTEM_ALERTS = [
@@ -115,7 +189,7 @@ export const SYSTEM_ALERTS = [
     windowMs: 60 * 1000,
     threshold: 80,
     clear: 70,
-    read(samples, intervalMs) {
+    read(samples: SystemSample[], intervalMs: number): SystemAlertReading | null {
       const value = meanOver(samples, 'cpu', this.windowMs, intervalMs);
       if (value === null) return null;
       return {
@@ -132,7 +206,7 @@ export const SYSTEM_ALERTS = [
     windowMs: 60 * 1000,
     threshold: 80,
     clear: 72,
-    read(samples, intervalMs) {
+    read(samples: SystemSample[], intervalMs: number): SystemAlertReading | null {
       const value = meanOver(samples, 'memory', this.windowMs, intervalMs);
       if (value === null) return null;
       return {
@@ -163,13 +237,13 @@ export const SYSTEM_ALERTS = [
     floorMbPerSecond: 50,
     /** Five minutes of history before there is any "usual" to compare against. */
     baselineSamples: 60,
-    read(samples, intervalMs) {
+    read(samples: SystemSample[], intervalMs: number): SystemAlertReading | null {
       const value = meanOver(samples, 'io', this.windowMs, intervalMs);
       if (value === null) return null;
       const windowCount = Math.max(1, Math.round(this.windowMs / intervalMs));
-      const older = samples.slice(0, -windowCount).map((sample) => sample.io).filter((rate) => Number.isFinite(rate));
+      const older = samples.slice(0, -windowCount).map((sample) => sample.io).filter((rate): rate is number => Number.isFinite(rate));
       if (older.length < this.baselineSamples) return null;
-      const usual = median(older);
+      const usual = median(older)!;
       const bar = Math.max(this.floorMbPerSecond, usual * this.multiple);
       return {
         value,
@@ -189,9 +263,9 @@ export const SYSTEM_ALERTS = [
     label: 'Low disk space',
     threshold: 80,
     clear: 75,
-    read(samples) {
+    read(samples: SystemSample[]): SystemAlertReading | null {
       const value = samples.at(-1)?.disk;
-      if (!Number.isFinite(value)) return null;
+      if (typeof value !== 'number' || !Number.isFinite(value)) return null;
       return {
         value,
         breached: value >= this.threshold,
@@ -202,11 +276,11 @@ export const SYSTEM_ALERTS = [
   },
 ];
 
-const round1 = (value) => Math.round(value * 10) / 10;
-const round2 = (value) => Math.round(value * 100) / 100;
+const round1 = (value: number): number => Math.round(value * 10) / 10;
+const round2 = (value: number): number => Math.round(value * 100) / 100;
 
 /** execFile as a promise that answers `null` instead of throwing. */
-function run(command, args = [], timeout = 5000) {
+function run(command: string, args: string[] = [], timeout = 5000): Promise<string | null> {
   return new Promise((resolve) => {
     execFile(command, args, { timeout, maxBuffer: 1 << 20 }, (err, stdout) => resolve(err ? null : String(stdout)));
   });
@@ -221,7 +295,7 @@ function run(command, args = [], timeout = 5000) {
  * is cumulative, so a percentage only exists as the difference between two of
  * these — which is why the first sample after startup reports no CPU figure.
  */
-function cpuTotals() {
+function cpuTotals(): { idle: number; total: number } | null {
   let idle = 0;
   let total = 0;
   for (const cpu of os.cpus()) {
@@ -243,11 +317,11 @@ function cpuTotals() {
  * 95% that Activity Monitor calls 60%. This counts what Activity Monitor counts
  * — active, wired and compressed pages — which is the figure a person recognises.
  */
-async function macMemory() {
+async function macMemory(): Promise<MemoryReading | null> {
   const out = await run('vm_stat');
   if (!out) return null;
   const pageSize = Number(/page size of (\d+) bytes/.exec(out)?.[1]) || 4096;
-  const pages = (label) => {
+  const pages = (label: string): number | null => {
     const match = new RegExp(`^${label}:\\s+(\\d+)\\.`, 'm').exec(out);
     return match ? Number(match[1]) : null;
   };
@@ -259,10 +333,10 @@ async function macMemory() {
 }
 
 /** Memory in use on Linux, from MemAvailable — the kernel's own answer. */
-async function linuxMemory() {
+async function linuxMemory(): Promise<MemoryReading | null> {
   const text = await fsp.readFile('/proc/meminfo', 'utf8').catch(() => null);
   if (!text) return null;
-  const bytes = (label) => {
+  const bytes = (label: string): number | null => {
     const match = new RegExp(`^${label}:\\s+(\\d+) kB`, 'm').exec(text);
     return match ? Number(match[1]) * 1024 : null;
   };
@@ -272,7 +346,7 @@ async function linuxMemory() {
   return { usedBytes: total - available, totalBytes: total };
 }
 
-async function readMemory() {
+async function readMemory(): Promise<MemoryReading> {
   const platform = process.platform === 'darwin' ? await macMemory() : process.platform === 'linux' ? await linuxMemory() : null;
   if (platform) return platform;
   // Every platform can answer this much, even if it answers it coarsely.
@@ -289,10 +363,10 @@ async function readMemory() {
  * Used counts the whole filesystem, not just this user's share of it, which is
  * what "how full is the disk" means.
  */
-async function readDiskUsage(target = ROOT) {
+async function readDiskUsage(target: string = ROOT): Promise<DiskUsage | null> {
   if (typeof fsp.statfs === 'function') {
     const stats = await fsp.statfs(target).catch(() => null);
-    if (stats?.blocks > 0) {
+    if (stats && stats.blocks > 0) {
       return {
         usedBytes: (stats.blocks - stats.bfree) * stats.bsize,
         freeBytes: stats.bavail * stats.bsize,
@@ -326,7 +400,17 @@ async function readDiskUsage(target = ROOT) {
  * the write of its next line finds the pipe closed.
  */
 class IostatReader {
-  constructor(intervalMs) {
+  public seconds: number;
+  public child: ChildProcess | null;
+  public buffer: string;
+  public latest: { mbPerSecond: number; transfers: number; at: number } | null;
+  public reason: string | null;
+  public stopped: boolean;
+  public restartMs: number;
+  public restartTimer: NodeJS.Timeout | null;
+  public sawFirstRow: boolean;
+
+  public constructor(intervalMs: number) {
     this.seconds = Math.max(1, Math.round(intervalMs / 1000));
     this.child = null;
     this.buffer = '';
@@ -339,12 +423,12 @@ class IostatReader {
     this.sawFirstRow = false;
   }
 
-  start() {
+  public start(): void {
     this.stopped = false;
     this.spawn();
   }
 
-  spawn() {
+  public spawn(): void {
     if (this.stopped || this.child) return;
     this.sawFirstRow = false;
     this.buffer = '';
@@ -352,13 +436,13 @@ class IostatReader {
     try {
       child = spawn('iostat', ['-d', '-w', String(this.seconds)], { stdio: ['ignore', 'pipe', 'ignore'] });
     } catch (err) {
-      this.reason = `iostat could not be started: ${err.message}`;
+      this.reason = `iostat could not be started: ${(err as Error).message}`;
       return;
     }
     this.child = child;
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => this.consume(chunk));
-    child.on('error', (err) => {
+    child.on('error', (err: NodeJS.ErrnoException) => {
       this.reason = err.code === 'ENOENT' ? 'iostat is not installed' : `iostat failed: ${err.message}`;
       this.child = null;
       // A missing binary will still be missing in ten seconds; everything else
@@ -373,7 +457,7 @@ class IostatReader {
     });
   }
 
-  scheduleRestart() {
+  public scheduleRestart(): void {
     if (this.stopped || this.restartTimer) return;
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
@@ -388,7 +472,7 @@ class IostatReader {
    * goes. A data row is every token being a number, three per disk — KB/t, tps,
    * MB/s — so the disks are summed by stepping over the row in threes.
    */
-  consume(chunk) {
+  public consume(chunk: string): void {
     this.buffer += chunk;
     const lines = this.buffer.split('\n');
     this.buffer = lines.pop() ?? '';
@@ -404,8 +488,8 @@ class IostatReader {
       let mbPerSecond = 0;
       let transfers = 0;
       for (let index = 0; index + 2 < numbers.length; index += 3) {
-        transfers += numbers[index + 1];
-        mbPerSecond += numbers[index + 2];
+        transfers += numbers[index + 1]!;
+        mbPerSecond += numbers[index + 2]!;
       }
       this.latest = { mbPerSecond, transfers, at: Date.now() };
       this.reason = null;
@@ -414,15 +498,15 @@ class IostatReader {
   }
 
   /** The last line, unless it is old enough that the process has clearly stalled. */
-  read() {
+  public read(): { mbPerSecond: number; transfers: number } | null {
     if (!this.latest) return null;
     if (Date.now() - this.latest.at > this.seconds * 3000) return null;
     return { mbPerSecond: this.latest.mbPerSecond, transfers: this.latest.transfers };
   }
 
-  stop() {
+  public stop(): void {
     this.stopped = true;
-    clearTimeout(this.restartTimer);
+    clearTimeout(this.restartTimer ?? undefined);
     this.restartTimer = null;
     this.child?.kill();
     this.child = null;
@@ -433,14 +517,14 @@ class IostatReader {
 const PHYSICAL_DISK = /^(sd[a-z]+|nvme\d+n\d+|vd[a-z]+|xvd[a-z]+|mmcblk\d+|hd[a-z]+)$/;
 
 /** Cumulative bytes and transfers across every physical disk, on Linux. */
-async function linuxDiskCounters() {
+async function linuxDiskCounters(): Promise<{ bytes: number; transfers: number; at: number } | null> {
   const text = await fsp.readFile('/proc/diskstats', 'utf8').catch(() => null);
   if (!text) return null;
   let sectors = 0;
   let transfers = 0;
   for (const line of text.split('\n')) {
     const fields = line.trim().split(/\s+/);
-    if (fields.length < 10 || !PHYSICAL_DISK.test(fields[2])) continue;
+    if (fields.length < 10 || !PHYSICAL_DISK.test(fields[2]!)) continue;
     sectors += Number(fields[5]) + Number(fields[9]);
     transfers += Number(fields[3]) + Number(fields[7]);
   }
@@ -451,7 +535,18 @@ async function linuxDiskCounters() {
 // ---- the service -------------------------------------------------------
 
 class SystemMonitor {
-  constructor() {
+  public samples: SystemSample[];
+  public detail: SystemDetail;
+  public notes: SystemNotes;
+  public timer: NodeJS.Timeout | null;
+  public sampling: boolean;
+  public cpuBaseline: { idle: number; total: number } | null;
+  public ioBaseline: { bytes: number; transfers: number; at: number } | null;
+  public iostat: IostatReader | null;
+  public alerts: Map<string, { firing: boolean; lastSentAt: number }>;
+  public runningCrons: () => RunningJobSummary[];
+
+  public constructor() {
     /** The retained window, oldest first. @type {Array<object>} */
     this.samples = [];
     /** Byte counts and the like behind the latest percentages. */
@@ -470,7 +565,7 @@ class SystemMonitor {
     this.runningCrons = () => [];
   }
 
-  get enabled() {
+  public get enabled(): boolean {
     return SAMPLE_INTERVAL_MS > 0;
   }
 
@@ -481,7 +576,7 @@ class SystemMonitor {
    * Reporting the since-boot average there instead would be a different number
    * wearing the same label.
    */
-  start({ runningCrons } = {}) {
+  public start({ runningCrons }: { runningCrons?: () => RunningJobSummary[] } = {}): void {
     if (typeof runningCrons === 'function') this.runningCrons = runningCrons;
     if (!this.enabled || this.timer) return;
     if (process.platform === 'darwin') {
@@ -489,21 +584,21 @@ class SystemMonitor {
       this.iostat.start();
     }
     this.timer = setInterval(() => {
-      this.sample().catch((err) => console.error('[system]', err));
+      this.sample().catch((err: unknown) => console.error('[system]', err));
     }, SAMPLE_INTERVAL_MS);
     this.timer.unref?.();
-    this.sample().catch((err) => console.error('[system]', err));
+    this.sample().catch((err: unknown) => console.error('[system]', err));
   }
 
-  stop() {
-    clearInterval(this.timer);
+  public stop(): void {
+    clearInterval(this.timer ?? undefined);
     this.timer = null;
     this.iostat?.stop();
     this.iostat = null;
   }
 
   /** Busy share of all cores since the previous tick, or null on the first one. */
-  readCpu() {
+  public readCpu(): number | null {
     const now = cpuTotals();
     if (!now) return null;
     const before = this.cpuBaseline;
@@ -516,7 +611,7 @@ class SystemMonitor {
   }
 
   /** Throughput since the previous tick: latched on macOS, differenced on Linux. */
-  async readIo() {
+  public async readIo(): Promise<IoReading> {
     if (process.platform === 'darwin') {
       const latest = this.iostat?.read();
       if (!latest) return { value: null, detail: null, note: this.iostat?.reason ?? 'waiting for the first iostat interval' };
@@ -545,20 +640,20 @@ class SystemMonitor {
    * than four. Every reader answers null instead of throwing, so a metric the
    * platform will not report costs an empty bar, not a dead service.
    */
-  async sample() {
+  public async sample(): Promise<SystemSample | null> {
     if (this.sampling) return null;
     this.sampling = true;
     try {
       const cpu = this.readCpu();
       const [memory, io, disk] = await Promise.all([
         readMemory().catch(() => null),
-        this.readIo().catch((err) => ({ value: null, detail: null, note: err.message })),
+        this.readIo().catch((err: Error) => ({ value: null, detail: null, note: err.message })),
         readDiskUsage().catch(() => null),
       ]);
 
-      const percentOf = (part, whole) => (whole > 0 ? round1(Math.max(0, Math.min(100, (part / whole) * 100))) : null);
+      const percentOf = (part: number, whole: number): number | null => (whole > 0 ? round1(Math.max(0, Math.min(100, (part / whole) * 100))) : null);
 
-      const sample = {
+      const sample: SystemSample = {
         at: new Date().toISOString(),
         cpu,
         memory: memory ? percentOf(memory.usedBytes, memory.totalBytes) : null,
@@ -567,7 +662,7 @@ class SystemMonitor {
       };
 
       this.detail = {
-        cpu: { cores: os.cpus().length, loadAverage: round2(os.loadavg()[0]) },
+        cpu: { cores: os.cpus().length, loadAverage: round2(os.loadavg()[0]!) },
         memory: memory ? { ...memory } : null,
         io: io.detail,
         disk: disk ? { ...disk, path: ROOT } : null,
@@ -600,7 +695,7 @@ class SystemMonitor {
    * says nothing until it has cleared, a cleared one can fire again, and
    * neither can happen more than once per ten minutes.
    */
-  checkAlerts() {
+  public checkAlerts(): void {
     const now = Date.now();
     for (const alert of SYSTEM_ALERTS) {
       const state = this.alerts.get(alert.id) ?? { firing: false, lastSentAt: 0 };
@@ -634,13 +729,13 @@ class SystemMonitor {
   }
 
   /** Drops anything older than the window, by time rather than by count. */
-  trim() {
+  public trim(): void {
     const cutoff = Date.now() - HISTORY_WINDOW_MS;
-    while (this.samples.length && Date.parse(this.samples[0].at) < cutoff) this.samples.shift();
+    while (this.samples.length && Date.parse(this.samples[0]!.at) < cutoff) this.samples.shift();
   }
 
   /** Everything the page needs to draw the meters and their charts from cold. */
-  state() {
+  public state(): SystemState {
     this.trim();
     return {
       enabled: this.enabled,
