@@ -1,0 +1,16 @@
+**/node_modules
+dist
+coverage
+*.tsbuildinfo
+.build.lock
+**/.env
+**/.env.*
+.git
+.github
+.claude
+infra
+test
+scripts
+*.log
+.DS_Store
+pnpm-lock.yaml

@@ -1,0 +1,183 @@
+#!/bin/bash
+# First boot of the hub host, run once as root from EC2 user data. Terraform
+# fills in the values below; everything secret comes from SSM at runtime.
+set -euxo pipefail
+
+NAME="${name}"
+APP_DIR="/opt/${name}"
+DATA_DIR="/var/lib/${name}"
+
+install -m 0644 /dev/stdin /etc/promptd.env <<EOF
+AWS_REGION=${aws_region}
+SSM_PREFIX=${ssm_prefix}
+ECR_REGISTRY=${ecr_registry}
+ECR_REPO=${ecr_repo}
+APP_DIR=$APP_DIR
+EOF
+
+# ---------- packages ---------------------------------------------------------
+dnf update -y
+dnf install -y docker awscli jq
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+if ! docker compose version >/dev/null 2>&1; then
+  curl -fsSL "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-aarch64" \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose
+  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+fi
+systemctl enable --now docker
+
+# No Caddy package builds for Amazon Linux 2023; the static binary is the supported route.
+CADDY_VERSION="2.10.2"
+curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v$${CADDY_VERSION}/caddy_$${CADDY_VERSION}_linux_arm64.tar.gz" \
+  -o /tmp/caddy.tar.gz
+tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
+install -m 755 /tmp/caddy /usr/bin/caddy
+rm -f /tmp/caddy /tmp/caddy.tar.gz
+getent group caddy >/dev/null || groupadd --system caddy
+getent passwd caddy >/dev/null || useradd --system --gid caddy --home-dir /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy
+mkdir -p /etc/caddy /var/lib/caddy
+chown -R caddy:caddy /var/lib/caddy
+
+cat > /etc/systemd/system/caddy.service <<'UNIT'
+[Unit]
+Description=Caddy
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# ---------- data volume: formatted on the first boot only --------------------
+# Nitro renames the attachment to /dev/nvme1n1 or similar, so find the disk
+# that is not the root one.
+ROOT_DEV="$(findmnt -no SOURCE / | sed 's/p[0-9]*$//')"
+TARGET_DEV=""
+for dev in /dev/nvme*n[0-9]*; do
+  case "$dev" in *p*) continue ;; esac
+  [ "$dev" = "$ROOT_DEV" ] && continue
+  TARGET_DEV="$dev"
+  break
+done
+[ -n "$TARGET_DEV" ] || { echo "no data volume found" >&2; lsblk; exit 1; }
+blkid "$TARGET_DEV" >/dev/null 2>&1 || mkfs.ext4 -L hubdata "$TARGET_DEV"
+
+mkdir -p "$DATA_DIR"
+grep -q "LABEL=hubdata" /etc/fstab || echo "LABEL=hubdata $DATA_DIR ext4 defaults,nofail 0 2" >> /etc/fstab
+mount -a
+mkdir -p "$DATA_DIR/data"
+chown -R 1000:1000 "$DATA_DIR/data"
+
+# ---------- the stack ----------------------------------------------------------
+mkdir -p "$APP_DIR"
+cat > "$APP_DIR/docker-compose.yml" <<YAML
+services:
+  hub:
+    image: \$${ECR_REGISTRY}/\$${ECR_REPO}:\$${IMAGE_TAG}
+    init: true
+    restart: unless-stopped
+    environment:
+      PROMPTD_ADMIN_PASSWORD_HASH: \$${PROMPTD_ADMIN_PASSWORD_HASH}
+      SESSION_SECRET: \$${SESSION_SECRET}
+      PROMPTD_NODE_TOKEN: \$${PROMPTD_NODE_TOKEN}
+      DATABASE_URL: \$${DATABASE_URL:-}
+    volumes:
+      - $DATA_DIR/data:/data
+    ports:
+      - "127.0.0.1:4321:4321"
+YAML
+
+cat > "$APP_DIR/fetch-env.sh" <<'SH'
+#!/bin/bash
+# Every parameter under the SSM prefix becomes a line of .env, read again
+# before each deploy so a rotated secret takes effect on the next start.
+# Values are single-quoted: compose expands $ in an unquoted one, and the
+# password hash is full of them.
+set -euo pipefail
+source /etc/promptd.env
+
+aws --region "$AWS_REGION" ssm get-parameters-by-path \
+    --path "$SSM_PREFIX" --with-decryption --recursive \
+    --query 'Parameters[*].[Name,Value]' --output text \
+  | awk -F'\t' -v prefix="$SSM_PREFIX/" -v q="'" '{ name = $1; sub(prefix, "", name); printf "%s=%s%s%s\n", name, q, $2, q }' \
+  > "$APP_DIR/.env.next"
+echo "ECR_REGISTRY='$ECR_REGISTRY'" >> "$APP_DIR/.env.next"
+echo "ECR_REPO='$ECR_REPO'" >> "$APP_DIR/.env.next"
+chmod 600 "$APP_DIR/.env.next"
+mv "$APP_DIR/.env.next" "$APP_DIR/.env"
+SH
+chmod +x "$APP_DIR/fetch-env.sh"
+
+cat > "$APP_DIR/deploy.sh" <<'SH'
+#!/bin/bash
+# Pulls the image SSM names and restarts the hub on it. The deploy workflow
+# runs this through SSM Run Command.
+set -euo pipefail
+source /etc/promptd.env
+
+"$APP_DIR/fetch-env.sh"
+aws --region "$AWS_REGION" ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+cd "$APP_DIR"
+docker compose --env-file .env pull
+docker compose --env-file .env up -d --remove-orphans
+docker image prune -af --filter "until=24h" || true
+SH
+chmod +x "$APP_DIR/deploy.sh"
+
+# ---------- HTTPS ----------------------------------------------------------
+# No response compression: it can hold back the live log and event streams.
+cat > /etc/caddy/Caddyfile <<EOF
+{
+  email ${acme_email}
+}
+
+${domain_name} {
+  reverse_proxy 127.0.0.1:4321
+  log {
+    output stdout
+    format console
+  }
+}
+EOF
+systemctl daemon-reload
+systemctl enable --now caddy
+
+# ---------- come back after a reboot ---------------------------------------
+cat > "/etc/systemd/system/$NAME.service" <<UNIT
+[Unit]
+Description=$NAME hub via docker compose
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$APP_DIR
+ExecStartPre=$APP_DIR/fetch-env.sh
+ExecStart=/usr/bin/docker compose --env-file $APP_DIR/.env up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file $APP_DIR/.env down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable "$NAME.service"
+
+# The first image may not be pushed yet; infra/DEPLOY.md covers running this again.
+"$APP_DIR/deploy.sh" || echo "first deploy failed; push an image and run $APP_DIR/deploy.sh"
+echo "[$NAME] first boot complete"

@@ -5,9 +5,10 @@ const MIN_LENGTH = 12;
 
 function readHidden(question: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const { stdin, stdout } = process;
-    stdout.write(question);
+    // Prompts go to stderr so `$(npm run -s set-password -- --print-hash)` captures only the hash.
+    const { stdin, stderr: prompt } = process;
     stdin.setRawMode(true);
+    prompt.write(question);
     stdin.resume();
     stdin.setEncoding('utf8');
     let typed = '';
@@ -15,7 +16,7 @@ function readHidden(question: string): Promise<string> {
       for (const char of chunk) {
         if (char === '\u0003') {
           stdin.setRawMode(false);
-          stdout.write('\n');
+          prompt.write('\n');
           reject(new Error('cancelled'));
           return;
         }
@@ -23,7 +24,7 @@ function readHidden(question: string): Promise<string> {
           stdin.setRawMode(false);
           stdin.pause();
           stdin.off('data', onData);
-          stdout.write('\n');
+          prompt.write('\n');
           resolve(typed);
           return;
         }

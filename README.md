@@ -61,6 +61,14 @@ NODE_ONLY=1 HUB_URL=http://<hub-address>:4321 NODE_TOKEN=<token> ./scripts/regis
 
 Copy the token from `~/.claude/promptd/node-token` on the hub's machine. The hub has to be reachable from the node, which on another network usually means binding it to `0.0.0.0` — read [Network access](#network-access) first. The token protects the node API; the web page has its own password — see [Signing in](#signing-in).
 
+## Deploying a hub
+
+[`infra/DEPLOY.md`](infra/DEPLOY.md) puts a hub on the internet, so nodes on any network can reach it:
+
+- **What runs.** One ARM EC2 instance runs the hub in Docker behind Caddy for HTTPS. A separate volume holds the database and logs, with daily snapshots.
+- **What it's built from.** Terraform in [`infra/`](infra), a [`Dockerfile`](Dockerfile), and a GitHub Actions workflow that ships every push to `main`.
+- **What you fill in.** The domain, AWS profile and GitHub repository are yours to set. The deploy workflow does nothing until you set its repository variables, so forks never try to ship.
+
 ## Signing in
 
 The page is open while no admin password is set and the hub is bound to `127.0.0.1`, as it always was. Set one and every page and API call needs a session:
@@ -134,7 +142,7 @@ FORCE=1 ./scripts/register-app-mac-os.sh
 
 > **⚠️ One password, and plain HTTP by default.** The login is a single admin password. Over plain `http://` it and the session cookie cross the network unencrypted, so anyone on the same network can read them.
 >
-> - Over the open internet, put the hub behind HTTPS, as a reverse proxy such as Caddy does. The session cookie is then marked secure.
+> - Over the open internet, put the hub behind HTTPS, as [the deployment](#deploying-a-hub) does with Caddy. The session cookie is then marked secure.
 > - On an untrusted network — cafés, hotels, shared offices, guest Wi-Fi — leave it on `127.0.0.1`.
 > - Prefer a private overlay to opening the LAN: Tailscale or WireGuard gives you remote access without anyone else on the network being able to reach the port.
 > - macOS may ask you to allow incoming connections for `node` the first time. That prompt is the firewall, not authentication.

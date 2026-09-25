@@ -1,0 +1,120 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy instead of building this commit (for a rollback)'
+        required: false
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+# Every value comes from repository variables (Settings → Secrets and
+# variables → Actions → Variables), filled in from your Terraform outputs.
+# Without AWS_ROLE_ARN the deploy job is skipped, so a fork or a checkout
+# with no hosted hub never tries to ship. See infra/DEPLOY.md.
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+  SSM_PREFIX: ${{ vars.SSM_PREFIX }}
+  HUB_URL: ${{ vars.HUB_URL }}
+
+jobs:
+  ci:
+    if: ${{ vars.AWS_ROLE_ARN != '' && !inputs.image_tag }}
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    if: ${{ always() && vars.AWS_ROLE_ARN != '' && (needs.ci.result == 'success' || (needs.ci.result == 'skipped' && inputs.image_tag)) }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.HUB_URL }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pick the image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.tag.outputs.build == 'true'
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.tag.outputs.build == 'true'
+
+      - name: Build and push the ARM64 hub image
+        if: steps.tag.outputs.build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Roll the image tag in SSM
+        run: |
+          aws ssm put-parameter --overwrite --type String \
+            --name "$SSM_PREFIX/IMAGE_TAG" --value "${{ steps.tag.outputs.tag }}"
+
+      - name: Run deploy.sh on the hub
+        id: ssm
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "promptd deploy ${{ steps.tag.outputs.tag }}" \
+            --parameters 'commands=["/opt/${{ vars.NAME || 'promptd' }}/deploy.sh"]' \
+            --output text --query 'Command.CommandId')
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deploy.sh
+        run: |
+          status=0
+          aws ssm wait command-executed --instance-id "$EC2_INSTANCE_ID" --command-id "${{ steps.ssm.outputs.command_id }}" || status=$?
+          aws ssm get-command-invocation --instance-id "$EC2_INSTANCE_ID" --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --query '{Status: Status, StandardOutput: StandardOutputContent, StandardError: StandardErrorContent}' --output json
+          exit "$status"
+
+      - name: Check the hub answers
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            if curl -fsS "$HUB_URL/api/health" | grep -q '"ok":true'; then
+              echo "hub healthy"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "the hub did not answer healthy after the deploy" >&2
+          exit 1
