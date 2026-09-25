@@ -73,19 +73,31 @@ To use Postgres instead of the SQLite file on the data volume, also add a `DATAB
 
 ## 4. Point your DNS at the hub
 
+There are two ways. Pick one with `manage_dns` in `terraform.tfvars`.
+
+**Route 53 (`manage_dns = true`).** Terraform creates a hosted zone for your host name and its A record, and the name is handed to that zone. This costs $0.50 a month for the zone.
+
+```sh
+terraform output hub_nameservers
+```
+
+At your parent domain's DNS, add four `NS` records for the host (for example `promptd`), one for each nameserver. In Cloudflare, that's DNS → Records → Add record → type `NS`. Cloudflare won't allow an `NS` and an `A` record on the same name, so delete any existing `A` record in the same edit.
+
+**Your own DNS (`manage_dns = false`, the default).** Add one `A` record yourself:
+
 ```sh
 terraform output hub_ip
 ```
 
-In Cloudflare, under **DNS → Records**, add an `A` record:
+In Cloudflare, add an `A` record under DNS → Records:
 
 - **Name:** your host, for example `promptd`
 - **IPv4 address:** the `hub_ip` output
 - **Proxy status:** DNS only, the grey cloud
 
-Leave the proxy off. Caddy gets its certificate directly, and a proxy in between can hold back the live log and event streams.
+Leave the proxy off. With it on, Caddy can't get its certificate, and the page loops on redirects. A proxy in between can also hold back the live log and event streams.
 
-The IP is an Elastic IP. It stays the same across deploys and even when Terraform replaces the instance, so this record is set once.
+Either way, the address is an Elastic IP. It stays the same across deploys, and even when Terraform replaces the instance, so DNS is set once.
 
 ## 5. Push the first image
 
@@ -120,7 +132,7 @@ sudo docker compose -f /opt/promptd/docker-compose.yml logs --tail 50
 sudo journalctl -u caddy --no-pager -n 50
 ```
 
-Open `https://promptd.example.com` (your host) and sign in with the password from step 3. The first visit can take a minute while Caddy gets the certificate.
+Open `https://promptd.example.com` (your host) and sign in with the password from step 3. The first visit can take a minute while Caddy gets the certificate. If Caddy started before your DNS was in place, it retries on a backoff that can stretch to hours; `sudo systemctl restart caddy` on the host makes it try again straight away.
 
 ## 7. Let GitHub deploy
 

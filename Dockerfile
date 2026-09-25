@@ -19,11 +19,7 @@ RUN npm run build && npm prune --omit=dev
 FROM node:24-bookworm-slim AS runtime
 WORKDIR /app
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends tini \
-  && rm -rf /var/lib/apt/lists/* \
-  && mkdir -p /data \
-  && chown node:node /data
+RUN mkdir -p /data && chown node:node /data
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
@@ -44,5 +40,5 @@ EXPOSE 4321
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:4321/api/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# No init of its own: compose runs it with `init: true`, and `docker run --init` does the same.
 CMD ["node", "dist/entry-hub.js"]

@@ -32,3 +32,8 @@ output "hub_url" {
   description = "Repository variable HUB_URL, and the HUB_URL a node registers with."
   value       = "https://${var.domain_name}"
 }
+
+output "hub_nameservers" {
+  description = "With manage_dns on: add these as NS records for domain_name at your parent domain's DNS."
+  value       = var.manage_dns ? aws_route53_zone.hub[0].name_servers : []
+}

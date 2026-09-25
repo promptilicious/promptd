@@ -59,3 +59,9 @@ variable "backup_retention_days" {
   type        = number
   default     = 14
 }
+
+variable "manage_dns" {
+  description = "Create a Route 53 zone for domain_name with its A record. You then delegate the name to the zone's nameservers. Leave false to add the A record yourself wherever your DNS lives."
+  type        = bool
+  default     = false
+}
