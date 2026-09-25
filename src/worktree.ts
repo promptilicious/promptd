@@ -35,11 +35,39 @@ export async function repoRoot(dir: string): Promise<string | null> {
 }
 
 /**
- * Force-removes the worktree Claude Code makes for `--worktree <name>`, at
- * `.claude/worktrees/<name>` in the repository `dir` is in, and deletes its
- * `worktree-<name>` branch. Uncommitted files in it are not kept. The branch's
- * last commit goes in the result, so work committed only there can still be
- * recovered from it.
+ * The main checkout of the repository `dir` belongs to: the folder holding the
+ * shared `.git`. It differs from `repoRoot` when `dir` is inside a linked
+ * worktree, and it is where Claude Code makes worktrees and reads
+ * .worktreeinclude from.
+ */
+export async function mainCheckoutRoot(dir: string): Promise<string | null> {
+  const commonDir = await git(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 10_000).catch(() => '');
+  if (!commonDir) return null;
+  return path.basename(commonDir) === '.git' ? path.dirname(commonDir) : repoRoot(dir);
+}
+
+/** Every worktree git knows of in the repository `dir` belongs to, with the branch each one has checked out. */
+async function listWorktrees(dir: string): Promise<Array<{ path: string; branch: string | null }>> {
+  const worktrees: Array<{ path: string; branch: string | null }> = [];
+  for (const block of (await git(dir, ['worktree', 'list', '--porcelain'])).split('\n\n')) {
+    const lines = block.split('\n');
+    const worktreePath = lines.find((line) => line.startsWith('worktree '))?.slice('worktree '.length);
+    if (!worktreePath) continue;
+    const branch = lines.find((line) => line.startsWith('branch '))?.slice('branch '.length) ?? null;
+    worktrees.push({ path: worktreePath, branch });
+  }
+  return worktrees;
+}
+
+/**
+ * Force-removes the worktree Claude Code makes for `--worktree <name>`, and
+ * deletes its `worktree-<name>` branch. Uncommitted files in it are not kept.
+ * The branch's last commit goes in the result, so work committed only there
+ * can still be recovered from it.
+ *
+ * The worktree is found through git rather than by building its path: Claude
+ * Code puts it under the main checkout's `.claude/worktrees`, which is not the
+ * folder `dir` is in when the job runs inside a linked worktree.
  *
  * @returns {Promise<{ cleaned: string } | { skipped: string }>} What was removed,
  *   or why there was nothing to remove.
@@ -47,11 +75,14 @@ export async function repoRoot(dir: string): Promise<string | null> {
 export async function removeWorktree(dir: string, name: string): Promise<WorktreeCleanup> {
   const root = await repoRoot(dir);
   if (!root) return { skipped: `${dir} is not in a git repository` };
-  const worktreePath = path.join(root, '.claude', 'worktrees', name);
   const branch = `worktree-${name}`;
   const removed: string[] = [];
 
-  if (await fsp.stat(worktreePath).then(() => true, () => false)) {
+  const registered = (await listWorktrees(root)).find((worktree) => worktree.branch === `refs/heads/${branch}`)?.path;
+  const fallback = path.join((await mainCheckoutRoot(root)) ?? root, '.claude', 'worktrees', name);
+  const worktreePath = registered ?? ((await fsp.stat(fallback).then(() => true, () => false)) ? fallback : null);
+
+  if (worktreePath) {
     // Claude Code locks the worktrees it makes, and git refuses to remove a locked one.
     await git(root, ['worktree', 'unlock', worktreePath]).catch(() => {});
     // node_modules can hold hundreds of thousands of files, so this can take a while.
@@ -82,8 +113,9 @@ export async function pathInRepo(dir: string): Promise<string | null> {
 }
 
 /**
- * Writes the default .worktreeinclude to the root of the repository `dir` is
- * in, replacing whatever file is there.
+ * Writes the default .worktreeinclude to the main checkout of the repository
+ * `dir` is in, replacing whatever file is there. Claude Code reads it from
+ * there even when the job runs inside a linked worktree.
  *
  * Empty text writes nothing rather than blanking a file the repo may rely on,
  * and a folder outside git writes nothing because there is no worktree to make.
@@ -93,7 +125,7 @@ export async function pathInRepo(dir: string): Promise<string | null> {
  */
 export async function writeWorktreeInclude(dir: string, text: string): Promise<WorktreeIncludeWrite> {
   if (!text.trim()) return { skipped: 'the default on the Settings page is empty' };
-  const root = await repoRoot(dir);
+  const root = await mainCheckoutRoot(dir);
   if (!root) return { skipped: `${dir} is not in a git repository` };
   const target = path.join(root, WORKTREE_INCLUDE_FILE);
   const content = text.endsWith('\n') ? text : `${text}\n`;

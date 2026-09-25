@@ -2485,8 +2485,8 @@ async function renderSettings() {
       el('div', { class: 'hint' }, [
         'Written as ',
         el('span', { class: 'mono', text: '.worktreeinclude' }),
-        ' before each run of a job with Use worktree on, to the root of the git repository its working directory is in. ',
-        'It goes at the root even when the working directory is a subfolder, because that is the only place Claude Code reads it. ',
+        ' before each run of a job with Use worktree on, to the main checkout of the git repository its working directory is in. ',
+        'That is the only place Claude Code reads it, so it goes there even when the working directory is a subfolder or a linked worktree. ',
         'Nothing is written while this is empty, or when the working directory is not in a git repository. ',
         'Claude Code copies the files it lists into each new worktree: one pattern per line, written like ',
         el('span', { class: 'mono', text: '.gitignore' }),
@@ -2497,7 +2497,7 @@ async function renderSettings() {
       el('div', { class: 'hint warn' }, [
         'Any ',
         el('span', { class: 'mono', text: '.worktreeinclude' }),
-        ' already at the repository root is overwritten with this text on every run, including one the repo has committed.',
+        ' already in the main checkout is overwritten with this text on every run, including one the repo has committed.',
       ]),
     ]),
     el('div', { class: 'card' }, [
