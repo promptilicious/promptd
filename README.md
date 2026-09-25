@@ -59,7 +59,23 @@ Clone the project there, then:
 NODE_ONLY=1 HUB_URL=http://<hub-address>:4321 NODE_TOKEN=<token> ./scripts/register-app-mac-os.sh
 ```
 
-Copy the token from `~/.claude/promptd/node-token` on the hub's machine. The hub has to be reachable from the node, which on another network usually means binding it to `0.0.0.0` — read [Network access](#network-access) first. The token protects the node API only; the web page itself still has no password.
+Copy the token from `~/.claude/promptd/node-token` on the hub's machine. The hub has to be reachable from the node, which on another network usually means binding it to `0.0.0.0` — read [Network access](#network-access) first. The token protects the node API; the web page has its own password — see [Signing in](#signing-in).
+
+## Signing in
+
+The page is open while no admin password is set and the hub is bound to `127.0.0.1`, as it always was. Set one and every page and API call needs a session:
+
+```bash
+npm run set-password                 # prompts twice; stores a scrypt hash in the database
+echo "$PASSWORD" | npm run set-password   # the same, from a script
+npm run set-password -- --print-hash # prints a hash to put in PROMPTD_ADMIN_PASSWORD_HASH instead
+npm run set-password -- --clear      # removes it; a loopback hub is open again
+```
+
+1. **Sessions.** Signing in sets an encrypted, `httpOnly` cookie that lasts 30 days. Changing the password signs every session out. **Sign out** is at the top of the Settings page.
+2. **Failed attempts.** Five wrong passwords from one address lock it out for 15 minutes.
+3. **Deployments.** `PROMPTD_ADMIN_PASSWORD_HASH`, set from a secret store, wins over the stored hash. `SESSION_SECRET` (32 characters or more) signs the cookie; without it the hub generates one and keeps it in the database.
+4. **What stays open.** The login page, and `/api/health`, which tells a signed-out caller only that a login is needed. Nodes use their own token on `/api/node/*` and never need the password.
 
 ## Start at login (macOS)
 
@@ -97,13 +113,14 @@ Run again without `FORCE` and it leaves registered agents alone, adds any that a
 
 ### Network access
 
-By default the server binds `127.0.0.1`, so only this Mac can reach it. To reach it from a phone or another computer on your LAN, register with `HOST=0.0.0.0`:
+By default the server binds `127.0.0.1`, so only this Mac can reach it. To reach it from a phone or another computer, set an admin password first, then register with `HOST=0.0.0.0`:
 
 ```bash
+npm run set-password
 HOST=0.0.0.0 ./scripts/register-app-mac-os.sh
 ```
 
-The address goes into the plist, so it survives restarts and every login. On success the script prints the LAN URL — `http://<this-mac-ip>:4321` — which is the address other devices use. Already registered? Add `FORCE=1` to replace the existing agent:
+A hub bound to anything other than a loopback address refuses to start without a password, so it cannot be exposed by accident. The address goes into the plist, so it survives restarts and every login. On success the script prints the LAN URL — `http://<this-mac-ip>:4321` — which is the address other devices use. Already registered? Add `FORCE=1` to replace the existing agent:
 
 ```bash
 HOST=0.0.0.0 FORCE=1 ./scripts/register-app-mac-os.sh
@@ -115,17 +132,12 @@ To go back to this machine only, re-register with the default:
 FORCE=1 ./scripts/register-app-mac-os.sh
 ```
 
-> **⚠️ Warning — no password, no authentication.** promptd has no login, no accounts, and no access control of any kind. Once it is bound to `0.0.0.0`, anyone who can reach the port can add a cron, run an arbitrary Claude prompt in any directory this Mac can read, browse your filesystem through the directory autocomplete, and read every past run's output. It spends your Claude quota doing it.
+> **⚠️ One password, and plain HTTP by default.** The login is a single admin password. Over plain `http://` it and the session cookie cross the network unencrypted, so anyone on the same network can read them.
 >
-> Protecting it is on you. Keep it on a network you control, and treat exposure as your risk to accept:
->
-> - Never put it on a public IP, and never forward a router port to it. Nothing here is safe on the open internet.
+> - Over the open internet, put the hub behind HTTPS, as a reverse proxy such as Caddy does. The session cookie is then marked secure.
 > - On an untrusted network — cafés, hotels, shared offices, guest Wi-Fi — leave it on `127.0.0.1`.
 > - Prefer a private overlay to opening the LAN: Tailscale or WireGuard gives you remote access without anyone else on the network being able to reach the port.
-> - If you need it on a shared LAN, put access control in front of it — a reverse proxy with HTTP basic auth and TLS, or a firewall rule limiting the source addresses.
 > - macOS may ask you to allow incoming connections for `node` the first time. That prompt is the firewall, not authentication.
->
-> You accept the risk of unauthorized access when you change this setting.
 
 ### Doing it by hand
 
@@ -699,6 +711,8 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | `PROMPTD_NODE_NAME`     | the hostname            | Node: the name the page shows                                                                                                                   |
 | `PROMPTD_NODE_HOME`     | `$PROMPTD_HOME/node`    | Node: where it keeps its state and unsent logs                                                                                                  |
 | `PROMPTD_SYNC_MS`       | `2000`                  | Node: how often it reports and fetches work                                                                                                     |
+| `PROMPTD_ADMIN_PASSWORD_HASH` | unset | Hub: the admin password's hash, from `npm run set-password -- --print-hash`. Wins over the stored one |
+| `SESSION_SECRET` | generated and stored | Hub: signs the session cookie. 32 characters or more |
 | `PROMPTD_PROJECT_DIR`   | the checkout this code lives in | Which repository the update check looks at                                                                                                       |
 
 ## Model
@@ -771,6 +785,8 @@ As the field changes, a green line below it shows when the expression next fires
 | GET              | `/api/crons/:id/logs/:file`        | One log as JSON                                                                                                                                                                |
 | GET              | `/api/crons/:id/logs/:file/stream` | One log as an SSE stream                                                                                                                                                       |
 | GET              | `/api/events`                      | Activity stream                                                                                                                                                                |
+| POST             | `/api/auth/login`, `/api/auth/logout` | Sign in with `{"password": "..."}`, or sign out. 401 on a wrong password, 429 after five in 15 minutes |
+| GET              | `/api/auth/status` | Whether a password is set, and whether this request is signed in |
 | GET              | `/api/nodes`                       | Every node that has connected, whether it is online, which is the default, and where the node token is kept                                                                     |
 | DELETE           | `/api/nodes/:id`                   | Forget a node (409 while it is online)                                                                                                                                          |
 | POST             | `/api/node/report`, `/api/node/leave` | Node API, bearer token required: a node's status, log output, run results and events; and its sign-off on shutdown                                                          |
@@ -801,7 +817,7 @@ As the field changes, a green line below it shows when the expression next fires
 
 ## Notes
 
-- The server binds to localhost and has no authentication. A cron here runs an arbitrary prompt through Claude in a directory you choose, so don't expose it to a network you don't control. Widening the bind address is possible and documented in [Network access](#network-access); the risk of doing so is yours.
+- A cron here runs an arbitrary prompt through Claude in a directory you choose, on any node. Anyone with the admin password can do the same, so treat it like a shell password. See [Signing in](#signing-in) and [Network access](#network-access).
 - The concurrent job limit and the usage thresholds are one setting each, applied by every node on its own: with two nodes online, twice the limit can run at once. The default limit is the hub machine's processor count.
 - The directory autocomplete lists folders on the hub's machine, which is only right for jobs on the local node. For a job on another machine, type the path.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.

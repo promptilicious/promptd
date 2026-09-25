@@ -62,6 +62,11 @@ export interface SettingTable {
   value: string;
 }
 
+export interface SecretTable {
+  key: string;
+  value: string;
+}
+
 export interface NodeTable {
   id: string;
   name: string;
@@ -78,6 +83,7 @@ export interface Tables {
   notifications: NotificationTable;
   settings: SettingTable;
   nodes: NodeTable;
+  secrets: SecretTable;
 }
 
 export type Db = Kysely<Tables>;
@@ -149,6 +155,16 @@ const MIGRATIONS: Record<string, Migration> = {
         .addColumn('commit', 'text')
         .addColumn('first_seen_at', 'text', (col) => col.notNull())
         .addColumn('last_seen_at', 'text', (col) => col.notNull())
+        .execute();
+    },
+  },
+  // Apart from settings, which the page reads back whole: nothing here may reach a response.
+  '20260925_002_secrets': {
+    async up(db: Kysely<unknown>): Promise<void> {
+      await db.schema
+        .createTable('secrets')
+        .addColumn('key', 'text', (col) => col.primaryKey())
+        .addColumn('value', 'text', (col) => col.notNull())
         .execute();
     },
   },

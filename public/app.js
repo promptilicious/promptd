@@ -27,6 +27,7 @@ async function api(url, options) {
   });
   const isJson = (res.headers.get('content-type') || '').includes('application/json');
   const body = isJson ? await res.json() : await res.text();
+  if (res.status === 401 && url !== '/api/auth/logout') location.assign('/login');
   if (!res.ok) throw new Error(body?.error || `request failed (${res.status})`);
   return body;
 }
@@ -1890,13 +1891,26 @@ function databaseLabel(database) {
 async function renderSettings() {
   // Health comes along for the boot time: it is the one fact on this page that
   // belongs to the running process rather than to a file on disk.
-  const [settings, config, health, notifications] = await Promise.all([
+  const [settings, config, health, notifications, auth] = await Promise.all([
     api('/api/settings'),
     api('/api/config'),
     api('/api/health').catch(() => ({})),
     // One item's worth of payload; it is the counts either side of it we want.
     api('/api/notifications?limit=1').catch(() => ({})),
+    api('/api/auth/status').catch(() => ({ required: false })),
   ]);
+
+  const signOut = auth.required
+    ? el('button', {
+        class: 'btn small',
+        type: 'button',
+        text: 'Sign out',
+        onclick: async () => {
+          await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+          location.assign('/login');
+        },
+      })
+    : null;
 
   const status = el('div', { class: 'hint' });
   const checkButton = el('button', { class: 'btn small', text: 'Check for updates' });
@@ -2343,7 +2357,7 @@ async function renderSettings() {
       ]),
     ]),
     el('div', { class: 'card' }, [
-      el('h2', { text: 'Server Settings' }),
+      el('div', { class: 'card-head' }, [el('h2', { text: 'Server Settings' }), signOut]),
       el('h3', { text: 'Server Name' }),
       el('div', { class: 'field' }, [serverNameInput]),
       el('div', { class: 'hint' }, [
@@ -3673,6 +3687,10 @@ function setConnState() {
 async function checkHealth() {
   try {
     const health = await api('/api/health');
+    if (health.authRequired) {
+      location.assign('/login');
+      return;
+    }
     setUpdateBadge(Boolean(health.updateAvailable), health.updateBehind);
     setBellBadge(health.unreadNotifications);
     setUsage(health.usage);

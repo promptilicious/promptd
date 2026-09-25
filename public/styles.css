@@ -1664,3 +1664,16 @@ input.narrow {
 .queue-row .link:hover {
   color: var(--accent);
 }
+
+.login {
+  max-width: 380px;
+  margin: 12vh auto 0;
+  padding: 0 16px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}

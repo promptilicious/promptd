@@ -241,13 +241,19 @@ if [ "$NODE_INSTALLED" = "1" ]; then
   printf '  • waiting for the node to connect'
   connected=0
   for _ in $(seq 1 30); do
-    if curl -fsS "$HUB_URL/api/nodes" 2>/dev/null | grep -q '"online":true'; then connected=1; break; fi
+    nodes="$(curl -sS -w '\n%{http_code}' "$HUB_URL/api/nodes" 2>/dev/null || true)"
+    case "$nodes" in
+      *$'\n'401) connected=locked; break ;;
+      *'"online":true'*) connected=1; break ;;
+    esac
     printf '.'
     sleep 1
   done
   printf '\n'
   if [ "$connected" = "1" ]; then
     ok "node connected to $HUB_URL"
+  elif [ "$connected" = "locked" ]; then
+    ok "node registered; the hub requires a login, so check it under Settings → Nodes"
   else
     warn "the node is registered but no node showed as online at $HUB_URL within 30s. Check $NODE_LOG"
   fi
