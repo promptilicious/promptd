@@ -6,8 +6,9 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import { bus, sseInit, sseSend } from './events.js';
-import { CRONS_DIR, EXECUTIONS_DIR, LOGS_DIR, NODE_TOKEN_FILE, ROOT, ensureDirs, resolveUserPath } from './paths.js';
-import { SETTINGS_FILE as SETTINGS_PATH } from './settings.js';
+import { databaseTarget, migrate, openDatabase } from './db.js';
+import { importLegacyFiles } from './legacyImport.js';
+import { LOGS_DIR, NODE_TOKEN_FILE, ROOT, ensureDirs, resolveUserPath } from './paths.js';
 import { EFFORT_LEVELS, PAUSE_OPTIONS, isEffortLevel, pauseOption, previewNextRun, validateCronExpression } from './schedule.js';
 import { hub } from './hub.js';
 import {
@@ -20,13 +21,12 @@ import {
   patchExecution,
   updateExecution,
 } from './executions.js';
-import { cronFileWatcher } from './watcher.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, loadSettings, normalizeMaxConcurrentJobs, patchSettings } from './settings.js';
 import { migrateLogDirs } from './logsMigration.js';
 import { checkForUpdates, currentCommit, selfUpdater, UPDATE_LOG, PROJECT_DIR } from './updater.js';
 import { USAGE_DELAY_CATEGORIES, normalizeUsageDelay, parseUsageThreshold, setUsageThresholds, usageDelayOptions } from './usage.js';
 import { lifetimeStats } from './stats.js';
-import { MAX_NOTIFICATIONS, NOTIFICATIONS_DIR, PAGE_SIZE, notificationCenter } from './notifications.js';
+import { MAX_NOTIFICATIONS, PAGE_SIZE, notificationCenter } from './notifications.js';
 import {
   MAX_LOGS_PER_CRON,
   createCron,
@@ -213,12 +213,10 @@ async function findRecord(id: string): Promise<FoundRecord | null> {
 app.get('/api/config', (_req, res) => {
   res.json({
     storageRoot: ROOT,
-    cronsDir: CRONS_DIR,
+    database: databaseTarget(),
     logsDir: LOGS_DIR,
     maxLogsPerCron: MAX_LOGS_PER_CRON,
-    notificationsDir: NOTIFICATIONS_DIR,
     maxNotifications: MAX_NOTIFICATIONS,
-    executionsDir: EXECUTIONS_DIR,
     effortLevels: EFFORT_LEVELS,
     // Each with the threshold in force now, which the form draws next to its label.
     usageDelayCategories: usageDelayOptions(),
@@ -323,7 +321,7 @@ app.get('/api/browse', async (req, res, next) => {
 
 app.get('/api/settings', async (_req, res, next) => {
   try {
-    res.json({ ...(await loadSettings()), settingsFile: SETTINGS_PATH, projectDir: PROJECT_DIR, updateLog: UPDATE_LOG });
+    res.json({ ...(await loadSettings()), database: databaseTarget(), projectDir: PROJECT_DIR, updateLog: UPDATE_LOG });
   } catch (err) {
     next(err);
   }
@@ -836,20 +834,25 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 await ensureDirs();
-// Subscribes to the event bus before anything can emit, and reads the folder
-// behind the server coming up: 5000 small files are not worth a slow start.
+openDatabase();
+await migrate();
+// Before the first settings read, which would otherwise write defaults over
+// an install that still has its settings.json.
+await importLegacyFiles();
+// Subscribes to the event bus before anything can emit, and reads the table
+// behind the server coming up.
 notificationCenter.start();
-const bootSettings = await loadSettings(); // writes settings.json with defaults on first run
+const bootSettings = await loadSettings(); // writes the defaults on first run
 setUsageThresholds(bootSettings.usageDelayThresholds);
 // Before any node can upload a log: after this the folders are cron ids.
 await migrateLogDirs().catch((err: unknown) => console.error(`[logs] migration failed: ${errorMessage(err)}`));
 runningCommit = await currentCommit();
 await hub.start(await loadSettings());
-await cronFileWatcher.start();
 selfUpdater.start();
 
 app.listen(PORT, HOST, () => {
   console.log(`promptd listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
-  console.log(`Storage: ${ROOT}`);
+  const database = databaseTarget();
+  console.log(`Storage: ${ROOT}; ${database.dialect} database at ${database.location}`);
   hub.ensureLocalNodeAgent().catch((err: unknown) => console.error(`[hub] local node agent check failed: ${errorMessage(err)}`));
 });

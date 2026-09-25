@@ -1,9 +1,9 @@
 # promptd
 
-A lightweight web UI to schedule, manage, and run Claude prompts, either as a cron that repeats on a schedule or as a one-time execution at a date and time you pick. A small Node.js hub holds a set of crons and one-time executions and serves the web page. One or more nodes, on this machine or others, fetch their jobs from it, spawn `claude -p` on each one's schedule, and report the output back as it happens. No database: every cron and every log line is a plain file under `~/.claude/promptd`.
+A lightweight web UI to schedule, manage, and run Claude prompts, either as a cron that repeats on a schedule or as a one-time execution at a date and time you pick. A small Node.js hub holds a set of crons and one-time executions and serves the web page. One or more nodes, on this machine or others, fetch their jobs from it, spawn `claude -p` on each one's schedule, and report the output back as it happens. Jobs, settings and notifications live in a SQLite file under `~/.claude/promptd`, with nothing to install; run logs are plain files beside it.
 
 - Two tabs on the home page: **Crons**, which run on a schedule, and **One-time Execution**, which run once at a date you pick.
-- Add, edit and delete crons in the browser, or by editing the JSON files directly — the folder is watched either way.
+- Add, edit and delete crons in the browser. They are kept in a SQLite file by default, or in Postgres when `DATABASE_URL` is set.
 - Follow a run's output as it is produced, or read back any of the last 50 runs per cron.
 - Stop a run in progress. The schedule stays armed for its next trigger.
 - Pause everything for 30 minutes, an hour, 3 hours, or until the next restart — crons and one-time executions together.
@@ -18,7 +18,7 @@ A lightweight web UI to schedule, manage, and run Claude prompts, either as a cr
 
 ## Run it
 
-Needs Node 18 or newer, and Claude Code installed and signed in — `claude --version` should answer.
+Needs Node 20 or newer, and Claude Code installed and signed in — `claude --version` should answer.
 
 ```bash
 npm install
@@ -336,7 +336,7 @@ queued     waited 4m 06s for a slot behind 8 running jobs
 
 The **⚙** button at the right of the header opens a page for everything below. Changes save as you make them — there is no Save button to forget — and each one confirms with a toast.
 
-`settings.json` sits in the storage root and is written with defaults the first time the server starts:
+Settings live in the database's `settings` table, one row per key, and are written with these defaults the first time the hub starts:
 
 ```json
 {
@@ -433,26 +433,23 @@ The paths in use are listed on the Settings page, under **Storage**.
 
 ```
 ~/.claude/promptd/
-├── crons/
-│   └── <uuid>.json                 # one file per cron
-├── executions/
-│   └── <uuid>.json                 # one file per one-time execution
+├── promptd.sqlite                  # crons, one-time executions, settings, notifications, nodes
 ├── logs/
 │   ├── <uuid>/
 │   │   └── 2026-09-10T06-11-12.789Z.txt   # one file per run, newest 50 kept
 │   └── update.log                  # appended by the self updater
-├── notifications/
-│   └── 2026-09-15T22-38-33.816Z-25ec7aca.json  # one file per notice, newest 5000 kept
 ├── node/                           # this machine's node
 │   ├── state.json                  # its copy of its jobs and settings, and writes not yet sent
 │   ├── uploads.json                # logs still being sent to the hub
 │   └── logs/<uuid>/<run>.txt       # a run's log until the hub has all of it
-├── node-token                      # the secret nodes present to the hub
-├── nodes.json                      # every node that has connected
-└── settings.json                   # app settings, written with defaults on first run
+└── node-token                      # the secret nodes present to the hub
 ```
 
-A cron file:
+Set `DATABASE_URL=postgres://user:password@host:5432/db` to keep the same tables in Postgres instead; the log files stay on disk either way. The schema is created and migrated when the hub starts.
+
+An install from before the database has `crons/`, `executions/`, `notifications/`, `settings.json` and `nodes.json` here. The first time the hub starts on an empty database it copies all of them in, once, and leaves the files where they are.
+
+A cron, as the API returns it:
 
 ```json
 {
@@ -481,7 +478,7 @@ A cron file:
 }
 ```
 
-A one-time execution file is the same shape with `scheduledAt` where `cron` was, plus the state it is in:
+A one-time execution is the same shape with `scheduledAt` where `cron` was, plus the state it is in:
 
 ```json
 {
@@ -513,28 +510,7 @@ A one-time execution file is the same shape with `scheduledAt` where `cron` was,
 
 Both kinds write their logs into `logs/` under their own id, so the folder serves the two without a prefix.
 
-Cron files are safe to edit or delete by hand — the server polls that folder and picks changes up within a few seconds. See [Editing files by hand](#editing-files-by-hand). The `executions` folder is **not** polled: it exists partly to keep the watcher's job small, so a one-time execution edited on disk is picked up at the next restart rather than within seconds.
-
-## Editing files by hand
-
-The `crons` folder is polled every 3 seconds. Changes made outside the app are applied to the scheduler and announced in the UI as a toast:
-
-| On disk              | Effect                       | Toast                                                             |
-| -------------------- | ---------------------------- | ----------------------------------------------------------------- |
-| New `.json` file     | Scheduled                    | `Cron file added: "X" — now scheduled`                            |
-| File edited          | Rescheduled                  | `Cron file updated: "X" — rescheduled`                            |
-| File deleted         | Unscheduled                  | `Cron file deleted: "X" — unscheduled`                            |
-| File is invalid JSON | Keeps its last good schedule | `x.json is not valid JSON — still running its last saved version` |
-| Invalid file fixed   | Rescheduled                  | `Cron file fixed: "X" — rescheduled`                              |
-
-Set `WATCH_INTERVAL_MS` to change the interval, or `0` to switch the watcher off.
-
-Two things the watcher deliberately stays quiet about, so you don't get told twice about your own actions:
-
-- **Changes made through the UI or API.** Those already reload the scheduler and show their own toast.
-- **Run bookkeeping.** Every run rewrites `lastRunAt`, `lastRunStatus`, `lastRunLog`, `lastRunDurationSeconds` and the three `lifetime*` totals in the cron file. Only the config fields (`name`, `description`, `cron`, `workingDirectory`, `model`, `effort`, `usageDelay`, `prompt`, `isActive`) count as a change.
-
-A file caught mid-write is treated as unchanged rather than deleted, so a save from an editor that truncates before writing does not cause a delete-then-add flicker.
+Edit jobs through the page or the API rather than the database: nodes pick up a change within a couple of syncs, and a change made directly in the tables is only seen once the hub's cache of them expires, within 10 seconds.
 
 ## How a run works
 
@@ -713,7 +689,7 @@ Two Server-Sent Event streams, no polling loops in the UI:
 | `HOST`                    | `127.0.0.1`                     | Bind address. Localhost only by default; `0.0.0.0` accepts connections from your network, with the caveats in [Network access](#network-access). |
 | `PROMPTD_HOME`          | `~/.claude/promptd`    | Storage root                                                                                                                                     |
 | `CLAUDE_BIN`              | `claude`                        | Binary to spawn. Set an absolute path if `claude` is not on the server's `PATH`.                                                                 |
-| `WATCH_INTERVAL_MS`       | `3000`                          | How often the crons folder is polled for outside changes. `0` disables it.                                                                       |
+| `DATABASE_URL`            | unset (SQLite at `$PROMPTD_HOME/promptd.sqlite`) | Hub: a `postgres://` URL to store jobs, settings and notifications in Postgres. `sqlite:<path>` picks another SQLite file. |
 | `SYSTEM_SAMPLE_MS`        | `5000`                          | How often machine stats are sampled. `0` disables the service and its meters. Floored at `1000`.                                                 |
 | `PROMPTD_LAUNCHD_LABEL` | `local.promptd`        | The hub's launchd service, which the updater restarts                                                                                            |
 | `PROMPTD_NODE_LAUNCHD_LABEL` | `$PROMPTD_LAUNCHD_LABEL.node` | The local node's launchd service, which the updater restarts first                                                                     |
@@ -830,7 +806,6 @@ As the field changes, a green line below it shows when the expression next fires
 - The directory autocomplete lists folders on the hub's machine, which is only right for jobs on the local node. For a job on another machine, type the path.
 - The directory autocomplete lets any client that can reach the server list directory names anywhere it can read. That is the same trust boundary as the rest of the app, which already runs prompts in any directory you name — another reason to keep it on localhost.
 - A pause lives in memory only. Restarting the server clears it, whichever length was chosen. So does a trigger held for usage: a restart comes back with nothing waiting. A one-time execution is the exception that proves the rule — it is on disk, so a restart finds it and, if its moment has passed, runs it.
-- The `executions` folder is not watched. Hand-edit a one-time execution and it takes effect at the next restart, not within seconds; the crons folder is the polled one.
 - The **Update available** badge reflects the last check, so it can lag a push by up to `updateCheckIntervalHours`. **Check for updates** on the Settings page refreshes it at once.
 - Deleting a cron or a one-time execution leaves its logs on disk. Remove `logs/<id>/` by hand if you want them gone — and with the cron file gone, its lifetime totals go with it.
 - Renaming a cron carries its lifetime totals, because they live on the cron file rather than being recounted from the logs.

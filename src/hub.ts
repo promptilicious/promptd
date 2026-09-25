@@ -7,7 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { bus, emit } from './events.js';
-import { NODES_FILE, NODE_TOKEN_FILE } from './paths.js';
+import { db } from './db.js';
+import { NODE_TOKEN_FILE } from './paths.js';
 import { listCrons, logPath, patchCron, pruneLogs } from './store.js';
 import { STATUSES, getExecution, listExecutions, patchExecution } from './executions.js';
 import { DEFAULT_MAX_CONCURRENT_JOBS, patchSettings } from './settings.js';
@@ -72,8 +73,6 @@ export interface HubNode {
 }
 
 export type OnlineHubNode = HubNode & { status: NodeStatus };
-
-type SavedNode = Pick<HubNode, 'commit' | 'firstSeenAt' | 'hostname' | 'id' | 'lastSeenAt' | 'name' | 'platform'>;
 
 export interface NodeListing {
   id: string;
@@ -161,7 +160,7 @@ class Hub {
     this.token = await this.ensureToken();
     await this.loadNodes();
     bus.on('event', (event: BusEvent) => {
-      if (event.type === 'crons:changed' || event.type === 'crons:files-changed') this.jobsCache = null;
+      if (event.type === 'crons:changed') this.jobsCache = null;
     });
   }
 
@@ -183,12 +182,8 @@ class Hub {
   }
 
   private async loadNodes(): Promise<void> {
-    try {
-      for (const saved of JSON.parse(await fsp.readFile(NODES_FILE, 'utf8')) as SavedNode[]) {
-        this.nodes.set(saved.id, { ...saved, instance: null, status: null, samples: [], commands: [] });
-      }
-    } catch (err) {
-      if (errorCode(err) !== 'ENOENT') console.error(`[hub] could not read ${NODES_FILE}: ${errorMessage(err)}`);
+    for (const saved of await db().selectFrom('nodes').selectAll().execute()) {
+      this.nodes.set(saved.id, { ...saved, instance: null, status: null, samples: [], commands: [] });
     }
   }
 
@@ -205,15 +200,24 @@ class Hub {
         firstSeenAt,
         lastSeenAt,
       }));
-      const tmp = `${NODES_FILE}.${process.pid}.tmp`;
-      fsp
-        .writeFile(tmp, `${JSON.stringify(rows, null, 2)}\n`, 'utf8')
-        .then(() => fsp.rename(tmp, NODES_FILE))
-        .catch((err: unknown) => console.error(`[hub] could not save ${NODES_FILE}: ${errorMessage(err)}`));
+      if (!rows.length) return;
+      db()
+        .insertInto('nodes')
+        .values(rows)
+        .onConflict((conflict) =>
+          conflict.column('id').doUpdateSet((eb) => ({
+            name: eb.ref('excluded.name'),
+            hostname: eb.ref('excluded.hostname'),
+            platform: eb.ref('excluded.platform'),
+            commit: eb.ref('excluded.commit'),
+            lastSeenAt: eb.ref('excluded.lastSeenAt'),
+          })),
+        )
+        .execute()
+        .catch((err: unknown) => console.error(`[hub] could not save the node list: ${errorMessage(err)}`));
     }, 1000);
     this.saveTimer.unref?.();
   }
-
 
   private isOnline(node: HubNode | undefined | null): node is OnlineHubNode {
     return Boolean(node?.status) && Date.now() - Date.parse(node!.lastSeenAt) < OFFLINE_AFTER_MS;
@@ -272,7 +276,11 @@ class Hub {
     if (!node) return { ok: false, status: 404, error: 'node not found' };
     if (this.isOnline(node)) return { ok: false, status: 409, error: 'this node is online; stop it before removing it' };
     this.nodes.delete(id);
-    this.saveNodes();
+    db()
+      .deleteFrom('nodes')
+      .where('id', '=', id)
+      .execute()
+      .catch((err: unknown) => console.error(`[hub] could not remove node "${id}": ${errorMessage(err)}`));
     return { ok: true };
   }
 
