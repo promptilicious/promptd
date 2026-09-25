@@ -1,8 +1,30 @@
+import type { Dirent } from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { LOGS_DIR } from './paths.js';
 import { listCrons, safeName } from './store.js';
 import { loadSettings, patchSettings } from './settings.js';
+import type { Cron } from './types.js';
+
+export interface LogMove {
+  from: string;
+  to: string;
+  cronName: string;
+}
+
+export interface LogMigrationPlan {
+  moves: LogMove[];
+  alreadyById: number;
+  unmatched: string[];
+  contested: Array<{ name: string; cronIds: string[] }>;
+}
+
+export interface LogMigrationResult {
+  skipped: boolean;
+  renamed: number;
+  merged: number;
+  failed: Array<LogMove & { error: string }>;
+}
 
 /**
  * Maps the log folders on disk to the crons that wrote them.
@@ -16,28 +38,28 @@ import { loadSettings, patchSettings } from './settings.js';
  * cron. The oldest wins it, since it is the one whose runs are most likely in
  * there, and the collision is reported.
  */
-export async function planLogMigration() {
+export async function planLogMigration(): Promise<LogMigrationPlan> {
   const crons = await listCrons();
   const ids = new Set(crons.map((cron) => cron.id));
 
-  const byName = new Map();
-  const contested = new Map();
+  const byName = new Map<string, Cron>();
+  const contested = new Map<string, Cron[]>();
   const oldestFirst = [...crons].sort((a, b) => String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')));
   for (const cron of oldestFirst) {
     const key = safeName(cron.name);
-    if (byName.has(key)) contested.set(key, [...(contested.get(key) ?? [byName.get(key)]), cron]);
+    if (byName.has(key)) contested.set(key, [...(contested.get(key) ?? [byName.get(key)!]), cron]);
     else byName.set(key, cron);
   }
 
-  let entries = [];
+  let entries: Dirent[];
   try {
     entries = await fsp.readdir(LOGS_DIR, { withFileTypes: true });
   } catch {
     return { moves: [], alreadyById: 0, unmatched: [], contested: [] };
   }
 
-  const moves = [];
-  const unmatched = [];
+  const moves: LogMove[] = [];
+  const unmatched: string[] = [];
   let alreadyById = 0;
   for (const entry of entries) {
     // update.log is a file that lives beside the folders; only folders move.
@@ -63,7 +85,7 @@ export async function planLogMigration() {
 }
 
 /** Moves one folder, merging file by file when the destination already exists. */
-async function moveLogDir(from, to) {
+async function moveLogDir(from: string, to: string): Promise<'merged' | 'renamed'> {
   const fromPath = path.join(LOGS_DIR, from);
   const toPath = path.join(LOGS_DIR, to);
   const destExists = await fsp
@@ -96,14 +118,14 @@ async function moveLogDir(from, to) {
  * flag stays off and the next boot tries again, which is what keeps a half
  * finished migration from being written off as done.
  */
-export async function migrateLogDirs({ force = false } = {}) {
+export async function migrateLogDirs({ force = false }: { force?: boolean } = {}): Promise<LogMigrationResult> {
   const settings = await loadSettings();
   if (settings.logsMigrated && !force) return { skipped: true, renamed: 0, merged: 0, failed: [] };
 
   const plan = await planLogMigration();
   let renamed = 0;
   let merged = 0;
-  const failed = [];
+  const failed: LogMigrationResult['failed'] = [];
   for (const move of plan.moves) {
     try {
       const how = await moveLogDir(move.from, move.to);
@@ -111,8 +133,8 @@ export async function migrateLogDirs({ force = false } = {}) {
       else renamed += 1;
       console.log(`[logs] ${how} "${move.from}" -> ${move.to} ("${move.cronName}")`);
     } catch (err) {
-      failed.push({ ...move, error: err.message });
-      console.error(`[logs] could not move "${move.from}" -> ${move.to}: ${err.message}`);
+      failed.push({ ...move, error: (err as Error).message });
+      console.error(`[logs] could not move "${move.from}" -> ${move.to}: ${(err as Error).message}`);
     }
   }
 

@@ -109,13 +109,16 @@ case ":$AGENT_PATH:" in *":$NODE_DIR:"*) ;; *) AGENT_PATH="$NODE_DIR:$AGENT_PATH
 
 # --- dependencies -----------------------------------------------------
 
-if [ ! -d "$PROJECT_DIR/node_modules" ]; then
-  info "node_modules is missing, running npm install"
+if [ ! -d "$PROJECT_DIR/node_modules/typescript" ]; then
+  info "dependencies are missing, running npm install"
   (cd "$PROJECT_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1) || die "npm install failed; run it by hand and try again"
   ok "dependencies installed"
 else
   ok "dependencies present"
 fi
+
+(cd "$PROJECT_DIR" && npm run build >/dev/null 2>&1) || die "the build failed; run npm run build in $PROJECT_DIR to see why"
+ok "built"
 
 mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents" || die "could not create $LOG_DIR"
 

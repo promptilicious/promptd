@@ -58,6 +58,13 @@ else
   log "dependencies unchanged"
 fi
 
+# A build that fails leaves the running processes on the code they loaded, so
+# stop here rather than restart them into it.
+log "building"
+if ! npm run build 2>&1 | tail -20; then
+  die "build failed; the new code is on disk but nothing was restarted"
+fi
+
 # Restart. Only launchd can bring a process back up, so an agent that is not
 # registered is left alone rather than killed. The node goes first: the hub is
 # what launched this script.

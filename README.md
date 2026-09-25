@@ -28,6 +28,15 @@ npm run start:hub  # the hub alone
 npm run start:node # a node alone
 ```
 
+The server is TypeScript, compiled from `src/` into `dist/`. Every start command compiles first when any source has changed since the last build, so a `git pull` needs nothing extra. `npm run dev` also keeps the compiler running and restarts on each change.
+
+```bash
+npm run build      # compile src/ into dist/
+npm run typecheck  # type-check sources and tests without writing dist/
+npm run lint
+npm test
+```
+
 ## Hub and nodes
 
 promptd is two processes. The **hub** (`src/server.js`) stores every job, log, setting and notification, and serves the web page. A **node** (`src/node.js`) runs jobs: it keeps its own schedules, spawns `claude`, and holds runs against its usage limits and concurrency limit.

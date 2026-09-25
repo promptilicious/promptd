@@ -6,6 +6,49 @@ import { emit } from './events.js';
 import { LOGS_DIR } from './paths.js';
 import { loadSettings, patchSettings } from './settings.js';
 import { hub } from './hub.js';
+import type { Settings } from './types.js';
+
+interface GitResult {
+  ok: boolean;
+  out: string;
+  err: string;
+}
+
+export interface UpdateCheck {
+  updatable: boolean;
+  reason: string | null;
+  behind?: number;
+  ahead?: number;
+  head?: string;
+}
+
+export type UpdateAvailability = {
+  updateAvailable: boolean;
+  updateBehind: number;
+  updateCheckedAt: string | null;
+};
+
+export interface DrainState {
+  draining: boolean;
+  runningCount: number;
+  since: string | null;
+}
+
+export type UpdateOutcome = Omit<UpdateCheck, 'reason'> &
+  Partial<DrainState> & {
+    reason?: string | null;
+    launched: boolean;
+    waiting?: boolean;
+    pid?: number | null;
+  };
+
+interface LastCheck {
+  updatable: boolean;
+  behind: number;
+  head: string | null;
+  reason: string | null;
+  at: string | null;
+}
 
 // Normally the checkout this file lives in; overridable so the update path can
 // be exercised against a scratch repository.
@@ -37,7 +80,7 @@ const BRANCH = 'main';
 const REMOTE = 'origin';
 
 /** git, never interactive: no credential prompts, no host key questions, no pager. */
-function git(args, timeout = 60000) {
+function git(args: string[], timeout = 60000): Promise<GitResult> {
   return new Promise((resolve) => {
     execFile(
       'git',
@@ -59,7 +102,7 @@ function git(args, timeout = 60000) {
 }
 
 /** The commit the project is checked out at, or null outside a repository. */
-export async function currentCommit() {
+export async function currentCommit(): Promise<string | null> {
   const head = await git(['rev-parse', '--short', 'HEAD'], 10000);
   return head.ok && head.out ? head.out : null;
 }
@@ -68,7 +111,7 @@ export async function currentCommit() {
  * Is the project's main branch behind its remote? Returns a reason instead of a
  * count whenever the question cannot be answered safely.
  */
-export async function checkForUpdates() {
+export async function checkForUpdates(): Promise<UpdateCheck> {
   const repo = await git(['rev-parse', '--is-inside-work-tree']);
   if (!repo.ok || repo.out !== 'true') return { updatable: false, reason: 'not a git repository' };
 
@@ -87,7 +130,7 @@ export async function checkForUpdates() {
 
   const counts = await git(['rev-list', '--left-right', '--count', `${BRANCH}...${REMOTE}/${BRANCH}`]);
   if (!counts.ok) return { updatable: false, reason: `could not compare with ${REMOTE}/${BRANCH}` };
-  const [ahead, behind] = counts.out.split(/\s+/).map(Number);
+  const [ahead, behind] = counts.out.split(/\s+/).map(Number) as [number, number];
 
   const head = await git(['rev-parse', '--short', 'HEAD']);
   if (behind > 0 && ahead > 0) {
@@ -97,7 +140,15 @@ export async function checkForUpdates() {
 }
 
 class SelfUpdater {
-  constructor() {
+  public timer: NodeJS.Timeout | null;
+  public busy: boolean;
+  public draining: boolean;
+  public drainTimer: NodeJS.Timeout | null;
+  public drainStartedAt: number | null;
+  public waitingCount: number | null;
+  public lastCheck: LastCheck;
+
+  public constructor() {
     this.timer = null;
     this.busy = false;
     /** Set from the moment schedules are held until the restart takes us down. */
@@ -115,7 +166,7 @@ class SelfUpdater {
   }
 
   /** What the health endpoint and the header badge read. */
-  availability() {
+  public availability(): UpdateAvailability {
     return {
       updateAvailable: Boolean(this.lastCheck.updatable),
       updateBehind: this.lastCheck.behind,
@@ -124,7 +175,7 @@ class SelfUpdater {
   }
 
   /** Remembers a check result, announcing only a change of answer. */
-  recordCheck(result) {
+  public recordCheck(result: UpdateCheck): UpdateCheck {
     const was = Boolean(this.lastCheck.updatable);
     this.lastCheck = {
       updatable: Boolean(result?.updatable),
@@ -138,7 +189,7 @@ class SelfUpdater {
   }
 
   /** What the page polls while an update is queued behind a running cron. */
-  state() {
+  public state(): DrainState {
     return {
       draining: this.draining,
       runningCount: hub.runningCount(),
@@ -146,7 +197,7 @@ class SelfUpdater {
     };
   }
 
-  start() {
+  public start(): void {
     // Idempotent: calling it twice must not leave two intervals ticking.
     if (this.timer) return;
     // A moment after boot, then on a slow tick. Not awaited by startup.
@@ -155,12 +206,12 @@ class SelfUpdater {
     this.timer.unref?.();
   }
 
-  stop() {
+  public stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }
 
-  due(settings) {
+  public due(settings: Pick<Settings, 'lastUpdateCheckAt' | 'updateCheckIntervalHours'>): boolean {
     if (!settings.lastUpdateCheckAt) return true;
     const hours = Number(settings.updateCheckIntervalHours) || 24;
     const elapsed = Date.now() - new Date(settings.lastUpdateCheckAt).getTime();
@@ -171,7 +222,7 @@ class SelfUpdater {
    * Checks, and launches the updater when main is behind. Shared by the daily
    * tick and the Update now button, so both behave identically.
    */
-  async applyIfBehind() {
+  public async applyIfBehind(): Promise<UpdateOutcome> {
     if (this.draining) {
       // Already committed to updating; a second press just reports the wait.
       return { updatable: true, launched: true, waiting: true, pid: null, ...this.state() };
@@ -199,8 +250,8 @@ class SelfUpdater {
    * Polls until no run is in flight, then hands over to the update script.
    * Returns the script's pid when it could start immediately, else null.
    */
-  startDrain() {
-    let pid = null;
+  public startDrain(): number | null | undefined {
+    let pid: number | null | undefined = null;
     const tick = () => {
       const running = hub.runningCount();
       if (running === 0 && hub.everyNodeHolding()) {
@@ -208,11 +259,11 @@ class SelfUpdater {
         pid = this.launch();
         return;
       }
-      if (Date.now() - this.drainStartedAt >= DRAIN_LIMIT_MS) {
+      if (Date.now() - this.drainStartedAt! >= DRAIN_LIMIT_MS) {
         console.error(`[update] gave up after ${Math.round(DRAIN_LIMIT_MS / 60000)}m; ${running} run(s) still going. Resuming schedules, update not applied.`);
         this.stopDrain();
         emit('update:abandoned', { runningCount: running });
-        hub.resumeAll('update gave up waiting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+        hub.resumeAll('update gave up waiting').catch((err: Error) => console.error(`[cron] resume failed: ${err.message}`));
         return;
       }
       // The news is how many runs are left, so it is only news when that number
@@ -232,7 +283,7 @@ class SelfUpdater {
     return pid;
   }
 
-  stopDrain() {
+  public stopDrain(): void {
     if (this.drainTimer) clearInterval(this.drainTimer);
     this.drainTimer = null;
     this.draining = false;
@@ -244,7 +295,7 @@ class SelfUpdater {
    * update is applied. With it off the answer is kept for the header badge, so
    * an update can be offered without ever being taken.
    */
-  async tick(force = false) {
+  public async tick(force = false): Promise<UpdateOutcome | null> {
     if (this.busy || this.draining) return null;
     const settings = await loadSettings();
     if (!force && !this.due(settings)) return null;
@@ -262,7 +313,7 @@ class SelfUpdater {
     }
   }
 
-  reportOnly(result) {
+  public reportOnly(result: UpdateCheck): UpdateOutcome {
     console.log(
       result.updatable
         ? `[update] ${result.behind} commit(s) behind ${REMOTE}/${BRANCH}; self update is off, so nothing was applied`
@@ -275,7 +326,7 @@ class SelfUpdater {
    * Hands the update to a process that outlives this one: it has to survive the
    * server being restarted, which is the last thing it does.
    */
-  launch() {
+  public launch(): number | undefined {
     console.log('[update] no runs in flight; starting the update script');
     const logFd = fs.openSync(UPDATE_LOG, 'a');
     const child = spawn('/bin/bash', [UPDATE_SCRIPT], {
@@ -299,7 +350,7 @@ class SelfUpdater {
       const grace = setTimeout(() => {
         console.error(`[update] no restart arrived; see ${UPDATE_LOG}. Resuming schedules.`);
         emit('update:failed', { code, updateLog: UPDATE_LOG });
-        hub.resumeAll('update finished without restarting').catch((err) => console.error(`[cron] resume failed: ${err.message}`));
+        hub.resumeAll('update finished without restarting').catch((err: Error) => console.error(`[cron] resume failed: ${err.message}`));
       }, RESTART_GRACE_MS);
       grace.unref?.();
     });

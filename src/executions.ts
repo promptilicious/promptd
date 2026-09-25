@@ -3,6 +3,14 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { EXECUTIONS_DIR } from './paths.js';
 import { normalizeUsageDelay } from './usage.js';
+import type { Execution, ExecutionInput, ExecutionStatus } from './types.js';
+
+export interface ExecutionPage {
+  items: Execution[];
+  nextBefore: string | null;
+  total: number;
+  scheduled: number;
+}
 
 /**
  * One-time executions: a prompt with a date instead of a cron expression.
@@ -24,14 +32,14 @@ export const PAGE_SIZE = 10;
  * history, still re-runnable by hand, and `cancelled` is a trigger the user
  * dropped while it waited on usage — neither re-fires on its own.
  */
-export const STATUSES = ['scheduled', 'running', 'done', 'cancelled'];
+export const STATUSES: ExecutionStatus[] = ['scheduled', 'running', 'done', 'cancelled'];
 
-function executionFile(id) {
+function executionFile(id: string): string {
   return path.join(EXECUTIONS_DIR, `${id}.json`);
 }
 
 /** A date the browser's datetime-local field produced, or null if it is not one. */
-export function parseScheduledAt(input) {
+export function parseScheduledAt(input: unknown): Date | null {
   const raw = String(input ?? '').trim();
   if (!raw) return null;
   const date = new Date(raw);
@@ -43,46 +51,49 @@ export function parseScheduledAt(input) {
  * history. A record with an unreadable date sorts last rather than first, so a
  * hand-edited file cannot push itself to the top of the list.
  */
-export function byScheduledAtDesc(a, b) {
+export function byScheduledAtDesc(
+  a: Pick<Execution, 'createdAt' | 'scheduledAt'>,
+  b: Pick<Execution, 'createdAt' | 'scheduledAt'>,
+): number {
   const left = Date.parse(a.scheduledAt ?? '') || 0;
   const right = Date.parse(b.scheduledAt ?? '') || 0;
   if (left !== right) return right - left;
   return String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? ''));
 }
 
-export async function listExecutions() {
-  let names = [];
+export async function listExecutions(): Promise<Execution[]> {
+  let names: string[];
   try {
     names = await fs.readdir(EXECUTIONS_DIR);
   } catch {
     return [];
   }
-  const executions = [];
+  const executions: Execution[] = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     try {
       const raw = await fs.readFile(path.join(EXECUTIONS_DIR, name), 'utf8');
-      const execution = JSON.parse(raw);
+      const execution = JSON.parse(raw) as Execution;
       execution.id ||= name.replace(/\.json$/, '');
       executions.push(execution);
     } catch (err) {
-      console.error(`[executions] skipping unreadable execution ${name}: ${err.message}`);
+      console.error(`[executions] skipping unreadable execution ${name}: ${(err as Error).message}`);
     }
   }
   return executions.sort(byScheduledAtDesc);
 }
 
-export async function getExecution(id) {
+export async function getExecution(id: string): Promise<Execution | null> {
   try {
-    return JSON.parse(await fs.readFile(executionFile(id), 'utf8'));
+    return JSON.parse(await fs.readFile(executionFile(id), 'utf8')) as Execution;
   } catch (err) {
-    if (err.code === 'ENOENT') return null;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
 }
 
 /** Temp file then rename, so a crash never leaves half a JSON file behind. */
-async function writeExecution(execution) {
+async function writeExecution(execution: Execution): Promise<void> {
   const target = executionFile(execution.id);
   const tmp = `${target}.${process.pid}.tmp`;
   await fs.mkdir(EXECUTIONS_DIR, { recursive: true });
@@ -90,9 +101,9 @@ async function writeExecution(execution) {
   await fs.rename(tmp, target);
 }
 
-export async function createExecution(input) {
+export async function createExecution(input: ExecutionInput): Promise<Execution> {
   const now = new Date().toISOString();
-  const execution = {
+  const execution: Execution = {
     id: randomUUID(),
     name: input.name,
     description: input.description ?? '',
@@ -128,11 +139,11 @@ export async function createExecution(input) {
  * still `running` before it writes `done`, so a date set while claude was
  * working survives rather than being closed over.
  */
-export async function updateExecution(id, input) {
+export async function updateExecution(id: string, input: ExecutionInput): Promise<Execution | null> {
   const existing = await getExecution(id);
   if (!existing) return null;
   const rescheduled = input.scheduledAt !== existing.scheduledAt;
-  const execution = {
+  const execution: Execution = {
     ...existing,
     name: input.name,
     description: input.description ?? '',
@@ -154,20 +165,20 @@ export async function updateExecution(id, input) {
 }
 
 /** Records the outcome of a run on the execution itself, like patchCron does. */
-export async function patchExecution(id, patch) {
+export async function patchExecution(id: string, patch: Partial<Execution>): Promise<Execution | null> {
   const existing = await getExecution(id);
   if (!existing) return null;
-  const execution = { ...existing, ...patch };
+  const execution: Execution = { ...existing, ...patch };
   await writeExecution(execution);
   return execution;
 }
 
-export async function deleteExecution(id) {
+export async function deleteExecution(id: string): Promise<boolean> {
   try {
     await fs.unlink(executionFile(id));
     return true;
   } catch (err) {
-    if (err.code === 'ENOENT') return false;
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
 }
@@ -178,7 +189,10 @@ export async function deleteExecution(id) {
  * way: records are created while the list is open, and an offset would show one
  * of them a second time.
  */
-export async function pageExecutions({ before = null, limit = PAGE_SIZE } = {}) {
+export async function pageExecutions({
+  before = null,
+  limit = PAGE_SIZE,
+}: { before?: string | null; limit?: unknown } = {}): Promise<ExecutionPage> {
   const all = await listExecutions();
   // Generous ceiling: the home page re-reads everything it has already shown in
   // one request whenever a run event redraws it, so the cap has to clear a list

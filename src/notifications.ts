@@ -3,6 +3,70 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { bus, emit } from './events.js';
 import { ROOT } from './paths.js';
+import type { RunningJobSummary } from './system.js';
+import type { BusEvent, JobKind, UsageBlocker } from './types.js';
+
+export interface NotificationRecord {
+  id: string;
+  at: string;
+  kind: string;
+  message: string;
+  read: boolean;
+  cronId: string | null;
+  cronName: string | null;
+  jobKind: JobKind;
+  file: string;
+  writing?: Promise<void> | null;
+}
+
+export type NotificationView = Omit<NotificationRecord, 'file' | 'writing'>;
+
+export interface NotificationPage {
+  items: NotificationView[];
+  nextBefore: string | null;
+  unread: number;
+  total: number;
+}
+
+interface NotificationDraft {
+  kind: string;
+  message: string;
+  read?: boolean;
+  cronId?: string | null;
+  cronName?: string | null;
+  jobKind?: JobKind;
+}
+
+type DescribableEvent = BusEvent & {
+  cronId?: string | null;
+  cronName?: string | null;
+  kind?: JobKind;
+  status?: string;
+  seconds?: number;
+  error?: string;
+  reason?: string;
+  hold?: 'concurrency' | 'usage';
+  position?: number;
+  queueLength?: number;
+  runningCount?: number;
+  ran?: boolean;
+  lateBy?: string;
+  paused?: boolean;
+  label?: string;
+  resumedFrom?: string | null;
+  updateAvailable?: boolean;
+  updateBehind?: number;
+  from?: string | null;
+  code?: number | null;
+  summary?: string;
+  running?: RunningJobSummary[];
+  reasons?: UsageBlocker[];
+  added?: string[];
+  updated?: string[];
+  removed?: string[];
+  repaired?: string[];
+  broken?: Array<{ file: string }>;
+};
 
 /**
  * Every notice the server produces, kept so it can be read later.
@@ -29,7 +93,7 @@ export const PAGE_SIZE = 20;
 const LOAD_CONCURRENCY = 64;
 
 /** `2026-09-15T22-31-33.059Z-4f3c21aa.json`, which sorts chronologically. */
-function fileName(record) {
+function fileName(record: Pick<NotificationRecord, 'at' | 'id'>): string {
   return `${record.at.replace(/:/g, '-')}-${record.id.slice(0, 8)}.json`;
 }
 
@@ -40,7 +104,7 @@ function fileName(record) {
  * Three names at most. A machine busy enough to alert may have several runs on
  * it, and a notification is a line to read, not a table.
  */
-function runningSummary(running = []) {
+function runningSummary(running: RunningJobSummary[] = []): string {
   if (!running.length) return 'No crons were running.';
   const named = running.slice(0, 3).map((run) => {
     const ms = Date.now() - Date.parse(run.startedAt);
@@ -53,7 +117,7 @@ function runningSummary(running = []) {
 }
 
 /** The limits a held trigger is waiting on, e.g. "Session, Weekly". */
-function blockerNames(event) {
+function blockerNames(event: DescribableEvent): string {
   return (event?.reasons ?? []).map((reason) => reason.label).join(', ');
 }
 
@@ -68,10 +132,10 @@ function blockerNames(event) {
  * written in the client and these on the server, so the two are kept in step by
  * hand; a difference in wording is a bug, not a feature.
  */
-function describe(event) {
+function describe(event: DescribableEvent): NotificationDraft | NotificationDraft[] | null {
   // jobKind, not kind: `kind` on a notification is what sort of notice it is,
   // and this is what sort of thing it happened to.
-  const cron = { cronId: event.cronId ?? null, cronName: event.cronName ?? null, jobKind: event.kind ?? 'cron' };
+  const cron: Pick<NotificationDraft, 'cronId' | 'cronName' | 'jobKind'> = { cronId: event.cronId ?? null, cronName: event.cronName ?? null, jobKind: event.kind ?? 'cron' };
   // A one-time execution names itself as one, so a line in the drawer is not
   // read as a cron that has started misbehaving.
   const name = event.kind === 'execution' ? `one-time "${event.cronName}"` : `"${event.cronName}"`;
@@ -124,7 +188,7 @@ function describe(event) {
         // on: the limit is the same for every one of them, the place is not.
         message:
           event.hold === 'concurrency'
-            ? `${name} is queued at position ${event.position + 1} of ${event.queueLength}, behind ${event.runningCount} running job${event.runningCount === 1 ? '' : 's'}`
+            ? `${name} is queued at position ${event.position! + 1} of ${event.queueLength}, behind ${event.runningCount} running job${event.runningCount === 1 ? '' : 's'}`
             : `${name} is waiting on ${blockerNames(event)}`,
         ...cron,
       };
@@ -188,7 +252,7 @@ function describe(event) {
         message: `${event.label}: ${event.summary}. ${runningSummary(event.running)}`,
       };
     case 'crons:files-changed': {
-      const out = [];
+      const out: NotificationDraft[] = [];
       for (const cronName of event.added ?? []) out.push({ kind: 'cron', read: true, message: `Cron file added: "${cronName}", now scheduled` });
       for (const cronName of event.updated ?? []) out.push({ kind: 'cron', read: true, message: `Cron file updated: "${cronName}", rescheduled` });
       for (const cronName of event.removed ?? []) out.push({ kind: 'cron', read: true, message: `Cron file deleted: "${cronName}", unscheduled` });
@@ -206,7 +270,11 @@ function describe(event) {
 }
 
 class NotificationCenter {
-  constructor() {
+  public items: NotificationRecord[];
+  public ready: Promise<number> | null;
+  public listening: boolean;
+
+  public constructor() {
     /** Newest first, which is the order everything reads them in. @type {Array<object>} */
     this.items = [];
     /** The startup read, so the API can wait for it without blocking the server. @type {Promise|null} */
@@ -221,13 +289,13 @@ class NotificationCenter {
    * coming off disk are appended under them rather than replacing them: they
    * are older by definition.
    */
-  start() {
+  public start(): Promise<number> {
     if (!this.listening) {
       bus.on('event', (event) => {
         try {
           this.record(event);
         } catch (err) {
-          console.error(`[notifications] could not record ${event?.type}: ${err.message}`);
+          console.error(`[notifications] could not record ${event?.type}: ${(err as Error).message}`);
         }
       });
       this.listening = true;
@@ -236,7 +304,7 @@ class NotificationCenter {
     return this.ready;
   }
 
-  async load() {
+  public async load(): Promise<number> {
     await fsp.mkdir(NOTIFICATIONS_DIR, { recursive: true }).catch(() => {});
     const names = (await fsp.readdir(NOTIFICATIONS_DIR).catch(() => []))
       .filter((name) => name.endsWith('.json'))
@@ -250,14 +318,14 @@ class NotificationCenter {
       await fsp.rm(path.join(NOTIFICATIONS_DIR, stale), { force: true }).catch(() => {});
     }
 
-    const loaded = [];
+    const loaded: NotificationRecord[] = [];
     for (let index = 0; index < names.length; index += LOAD_CONCURRENCY) {
       const batch = await Promise.all(
-        names.slice(index, index + LOAD_CONCURRENCY).map(async (name) => {
+        names.slice(index, index + LOAD_CONCURRENCY).map(async (name): Promise<NotificationRecord | null> => {
           const raw = await fsp.readFile(path.join(NOTIFICATIONS_DIR, name), 'utf8').catch(() => null);
           if (!raw) return null;
           try {
-            const record = JSON.parse(raw);
+            const record = JSON.parse(raw) as NotificationRecord | null;
             // A file with no timestamp cannot be ordered, so it is left on disk
             // and ignored rather than shown in the wrong place.
             return record?.id && record?.at ? { ...record, read: Boolean(record.read), file: name } : null;
@@ -273,10 +341,10 @@ class NotificationCenter {
   }
 
   /** Turns one bus event into however many notifications it is worth. */
-  record(event) {
-    const described = describe(event);
+  public record(event: BusEvent): void {
+    const described = describe(event as DescribableEvent);
     if (!described) return;
-    for (const one of [].concat(described)) this.add(one);
+    for (const one of ([] as NotificationDraft[]).concat(described)) this.add(one);
   }
 
   /**
@@ -284,7 +352,7 @@ class NotificationCenter {
    * on: a notification that cannot be written is still worth showing, and the
    * event that produced it must not be held up by a filesystem.
    */
-  add({ kind, message, read = true, cronId = null, cronName = null, jobKind = 'cron' }) {
+  public add({ kind, message, read = true, cronId = null, cronName = null, jobKind = 'cron' }: NotificationDraft): NotificationRecord {
     const record = {
       id: randomUUID(),
       at: new Date().toISOString(),
@@ -295,7 +363,7 @@ class NotificationCenter {
       cronName,
       // Which page the drawer's link should open: a cron's logs or an execution's.
       jobKind,
-    };
+    } as NotificationRecord;
     record.file = fileName(record);
     this.items.unshift(record);
     const pruned = this.items.length > MAX_NOTIFICATIONS ? this.items.splice(MAX_NOTIFICATIONS) : [];
@@ -306,10 +374,10 @@ class NotificationCenter {
   }
 
   /** Marks the given ids read, and answers with what is still unread. */
-  async markRead(ids) {
+  public async markRead(ids: string | string[] | null | undefined): Promise<{ marked: number; unread: number }> {
     await this.ready;
-    const wanted = new Set([].concat(ids ?? []));
-    const changed = [];
+    const wanted = new Set(([] as string[]).concat(ids ?? []));
+    const changed: NotificationRecord[] = [];
     for (const record of this.items) {
       if (!record.read && wanted.has(record.id)) {
         record.read = true;
@@ -324,7 +392,7 @@ class NotificationCenter {
   }
 
   /** Marks every stored notification read, which is the drawer's one button. */
-  async markAllRead() {
+  public async markAllRead(): Promise<{ marked: number; unread: number }> {
     await this.ready;
     const changed = this.items.filter((record) => !record.read);
     for (const record of changed) record.read = true;
@@ -342,7 +410,11 @@ class NotificationCenter {
    * cursor is an id either way, so it keeps working across the filter being
    * turned on: the read ones between two unread ones are simply skipped.
    */
-  async page({ before = null, limit = PAGE_SIZE, unreadOnly = false } = {}) {
+  public async page({
+    before = null,
+    limit = PAGE_SIZE,
+    unreadOnly = false,
+  }: { before?: string | null; limit?: unknown; unreadOnly?: boolean } = {}): Promise<NotificationPage> {
     await this.ready;
     const size = Math.max(1, Math.min(100, Number(limit) || PAGE_SIZE));
     let start = 0;
@@ -366,12 +438,12 @@ class NotificationCenter {
   }
 
   /** The file name and the in-flight write are ours, not the reader's. */
-  view(record) {
+  public view(record: NotificationRecord): NotificationView {
     const { file, writing, ...rest } = record;
     return rest;
   }
 
-  unreadCount() {
+  public unreadCount(): number {
     let count = 0;
     for (const record of this.items) if (!record.read) count += 1;
     return count;
@@ -385,14 +457,14 @@ class NotificationCenter {
    * recreates the file and it is there for good. `writing` is what `remove`
    * waits on so that cannot happen.
    */
-  async persist(record) {
+  public async persist(record: NotificationRecord): Promise<void> {
     const write = this.write(record);
     record.writing = write;
     await write;
     if (record.writing === write) record.writing = null;
   }
 
-  async write(record) {
+  public async write(record: NotificationRecord): Promise<void> {
     try {
       await fsp.mkdir(NOTIFICATIONS_DIR, { recursive: true });
       const target = path.join(NOTIFICATIONS_DIR, record.file);
@@ -400,11 +472,11 @@ class NotificationCenter {
       await fsp.writeFile(tmp, `${JSON.stringify(this.view(record), null, 2)}\n`, 'utf8');
       await fsp.rename(tmp, target);
     } catch (err) {
-      console.error(`[notifications] could not write ${record.file}: ${err.message}`);
+      console.error(`[notifications] could not write ${record.file}: ${(err as Error).message}`);
     }
   }
 
-  async remove(record) {
+  public async remove(record: NotificationRecord): Promise<void> {
     // Never delete ahead of the write that would put it back.
     await record.writing?.catch(() => {});
     await fsp.rm(path.join(NOTIFICATIONS_DIR, record.file), { force: true }).catch(() => {});

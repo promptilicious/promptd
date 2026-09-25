@@ -3,6 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { emit } from './events.js';
+import type { ModelCatalogState } from './types.js';
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -16,8 +17,8 @@ const PROBE_CONCURRENCY = 6;
 const FAMILY_ORDER = ['opus', 'sonnet', 'haiku', 'fable'];
 
 /** Absolute path of the binary we would spawn, following symlinks. */
-async function resolveBinary() {
-  const candidates = [];
+async function resolveBinary(): Promise<string | null> {
+  const candidates: string[] = [];
   if (CLAUDE_BIN.includes('/')) candidates.push(path.resolve(CLAUDE_BIN));
   else {
     for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
@@ -40,11 +41,11 @@ async function resolveBinary() {
  * lives, so the list tracks the CLI rather than anything hardcoded here. Every
  * hit is a candidate only — scanning also turns up junk, which the probe drops.
  */
-async function scrapeCandidates(binary) {
-  const found = new Set();
+async function scrapeCandidates(binary: string): Promise<string[]> {
+  const found = new Set<string>();
   const stream = fs.createReadStream(binary, { encoding: 'latin1', highWaterMark: 4 << 20 });
   let carry = '';
-  for await (const chunk of stream) {
+  for await (const chunk of stream as AsyncIterable<string>) {
     const text = carry + chunk;
     for (const match of text.matchAll(ID_PATTERN)) found.add(match[0]);
     carry = text.slice(-64); // an id could straddle a chunk boundary
@@ -58,14 +59,14 @@ async function scrapeCandidates(binary) {
  * Asks the CLI whether it knows a model. An empty prompt makes it validate the
  * model and then bail out on the missing input, so this costs no tokens.
  */
-function isKnownModel(model) {
+function isKnownModel(model: string): Promise<boolean> {
   return new Promise((resolve) => {
     const child = spawn(CLAUDE_BIN, ['-p', '', '--model', model], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
     });
     let output = '';
-    const collect = (chunk) => {
+    const collect = (chunk: Buffer): void => {
       output += chunk;
     };
     child.stdout.on('data', collect);
@@ -82,8 +83,8 @@ function isKnownModel(model) {
   });
 }
 
-async function filterKnown(candidates) {
-  const known = [];
+async function filterKnown(candidates: string[]): Promise<string[]> {
+  const known: string[] = [];
   for (let i = 0; i < candidates.length; i += PROBE_CONCURRENCY) {
     const batch = candidates.slice(i, i + PROBE_CONCURRENCY);
     const results = await Promise.all(batch.map(isKnownModel));
@@ -95,12 +96,12 @@ async function filterKnown(candidates) {
 }
 
 /** "claude-haiku-4-5" becomes "Haiku 4.5"; "opus" becomes "Opus (latest)". */
-function label(value) {
-  if (ALIASES.includes(value)) return `${value[0].toUpperCase()}${value.slice(1)} (latest)`;
+function label(value: string): string {
+  if (ALIASES.includes(value)) return `${value[0]!.toUpperCase()}${value.slice(1)} (latest)`;
   const parts = value.replace(/^claude-/, '').split('-');
   const family = parts.shift() ?? value;
-  const words = [];
-  let version = [];
+  const words: string[] = [];
+  let version: string[] = [];
   for (const part of parts) {
     if (/^\d+$/.test(part)) version.push(part);
     else {
@@ -108,21 +109,21 @@ function label(value) {
         words.push(version.join('.'));
         version = [];
       }
-      words.push(`${part[0].toUpperCase()}${part.slice(1)}`);
+      words.push(`${part[0]!.toUpperCase()}${part.slice(1)}`);
     }
   }
   if (version.length) words.push(version.join('.'));
-  return [`${family[0].toUpperCase()}${family.slice(1)}`, ...words].join(' ');
+  return [`${family[0]!.toUpperCase()}${family.slice(1)}`, ...words].join(' ');
 }
 
-function sortModels(values) {
-  const familyIndex = (value) => {
+function sortModels(values: string[]): string[] {
+  const familyIndex = (value: string): number => {
     const index = FAMILY_ORDER.findIndex((family) => value.includes(family));
     return index === -1 ? FAMILY_ORDER.length : index;
   };
   // Compare version parts one at a time, newest first: 5 beats 4.8.
-  const parts = (value) => (value.replace(/^claude-/, '').match(/\d+/g) ?? []).map(Number);
-  const newestFirst = (a, b) => {
+  const parts = (value: string): number[] => (value.replace(/^claude-/, '').match(/\d+/g) ?? []).map(Number);
+  const newestFirst = (a: string, b: string): number => {
     const [left, right] = [parts(a), parts(b)];
     for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
       const diff = (right[i] ?? -1) - (left[i] ?? -1);
@@ -139,7 +140,13 @@ function sortModels(values) {
 }
 
 class ModelCatalog {
-  constructor() {
+  public models: string[];
+  public discoveredAt: string | null;
+  public loading: boolean;
+  public error: string | null;
+  public inFlight: Promise<void> | null;
+
+  public constructor() {
     this.models = [];
     this.discoveredAt = null;
     this.loading = false;
@@ -147,7 +154,7 @@ class ModelCatalog {
     this.inFlight = null;
   }
 
-  state() {
+  public state(): ModelCatalogState {
     return {
       models: this.models.map((value) => ({ value, label: label(value) })),
       discoveredAt: this.discoveredAt,
@@ -157,13 +164,13 @@ class ModelCatalog {
   }
 
   /** Concurrent callers share one discovery run. */
-  refresh() {
+  public refresh(): Promise<void> {
     if (this.inFlight) return this.inFlight;
     this.loading = true;
     this.error = null;
     emit('models:loading');
     this.inFlight = this.discover()
-      .catch((err) => {
+      .catch((err: Error) => {
         this.error = err.message;
         console.error(`[models] discovery failed: ${err.message}`);
       })
@@ -175,7 +182,7 @@ class ModelCatalog {
     return this.inFlight;
   }
 
-  async discover() {
+  public async discover(): Promise<void> {
     const started = Date.now();
     const binary = await resolveBinary();
     let candidates = [...ALIASES];

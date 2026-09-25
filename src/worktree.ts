@@ -5,15 +5,21 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
+type GitError = Error & { stderr?: string };
+
+export type WorktreeCleanup = { cleaned: string } | { skipped: string };
+
+export type WorktreeIncludeWrite = { written: string; text: string } | { skipped: string };
+
 export const WORKTREE_INCLUDE_FILE = '.worktreeinclude';
 
 /** Runs git in `dir` and returns its trimmed stdout; a failure throws with git's own message. */
-async function git(dir, args, timeout = 60_000) {
+async function git(dir: string, args: string[], timeout = 60_000): Promise<string> {
   try {
     const { stdout } = await execFileAsync('git', ['-C', dir, ...args], { timeout });
     return stdout.trim();
   } catch (err) {
-    throw new Error(err.stderr?.trim() || err.message);
+    throw new Error((err as GitError).stderr?.trim() || (err as GitError).message, { cause: err });
   }
 }
 
@@ -24,7 +30,7 @@ async function git(dir, args, timeout = 60_000) {
  * the session starts in, so a job whose working directory is a subfolder still
  * has to write it at the top.
  */
-export async function repoRoot(dir) {
+export async function repoRoot(dir: string): Promise<string | null> {
   return (await git(dir, ['rev-parse', '--show-toplevel'], 10_000).catch(() => '')) || null;
 }
 
@@ -38,12 +44,12 @@ export async function repoRoot(dir) {
  * @returns {Promise<{ cleaned: string } | { skipped: string }>} What was removed,
  *   or why there was nothing to remove.
  */
-export async function removeWorktree(dir, name) {
+export async function removeWorktree(dir: string, name: string): Promise<WorktreeCleanup> {
   const root = await repoRoot(dir);
   if (!root) return { skipped: `${dir} is not in a git repository` };
   const worktreePath = path.join(root, '.claude', 'worktrees', name);
   const branch = `worktree-${name}`;
-  const removed = [];
+  const removed: string[] = [];
 
   if (await fsp.stat(worktreePath).then(() => true, () => false)) {
     // Claude Code locks the worktrees it makes, and git refuses to remove a locked one.
@@ -68,7 +74,7 @@ export async function removeWorktree(dir, name) {
  * top of one or outside git. The root git reports has its symlinks resolved,
  * so `dir` is resolved too before the two are compared.
  */
-export async function pathInRepo(dir) {
+export async function pathInRepo(dir: string): Promise<string | null> {
   const root = await repoRoot(dir);
   if (!root) return null;
   const relative = path.relative(root, await fsp.realpath(dir).catch(() => dir));
@@ -85,7 +91,7 @@ export async function pathInRepo(dir) {
  * @returns {Promise<{ written: string, text: string } | { skipped: string }>} The
  *   path written and the exact text now in the file, or why nothing was written.
  */
-export async function writeWorktreeInclude(dir, text) {
+export async function writeWorktreeInclude(dir: string, text: string): Promise<WorktreeIncludeWrite> {
   if (!text.trim()) return { skipped: 'the default on the Settings page is empty' };
   const root = await repoRoot(dir);
   if (!root) return { skipped: `${dir} is not in a git repository` };

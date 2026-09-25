@@ -3,6 +3,75 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { ROOT } from './paths.js';
+import type {
+  UsageBlocker,
+  UsageDelay,
+  UsageDelayCategoryId,
+  UsageReading,
+  UsageThresholds,
+  UsageWindow,
+} from './types.js';
+
+export interface UsageDelayCategory {
+  id: UsageDelayCategoryId;
+  label: string;
+  limit: string;
+  note?: string;
+  defaultThreshold: number;
+  matches: (window: UsageWindow) => boolean;
+}
+
+export interface UsageDelayOption {
+  id: UsageDelayCategoryId;
+  label: string;
+  threshold: number;
+  defaultThreshold: number;
+  hint: string;
+}
+
+interface StoredOAuth {
+  accessToken?: string;
+  expiresAt?: unknown;
+}
+
+type StoredCredentials = StoredOAuth & { claudeAiOauth?: StoredOAuth | null };
+
+interface ApiLimit {
+  percent?: unknown;
+  kind?: string | null;
+  scope?: { model?: { display_name?: string | null } | null; surface?: string | null } | null;
+  severity?: unknown;
+  resets_at?: string | null;
+}
+
+interface ApiMoney {
+  amount_minor?: unknown;
+  exponent?: number | null;
+  currency?: string | null;
+}
+
+interface ApiSpend {
+  percent?: unknown;
+  enabled?: unknown;
+  used?: ApiMoney | null;
+  limit?: ApiMoney | null;
+  severity?: unknown;
+  resets_at?: string | null;
+}
+
+interface ApiUsageResponse {
+  limits?: Array<ApiLimit | null> | null;
+  spend?: ApiSpend | null;
+}
+
+type UsageLookup =
+  | { ok: true; reason: null; windows: UsageWindow[] }
+  | { ok: false; reason: string | null; windows?: UsageWindow[]; retryMs?: number };
+
+interface KeptReading {
+  windows: UsageWindow[];
+  checkedAt: string;
+}
 
 /**
  * Subscription usage for the account the Claude CLI is signed in as.
@@ -42,20 +111,20 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  * instead of those: it is already normalized, and a kind added later still
  * renders off its own name rather than being dropped.
  */
-const KIND_LABELS = {
+const KIND_LABELS: Record<string, { label: string; detail: string }> = {
   session: { label: 'Session', detail: 'Current 5-hour session' },
   weekly_all: { label: 'Weekly', detail: 'Rolling 7-day limit, all models' },
   weekly_scoped: { label: 'Weekly', detail: 'Rolling 7-day limit' },
 };
 
 /** "weekly_all" -> "Weekly all", so an unknown future kind is still readable. */
-function humanize(kind) {
+function humanize(kind: unknown): string {
   const text = String(kind ?? '').replace(/[_-]+/g, ' ').trim();
-  return text ? text[0].toUpperCase() + text.slice(1) : 'Limit';
+  return text ? text[0]!.toUpperCase() + text.slice(1) : 'Limit';
 }
 
 /** The CLI keeps its credentials in the login keychain on macOS. */
-function keychainCredentials() {
+function keychainCredentials(): Promise<string | null> {
   return new Promise((resolve) => {
     execFile(
       'security',
@@ -73,15 +142,15 @@ function keychainCredentials() {
  * this token, and a copy we kept would go stale. It is never logged, never
  * cached, and never leaves this module.
  */
-async function accessToken() {
-  let raw = null;
+async function accessToken(): Promise<{ token: string | null; reason: string | null }> {
+  let raw: string | null = null;
   if (process.platform === 'darwin') raw = await keychainCredentials();
   if (!raw) raw = await fsp.readFile(CREDENTIALS_FILE, 'utf8').catch(() => null);
   if (!raw) return { token: null, reason: 'the Claude CLI is not signed in on this machine' };
 
-  let parsed;
+  let parsed: StoredCredentials | null;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(raw) as StoredCredentials | null;
   } catch {
     return { token: null, reason: 'stored Claude credentials could not be read' };
   }
@@ -92,37 +161,37 @@ async function accessToken() {
   // An expired token is reported as its own state rather than refreshed here:
   // refreshing rotates the CLI's refresh token underneath it, so that is the
   // CLI's job, not ours.
-  if (Number.isFinite(oauth.expiresAt) && oauth.expiresAt <= Date.now()) {
+  if (typeof oauth?.expiresAt === 'number' && Number.isFinite(oauth.expiresAt) && oauth.expiresAt <= Date.now()) {
     return { token: null, reason: 'the stored Claude login has expired; run any claude command to refresh it' };
   }
   return { token, reason: null };
 }
 
-function percent(value) {
+function percent(value: unknown): number | null {
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
   return Math.max(0, Math.min(100, Math.round(number * 10) / 10));
 }
 
-function isoOrNull(value) {
+function isoOrNull(value: string | null | undefined): string | null {
   if (!value) return null;
   const at = new Date(value);
   return Number.isNaN(at.getTime()) ? null : at.toISOString();
 }
 
 /** One entry of the endpoint's `limits` array, in the shape the page draws. */
-function readLimit(entry, index) {
+function readLimit(entry: ApiLimit | null | undefined, index: number): UsageWindow | null {
   const used = percent(entry?.percent);
   if (used === null) return null;
-  const known = KIND_LABELS[entry.kind];
+  const known = KIND_LABELS[entry!.kind!];
   // A scoped limit names what it is scoped to, e.g. "Weekly · Fable".
   const scope = entry?.scope?.model?.display_name ?? entry?.scope?.surface ?? null;
-  const label = known?.label ?? humanize(entry.kind);
+  const label = known?.label ?? humanize(entry!.kind);
   return {
-    key: `${entry.kind ?? 'limit'}:${scope ?? index}`,
+    key: `${entry!.kind ?? 'limit'}:${scope ?? index}`,
     // Kept alongside the drawn label because the usage-delay categories match on
     // what a limit *is*, not on how it happens to be worded in the header.
-    kind: entry.kind ?? null,
+    kind: entry!.kind ?? null,
     scope,
     label: scope ? `${label} · ${scope}` : label,
     detail: scope ? `${known?.detail ?? label} — ${scope}` : (known?.detail ?? label),
@@ -133,13 +202,13 @@ function readLimit(entry, index) {
 }
 
 /** Local midnight on the first of next month. */
-function firstOfNextMonth(now = new Date()) {
+function firstOfNextMonth(now: Date = new Date()): string {
   return new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
 }
 
 /** Money is reported in minor units with its own exponent, e.g. 272985 / 10^2. */
-function money(amount) {
-  if (!Number.isFinite(amount?.amount_minor)) return null;
+function money(amount: ApiMoney | null | undefined): string | null {
+  if (typeof amount?.amount_minor !== 'number' || !Number.isFinite(amount.amount_minor)) return null;
   const value = amount.amount_minor / 10 ** (amount.exponent ?? 2);
   try {
     return value.toLocaleString('en-US', { style: 'currency', currency: amount.currency ?? 'USD' });
@@ -157,11 +226,11 @@ function money(amount) {
  * — one place, so the header meter and a trigger held on credits both say the
  * same thing. Anything the endpoint does report wins over it.
  */
-function readSpend(spend) {
+function readSpend(spend: ApiSpend | null | undefined): UsageWindow | null {
   const used = percent(spend?.percent);
   if (used === null || !spend?.enabled) return null;
-  const spent = money(spend.used);
-  const cap = money(spend.limit);
+  const spent = money(spend!.used);
+  const cap = money(spend!.limit);
   return {
     key: 'spend',
     kind: 'spend',
@@ -182,7 +251,7 @@ function readSpend(spend) {
  * the `kind` field, so the key — which has always started with the kind — is the
  * fallback rather than letting a restored cache match nothing.
  */
-function kindOf(window) {
+function kindOf(window: UsageWindow | null | undefined): string | undefined {
   return window?.kind ?? String(window?.key ?? '').split(':')[0];
 }
 
@@ -192,7 +261,7 @@ function kindOf(window) {
  * limit is at or above that category's threshold, which the Settings page sets;
  * `defaultThreshold` is what it is out of the box.
  */
-export const USAGE_DELAY_CATEGORIES = [
+export const USAGE_DELAY_CATEGORIES: UsageDelayCategory[] = [
   {
     id: 'session',
     label: 'Session',
@@ -225,16 +294,16 @@ export const USAGE_DELAY_CATEGORIES = [
 ];
 
 /** A whole percentage from 1 to 100, or null when the input is not one. */
-export function parseUsageThreshold(input) {
+export function parseUsageThreshold(input: unknown): number | null {
   const value = Number(input);
   return Number.isInteger(value) && value >= 1 && value <= 100 ? value : null;
 }
 
 /** Every category's threshold, always all four keys; a missing or bad one takes its default. */
-export function normalizeUsageThresholds(input) {
-  const value = {};
+export function normalizeUsageThresholds(input: unknown): UsageThresholds {
+  const value = {} as UsageThresholds;
   for (const category of USAGE_DELAY_CATEGORIES) {
-    value[category.id] = parseUsageThreshold(input?.[category.id]) ?? category.defaultThreshold;
+    value[category.id] = parseUsageThreshold((input as Partial<Record<UsageDelayCategoryId, unknown>> | null | undefined)?.[category.id]) ?? category.defaultThreshold;
   }
   return value;
 }
@@ -248,13 +317,13 @@ export const DEFAULT_USAGE_THRESHOLDS = normalizeUsageThresholds({});
  */
 let thresholds = DEFAULT_USAGE_THRESHOLDS;
 
-export function setUsageThresholds(input) {
+export function setUsageThresholds(input: unknown): UsageThresholds {
   thresholds = normalizeUsageThresholds(input);
   return thresholds;
 }
 
 /** The categories as the page draws them, with the threshold in force now. */
-export function usageDelayOptions() {
+export function usageDelayOptions(): UsageDelayOption[] {
   return USAGE_DELAY_CATEGORIES.map((category) => {
     const threshold = thresholds[category.id];
     return {
@@ -268,14 +337,14 @@ export function usageDelayOptions() {
 }
 
 /** Every category, always all four keys, so a cron file never carries a half set. */
-export function normalizeUsageDelay(input) {
-  const value = {};
-  for (const category of USAGE_DELAY_CATEGORIES) value[category.id] = Boolean(input?.[category.id]);
+export function normalizeUsageDelay(input: unknown): UsageDelay {
+  const value = {} as UsageDelay;
+  for (const category of USAGE_DELAY_CATEGORIES) value[category.id] = Boolean((input as Partial<Record<UsageDelayCategoryId, unknown>> | null | undefined)?.[category.id]);
   return value;
 }
 
 /** True when at least one category is ticked. */
-export function hasUsageDelay(delay) {
+export function hasUsageDelay(delay: Partial<UsageDelay> | null | undefined): boolean {
   return USAGE_DELAY_CATEGORIES.some((category) => Boolean(delay?.[category.id]));
 }
 
@@ -287,10 +356,13 @@ export function hasUsageDelay(delay) {
  * lookup is not evidence that the account is out of usage, and holding every cron
  * on a reading we do not have would be the worse failure.
  */
-export function usageBlockers(reading, delay) {
+export function usageBlockers(
+  reading: Pick<UsageReading, 'windows'> | null | undefined,
+  delay: Partial<UsageDelay> | null | undefined,
+): UsageBlocker[] {
   const windows = reading?.windows ?? [];
   if (!windows.length) return [];
-  const blockers = [];
+  const blockers: UsageBlocker[] = [];
   for (const category of USAGE_DELAY_CATEGORIES) {
     if (!delay?.[category.id]) continue;
     const window = windows.find((candidate) => category.matches(candidate));
@@ -308,7 +380,7 @@ export function usageBlockers(reading, delay) {
 }
 
 /** `Retry-After` is either a count of seconds or an HTTP date; both appear. */
-function retryAfterMs(header) {
+function retryAfterMs(header: string | null): number {
   if (!header) return 0;
   const seconds = Number(header);
   if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
@@ -316,7 +388,7 @@ function retryAfterMs(header) {
   return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
 }
 
-async function fetchUsage() {
+async function fetchUsage(): Promise<UsageLookup> {
   const { token, reason } = await accessToken();
   if (!token) return { ok: false, reason, windows: [] };
 
@@ -344,15 +416,15 @@ async function fetchUsage() {
       };
     }
 
-    const body = await res.json();
+    const body = (await res.json()) as ApiUsageResponse | null;
     const windows = [
       ...(Array.isArray(body?.limits) ? body.limits.map(readLimit).filter(Boolean) : []),
       readSpend(body?.spend),
-    ].filter(Boolean);
+    ].filter((window): window is UsageWindow => Boolean(window));
     if (!windows.length) return { ok: false, reason: 'no usage limits reported for this account', windows: [] };
     return { ok: true, reason: null, windows };
   } catch (err) {
-    const reason = err.name === 'AbortError' ? 'usage lookup timed out' : `usage lookup failed: ${err.message}`;
+    const reason = (err as Error).name === 'AbortError' ? 'usage lookup timed out' : `usage lookup failed: ${(err as Error).message}`;
     return { ok: false, reason, windows: [] };
   } finally {
     clearTimeout(timer);
@@ -360,7 +432,7 @@ async function fetchUsage() {
 }
 
 /** Writes the last good reading so a restart does not start from nothing. */
-async function persist(reading) {
+async function persist(reading: KeptReading): Promise<void> {
   try {
     await fsp.mkdir(path.dirname(CACHE_FILE), { recursive: true });
     const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
@@ -372,10 +444,10 @@ async function persist(reading) {
 }
 
 /** The kept reading, or null when there is none, it is unreadable, or it is stale. */
-async function readCache() {
+async function readCache(): Promise<KeptReading | null> {
   try {
-    const kept = JSON.parse(await fsp.readFile(CACHE_FILE, 'utf8'));
-    const at = Date.parse(kept?.checkedAt);
+    const kept = JSON.parse(await fsp.readFile(CACHE_FILE, 'utf8')) as Partial<KeptReading> | null;
+    const at = Date.parse(kept?.checkedAt as string);
     if (!Array.isArray(kept?.windows) || !kept.windows.length) return null;
     if (!Number.isFinite(at) || Date.now() - at > CACHE_MAX_AGE_MS) return null;
     return { windows: kept.windows, checkedAt: new Date(at).toISOString() };
@@ -385,7 +457,14 @@ async function readCache() {
 }
 
 class UsageMonitor {
-  constructor() {
+  public lastGood: KeptReading | null;
+  public reason: string | null;
+  public nextFetchAt: number;
+  public failures: number;
+  public inFlight: Promise<void> | null;
+  public restoring: Promise<void> | null;
+
+  public constructor() {
     /** The last reading that carried windows, however old it now is. */
     this.lastGood = null;
     /** Why the most recent refresh failed, or null when it succeeded. */
@@ -412,7 +491,7 @@ class UsageMonitor {
    * everything that wants usage — the header meters and the triggers held for
    * usage alike — comes through here and shares the one request per window.
    */
-  async state() {
+  public async state(): Promise<UsageReading> {
     await this.restore();
     if (Date.now() >= this.nextFetchAt) this.refresh();
     return this.reading();
@@ -426,12 +505,12 @@ class UsageMonitor {
    * hold — can wait for the first one without adding to the request budget. With
    * nothing in flight this answers immediately, empty reading and all.
    */
-  async settled() {
+  public async settled(): Promise<UsageReading> {
     if (this.inFlight) await this.inFlight;
     return this.reading();
   }
 
-  reading() {
+  public reading(): UsageReading {
     const windows = this.lastGood?.windows ?? [];
     const age = this.lastGood ? Date.now() - Date.parse(this.lastGood.checkedAt) : 0;
     return {
@@ -448,7 +527,7 @@ class UsageMonitor {
   }
 
   /** Starts a refresh unless one is already running. Failures are absorbed. */
-  refresh() {
+  public refresh(): Promise<void> {
     if (this.inFlight) return this.inFlight;
     // Claim the window before the request goes out, so a slow one cannot let
     // the next poll start a second.
@@ -457,7 +536,7 @@ class UsageMonitor {
       .then((result) => this.record(result))
       // fetchUsage answers rather than throws, so this is only ever a bug here;
       // it still must not surface as an unhandled rejection or blank the meters.
-      .catch((err) => this.record({ ok: false, reason: `usage lookup failed: ${err.message}` }))
+      .catch((err: Error) => this.record({ ok: false, reason: `usage lookup failed: ${err.message}` }))
       .finally(() => {
         this.inFlight = null;
       });
@@ -469,7 +548,7 @@ class UsageMonitor {
    * windows — it only records why they stopped moving and pushes the next
    * attempt further out.
    */
-  record(result) {
+  public record(result: UsageLookup): void {
     if (result.ok) {
       this.lastGood = { windows: result.windows, checkedAt: new Date().toISOString() };
       this.reason = null;
@@ -488,7 +567,7 @@ class UsageMonitor {
    * The reading kept from a previous run, read once. Its age also sets the next
    * fetch, so a server that restarts repeatedly does not ask on every boot.
    */
-  restore() {
+  public restore(): Promise<void> {
     if (this.restoring) return this.restoring;
     this.restoring = readCache().then((kept) => {
       if (!kept || this.lastGood) return;
