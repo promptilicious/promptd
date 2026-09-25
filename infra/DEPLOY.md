@@ -4,7 +4,7 @@ This puts a promptd hub on the internet, so nodes on any network can reach it:
 
 - **The host.** One ARM EC2 instance runs the hub in Docker behind Caddy, which gets and renews the HTTPS certificate.
 - **The data.** The SQLite database and every run log live on their own EBS volume, snapshotted daily.
-- **Shipping.** A push to `main` builds the image, stores it in ECR, and restarts the hub on it.
+- **Shipping.** `scripts/deploy-hub.sh` builds the image, stores it in ECR, and restarts the hub on it.
 
 Nodes stay where they are. Each one polls the hub over HTTPS and needs only outbound access.
 
@@ -14,8 +14,7 @@ Everything below is yours to fill in. `promptd.example.com`, `promptd-admin` and
 
 1. An AWS account, and an AWS CLI profile with admin rights on it. The examples call it `promptd-admin`.
 2. A host name whose DNS you control, such as `promptd.example.com`. The steps show Cloudflare; any DNS provider works.
-3. Your own copy of this repository on GitHub, so the deploy workflow runs in it.
-4. On your machine: Terraform 1.5 or newer, Docker with `buildx`, Node 20 or newer, and a checkout with `npm install` done.
+3. On your machine: Terraform 1.5 or newer, Docker with `buildx`, the AWS CLI, Node 20 or newer, and a checkout with `npm install` done.
 
 ## 1. Create the Terraform state bucket
 
@@ -41,7 +40,7 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
-`terraform.tfvars` is git-ignored. If your AWS account already has a GitHub OIDC provider, for example from another project, set `create_github_oidc_provider = false`.
+`terraform.tfvars` is git-ignored, and so is the state, which lives in your bucket.
 
 The instance boots while this runs. Its first attempt to start the hub fails because there is no image yet; step 5 fixes that.
 
@@ -99,60 +98,39 @@ Leave the proxy off. With it on, Caddy can't get its certificate, and the page l
 
 Either way, the address is an Elastic IP. It stays the same across deploys, and even when Terraform replaces the instance, so DNS is set once.
 
-## 5. Push the first image
+## 5. Ship the first version
 
 ```sh
-REPO_URL=$(terraform output -raw ecr_repository_url)
-REGISTRY=${REPO_URL%%/*}
-
-aws --profile promptd-admin ecr get-login-password --region us-east-1 \
-  | docker login --username AWS --password-stdin "$REGISTRY"
-
 cd ../..
-docker buildx build --platform linux/arm64 -t "$REPO_URL:bootstrap" --push .
+./scripts/deploy-hub.sh
 ```
 
-Terraform set the `IMAGE_TAG` parameter to `bootstrap`, so this is the tag the hub looks for. The deploy workflow tags later images by commit.
+The script reads everything it needs from the Terraform outputs:
 
-## 6. Start the hub
+1. It builds this commit as an ARM64 image and pushes it to ECR, tagged with the commit.
+2. It sets the `IMAGE_TAG` parameter to that tag.
+3. It runs `deploy.sh` on the host over SSM, which fetches the secrets, pulls the image and restarts the hub.
+4. It waits until `/api/health` answers.
+
+Run the same command whenever you want to ship a new version. A checkout with uncommitted changes still deploys, with the tag marked `-dirty`.
+
+## 6. Sign in
+
+Open `https://promptd.example.com` (your host) and sign in with the password from step 3. The first visit can take a minute while Caddy gets the certificate. If Caddy started before your DNS was in place, it retries on a backoff that can stretch to hours; `sudo systemctl restart caddy` on the host makes it try again straight away.
+
+To look around on the host:
 
 ```sh
-cd infra/terraform
-INSTANCE_ID=$(terraform output -raw hub_instance_id)
-aws --profile promptd-admin ssm send-command --instance-ids "$INSTANCE_ID" \
-  --document-name AWS-RunShellScript --parameters 'commands=["/opt/promptd/deploy.sh"]'
-```
-
-Replace `promptd` in the path if you changed `name`. To look around on the host:
-
-```sh
+INSTANCE_ID=$(terraform -chdir=infra/terraform output -raw hub_instance_id)
 aws --profile promptd-admin ssm start-session --target "$INSTANCE_ID"
 sudo docker compose -f /opt/promptd/docker-compose.yml ps
 sudo docker compose -f /opt/promptd/docker-compose.yml logs --tail 50
 sudo journalctl -u caddy --no-pager -n 50
 ```
 
-Open `https://promptd.example.com` (your host) and sign in with the password from step 3. The first visit can take a minute while Caddy gets the certificate. If Caddy started before your DNS was in place, it retries on a backoff that can stretch to hours; `sudo systemctl restart caddy` on the host makes it try again straight away.
+Replace `promptd` in the path if you changed `name`.
 
-## 7. Let GitHub deploy
-
-In your repository, under **Settings → Secrets and variables → Actions → Variables**, add:
-
-| Variable | Value |
-| --- | --- |
-| `AWS_ROLE_ARN` | `terraform output -raw github_deploy_role_arn` |
-| `AWS_REGION` | your region, if not `us-east-1` |
-| `ECR_REPOSITORY` | `terraform output -raw ecr_repository` |
-| `EC2_INSTANCE_ID` | `terraform output -raw hub_instance_id` |
-| `SSM_PREFIX` | `terraform output -raw ssm_prefix` |
-| `HUB_URL` | `terraform output -raw hub_url` |
-| `NAME` | your `name`, if not `promptd` |
-
-Then add an environment called `production` under **Settings → Environments**. Give it a required reviewer if you want to approve each deploy.
-
-From then on, every push to `main` runs the checks, builds the ARM64 image, rolls `IMAGE_TAG`, runs `deploy.sh` on the host, and checks that `/api/health` answers. Without `AWS_ROLE_ARN` the deploy workflow does nothing, which is what keeps forks from trying to ship.
-
-## 8. Connect nodes
+## 7. Connect nodes
 
 On each Mac that should run jobs, in a checkout of this repository:
 
@@ -163,24 +141,28 @@ NODE_ONLY=1 HUB_URL=https://promptd.example.com NODE_TOKEN=<token from step 3> \
 
 The first node to connect becomes the default node, which runs every job with no node of its own. The hosted hub does not run jobs itself.
 
-Moving from a Mac that already runs a full local install: that Mac's jobs stay in its own hub, and are not moved to the hosted one. Recreate them on the hosted hub, then stop the local hub with `launchctl bootout gui/$(id -u)/local.promptd`. Register the Mac as a node as above, with `FORCE=1` so it replaces the existing node agent.
+A Mac that already runs a full local install has a node agent of its own. There are two ways to go from there:
+
+1. **Keep the local hub, and add a second node.** Give the new node its own id and launchd label, so it doesn't collide with the local one:
+
+   ```sh
+   NODE_ONLY=1 HUB_URL=https://promptd.example.com NODE_TOKEN=<token> \
+     NODE_ID=<this-mac>-hosted NODE_LABEL=local.promptd.hosted-node ./scripts/register-app-mac-os.sh
+   ```
+
+2. **Move to the hosted hub.** That Mac's jobs stay in its local hub and are not copied across, so recreate them on the hosted one. Stop the local hub with `launchctl bootout gui/$(id -u)/local.promptd`, then register as above with `FORCE=1`, so the new node replaces the old node agent.
 
 ## Rolling back
 
-Run the `deploy` workflow by hand (**Actions → deploy → Run workflow**) with an earlier image tag. That skips the build and deploys the tag as it is. ECR keeps the 10 most recent tagged images.
-
-By hand:
-
 ```sh
-aws --profile promptd-admin ssm put-parameter --overwrite --type String \
-  --name /promptd/prod/IMAGE_TAG --value <earlier-tag>
-aws --profile promptd-admin ssm send-command --instance-ids "$INSTANCE_ID" \
-  --document-name AWS-RunShellScript --parameters 'commands=["/opt/promptd/deploy.sh"]'
+./scripts/deploy-hub.sh --tag <earlier tag>
 ```
+
+That skips the build and deploys an image already in ECR. ECR keeps the 10 most recent tagged images; `aws ecr describe-images --repository-name promptd-hub` lists them.
 
 ## Changing a secret
 
-Write the new value with `aws ssm put-parameter --overwrite` as in step 3, then run `deploy.sh` as in step 6. The hub reads its secrets from SSM on every deploy.
+Write the new value with `aws ssm put-parameter --overwrite` as in step 3, then run `./scripts/deploy-hub.sh --tag <current tag>` to restart the hub on it. The hub reads its secrets from SSM on every deploy.
 
 - **A new admin password** signs every session out.
 - **A new `SESSION_SECRET`** does the same.

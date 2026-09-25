@@ -2290,7 +2290,7 @@ async function renderSettings() {
     el('div', { class: 'field' }, [el('label', { text: label }), el('div', { class: 'path-value mono', text: value })]);
 
   const nodesBody = el('div', {});
-  const tokenFile = el('span', { class: 'mono', text: 'node-token' });
+  const tokenWhere = el('span', {}, ['the token in ', el('span', { class: 'mono', text: 'node-token' }), ' on this machine']);
   const paintNodes = async () => {
     let state;
     try {
@@ -2299,7 +2299,11 @@ async function renderSettings() {
       nodesBody.replaceChildren(el('div', { class: 'hint warn', text: `Could not load the nodes: ${err.message}` }));
       return;
     }
-    tokenFile.textContent = state.tokenFile;
+    tokenWhere.replaceChildren(
+      ...(state.tokenSource === 'environment'
+        ? ['the token this server was started with in ', el('span', { class: 'mono', text: 'PROMPTD_NODE_TOKEN' })]
+        : ['the token in ', el('span', { class: 'mono', text: state.tokenFile }), ' on this machine']),
+    );
     const describe = (node) =>
       [
         node.id,
@@ -2504,9 +2508,9 @@ async function renderSettings() {
         'so only this server needs to be reachable. A job with no node of its own runs on the default node. ',
         'To add a Mac, run ',
         el('span', { class: 'mono', text: 'NODE_ONLY=1 HUB_URL=<this server> NODE_TOKEN=<token> ./scripts/register-app-mac-os.sh' }),
-        ' in a checkout there, with the token from ',
-        tokenFile,
-        ' on this machine.',
+        ' in a checkout there, with ',
+        tokenWhere,
+        '.',
       ]),
     ]),
     el('div', { class: 'card' }, [

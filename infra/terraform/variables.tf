@@ -26,22 +26,6 @@ variable "acme_email" {
   type        = string
 }
 
-variable "github_owner" {
-  description = "GitHub user or org that owns the repository deploying to this hub."
-  type        = string
-}
-
-variable "github_repo" {
-  description = "GitHub repository deploying to this hub."
-  type        = string
-}
-
-variable "create_github_oidc_provider" {
-  description = "An AWS account holds one GitHub OIDC provider. Set false if another stack already created it."
-  type        = bool
-  default     = true
-}
-
 variable "instance_type" {
   description = "EC2 instance type. ARM64 (t4g) to match the image the workflow builds."
   type        = string

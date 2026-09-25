@@ -66,8 +66,8 @@ Copy the token from `~/.claude/promptd/node-token` on the hub's machine. The hub
 [`infra/DEPLOY.md`](infra/DEPLOY.md) puts a hub on the internet, so nodes on any network can reach it:
 
 - **What runs.** One ARM EC2 instance runs the hub in Docker behind Caddy for HTTPS. A separate volume holds the database and logs, with daily snapshots.
-- **What it's built from.** Terraform in [`infra/`](infra), a [`Dockerfile`](Dockerfile), and a GitHub Actions workflow that ships every push to `main`.
-- **What you fill in.** The domain, AWS profile and GitHub repository are yours to set. The deploy workflow does nothing until you set its repository variables, so forks never try to ship.
+- **What it's built from.** Terraform in [`infra/`](infra) and a [`Dockerfile`](Dockerfile). `scripts/deploy-hub.sh` ships a new version.
+- **What you fill in.** The domain, email, AWS profile and DNS choice are yours to set in `infra/terraform/terraform.tfvars`, so each hub is its owner's own.
 
 ## Signing in
 

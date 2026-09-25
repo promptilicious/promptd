@@ -271,7 +271,12 @@ app.get('/api/system', (_req, res) => {
 });
 
 app.get('/api/nodes', (_req, res) => {
-  res.json({ nodes: hub.listNodes(), defaultNodeId: hub.defaultNodeId(), tokenFile: NODE_TOKEN_FILE });
+  res.json({
+    nodes: hub.listNodes(),
+    defaultNodeId: hub.defaultNodeId(),
+    tokenSource: process.env.PROMPTD_NODE_TOKEN?.trim() ? 'environment' : 'file',
+    tokenFile: NODE_TOKEN_FILE,
+  });
 });
 
 app.delete('/api/nodes/:id', (req, res) => {
