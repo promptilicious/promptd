@@ -14,12 +14,14 @@
     "start": "node src/local.js",
     "dev": "node src/local.js --watch",
     "start:hub": "node src/server.js",
-    "start:node": "node src/node.js"
+    "start:node": "node src/node.js",
+    "set-password": "node src/set-password.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
     "croner": "^9.0.0",
     "express": "^4.21.2",
+    "iron-session": "^9.0.1",
     "kysely": "^0.29.6",
     "pg": "^8.23.0"
   },

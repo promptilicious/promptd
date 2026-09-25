@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import { bus, sseInit, sseSend } from './events.js';
+import { assertAuthConfigured, authRouter, requireLogin } from './auth.js';
 import { databaseTarget, migrate, openDatabase } from './db.js';
 import { importLegacyFiles } from './legacyImport.js';
 import { LOGS_DIR, NODE_TOKEN_FILE, ROOT, ensureDirs, resolveUserPath } from './paths.js';
@@ -70,6 +71,9 @@ function errorMessage(err: unknown): unknown {
 const app = express();
 // Ahead of the page's body parser: a node's report carries log bytes and outgrows its limit.
 app.use('/api/node', hub.router());
+app.use(authRouter());
+app.use(requireLogin());
+app.get('/login', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'login.html')));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(PUBLIC_DIR));
 
@@ -812,6 +816,7 @@ app.get('/api/events', (req, res) => {
 let runningCommit: string | null = null;
 
 app.get('/api/health', async (_req, res) => {
+  if (res.locals.signedIn === false) return res.json({ ok: true, authRequired: true });
   // The one await that can be slow, and only once: the folder is read at
   // startup, and every poll after that is answered from memory.
   await notificationCenter.ready;
@@ -836,6 +841,12 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 await ensureDirs();
 openDatabase();
 await migrate();
+try {
+  await assertAuthConfigured(HOST);
+} catch (err) {
+  console.error(`[auth] ${errorMessage(err)}`);
+  process.exit(1);
+}
 // Before the first settings read, which would otherwise write defaults over
 // an install that still has its settings.json.
 await importLegacyFiles();
