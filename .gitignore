@@ -4,3 +4,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 .build.lock/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars

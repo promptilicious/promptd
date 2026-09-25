@@ -169,6 +169,8 @@ class Hub {
   }
 
   private async ensureToken(): Promise<string> {
+    const fromEnv = process.env.PROMPTD_NODE_TOKEN?.trim();
+    if (fromEnv) return fromEnv;
     try {
       const existing = (await fsp.readFile(NODE_TOKEN_FILE, 'utf8')).trim();
       if (existing) return existing;

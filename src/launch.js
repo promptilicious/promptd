@@ -53,8 +53,8 @@ export function ensureBuilt() {
   try {
     if (!sourcesChangedSinceBuild()) return;
     const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
-    console.log('[launch] sources changed since the last build; compiling');
-    execFileSync(process.execPath, [tsc, '-p', path.join(ROOT, 'tsconfig.build.json')], { cwd: ROOT, stdio: 'inherit' });
+    console.error('[launch] sources changed since the last build; compiling');
+    execFileSync(process.execPath, [tsc, '-p', path.join(ROOT, 'tsconfig.build.json')], { cwd: ROOT, stdio: ['ignore', 2, 2] });
     fs.writeFileSync(STAMP, `${new Date().toISOString()}\n`);
   } finally {
     fs.rmSync(LOCK, { recursive: true, force: true });

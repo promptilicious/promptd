@@ -69,6 +69,10 @@ function errorMessage(err: unknown): unknown {
 }
 
 const app = express();
+// Behind a reverse proxy every request arrives from the proxy, which would
+// put all sign-in attempts under one address and hide that the visitor used HTTPS.
+const trustProxy = process.env.PROMPTD_TRUST_PROXY?.trim();
+if (trustProxy) app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
 // Ahead of the page's body parser: a node's report carries log bytes and outgrows its limit.
 app.use('/api/node', hub.router());
 app.use(authRouter());
@@ -267,7 +271,12 @@ app.get('/api/system', (_req, res) => {
 });
 
 app.get('/api/nodes', (_req, res) => {
-  res.json({ nodes: hub.listNodes(), defaultNodeId: hub.defaultNodeId(), tokenFile: NODE_TOKEN_FILE });
+  res.json({
+    nodes: hub.listNodes(),
+    defaultNodeId: hub.defaultNodeId(),
+    tokenSource: process.env.PROMPTD_NODE_TOKEN?.trim() ? 'environment' : 'file',
+    tokenFile: NODE_TOKEN_FILE,
+  });
 });
 
 app.delete('/api/nodes/:id', (req, res) => {
@@ -859,7 +868,7 @@ setUsageThresholds(bootSettings.usageDelayThresholds);
 await migrateLogDirs().catch((err: unknown) => console.error(`[logs] migration failed: ${errorMessage(err)}`));
 runningCommit = await currentCommit();
 await hub.start(await loadSettings());
-selfUpdater.start();
+if (process.env.PROMPTD_SELF_UPDATE !== '0') selfUpdater.start();
 
 app.listen(PORT, HOST, () => {
   console.log(`promptd listening on http://${HOST}:${PORT}${runningCommit ? ` (${runningCommit})` : ''}`);
